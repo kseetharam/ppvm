@@ -214,6 +214,102 @@ impl LindbladSpec {
         }
     }
 
+    /// Number of jump operators given at construction (the length of
+    /// `jump_rates`); does not count Kossakowski pairs.
+    #[getter]
+    fn num_jump_ops(&self) -> usize {
+        self.inner.num_jump_ops()
+    }
+
+    /// Current GKSL rates of the jump operators given at construction,
+    /// shape `(num_jump_ops,)` float64 (a copy).
+    #[getter]
+    fn jump_rates<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        self.inner.jump_rates().into_pyarray(py)
+    }
+
+    /// Overwrite the jump rates in place (`O(num_jump_ops)`).
+    ///
+    /// `rates` must be a 1-D float64 array of length `num_jump_ops` with
+    /// non-negative entries; otherwise `ValueError`. Jump operators,
+    /// Hamiltonian and Kossakowski block are untouched.
+    fn set_jump_rates(&mut self, rates: &Bound<'_, PyAny>) -> PyResult<()> {
+        let n = self.inner.num_jump_ops();
+        let rates: PyReadonlyArray1<'_, f64> = rates.extract().map_err(|_| {
+            PyValueError::new_err(format!(
+                "set_jump_rates: expected a 1-D float64 ndarray of shape ({n},)"
+            ))
+        })?;
+        let got = rates.len()?;
+        if got != n {
+            return Err(PyValueError::new_err(format!(
+                "set_jump_rates: expected {n} rates (num_jump_ops), got {got}"
+            )));
+        }
+        match rates.as_slice() {
+            Ok(sl) => self.inner.set_jump_rates(sl).map_err(map_err),
+            Err(_) => {
+                let v: Vec<f64> = rates.as_array().iter().copied().collect();
+                self.inner.set_jump_rates(&v).map_err(map_err)
+            }
+        }
+    }
+
+    /// Number `M` of Kossakowski operators (0 when built without a block).
+    #[getter]
+    fn num_kossakowski_ops(&self) -> usize {
+        self.inner.num_kossakowski_ops()
+    }
+
+    /// Current Kossakowski matrix, shape `(M, M)` complex128 (a copy;
+    /// `(0, 0)` when built without a block).
+    #[getter]
+    fn kossakowski<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<Complex64>>> {
+        let k = self.inner.kossakowski();
+        let m = k.len();
+        let flat: Vec<Complex64> = k
+            .into_iter()
+            .flatten()
+            .map(|c| Complex64::new(c.re, c.im))
+            .collect();
+        flat.into_pyarray(py)
+            .reshape([m, m])
+            .map_err(|e| PyValueError::new_err(format!("reshape failed: {e}")))
+    }
+
+    /// Replace the Kossakowski matrix in place, keeping the operator basis.
+    ///
+    /// `k` must be a 2-D complex128 array of shape `(M, M)` with
+    /// `M = num_kossakowski_ops > 0`, Hermitian to `1e-10·max(‖K‖, 1)`;
+    /// otherwise `ValueError`. Positive semi-definiteness is checked in the
+    /// Python layer. The precompiled pair tables are rebuilt from the
+    /// stored operators, so later results are bit-identical to a fresh
+    /// construction with `k`.
+    fn set_kossakowski(&mut self, k: &Bound<'_, PyAny>) -> PyResult<()> {
+        let m = self.inner.num_kossakowski_ops();
+        if m == 0 {
+            return Err(PyValueError::new_err(
+                "set_kossakowski: this LindbladSpec was built without a Kossakowski block",
+            ));
+        }
+        let k: PyReadonlyArray2<'_, Complex64> = k.extract().map_err(|_| {
+            PyValueError::new_err(format!(
+                "set_kossakowski: expected a 2-D complex128 ndarray of shape ({m}, {m})"
+            ))
+        })?;
+        let view = k.as_array();
+        if view.shape() != [m, m] {
+            return Err(PyValueError::new_err(format!(
+                "set_kossakowski: expected shape ({m}, {m}) (num_kossakowski_ops), got {:?}",
+                view.shape()
+            )));
+        }
+        let rows: Vec<Vec<Complex<f64>>> = (0..m)
+            .map(|i| (0..m).map(|j| Complex::new(view[[i, j]].re, view[[i, j]].im)).collect())
+            .collect();
+        self.inner.set_kossakowski(&rows).map_err(map_err)
+    }
+
     /// Apply `L*` to a single Pauli string `p`.
     fn action<'py>(
         &self,

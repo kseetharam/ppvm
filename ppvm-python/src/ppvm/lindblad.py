@@ -214,25 +214,37 @@ class Lindbladian:
         if kossakowski is not None:
             ops, K = kossakowski
             k_ops = [_normalize_jump(op) for op in ops]
-            K = np.asarray(K, dtype=np.complex128)
-            if K.shape != (len(k_ops), len(k_ops)):
-                raise ValueError(
-                    f"kossakowski K has shape {K.shape} but ops has length {len(k_ops)}"
-                )
-            scale = max(float(np.abs(K).max()), 1.0)
-            if float(np.abs(K - K.conj().T).max()) > self._K_TOL * scale:
-                raise ValueError("kossakowski K is not Hermitian")
-            evals = np.linalg.eigvalsh(K)
-            if float(evals.min()) < -self._K_TOL * scale:
-                raise ValueError(
-                    f"kossakowski K is not positive semidefinite "
-                    f"(min eigenvalue {evals.min():.3e}); a non-PSD pair matrix "
-                    f"is not a valid GKSL generator"
-                )
+            K = self._validate_k(K, len(k_ops), check_psd=True, what="kossakowski K")
             k_mat = [[(float(v.real), float(v.imag)) for v in row] for row in K]
         self._spec = _LindbladSpec(
             self.n_qubits, h_strs, h_coeffs, j_lincombs, j_rates, k_ops, k_mat
         )
+
+    @classmethod
+    def _validate_k(cls, K, m: int, *, check_psd: bool, what: str) -> np.ndarray:
+        """Return ``K`` as a C-contiguous ``(m, m)`` complex128 array.
+
+        Raises ``ValueError`` on a shape mismatch, when ``K`` is not
+        Hermitian to ``_K_TOL·max(‖K‖, 1)`` and, with ``check_psd``, when
+        its smallest eigenvalue is below ``−_K_TOL·max(‖K‖, 1)``.
+        """
+        K = np.ascontiguousarray(K, dtype=np.complex128)
+        if K.shape != (m, m):
+            raise ValueError(f"{what} has shape {K.shape} but ops has length {m}")
+        if m == 0:
+            return K
+        scale = max(float(np.abs(K).max()), 1.0)
+        if float(np.abs(K - K.conj().T).max()) > cls._K_TOL * scale:
+            raise ValueError(f"{what} is not Hermitian")
+        if check_psd:
+            evals = np.linalg.eigvalsh(K)
+            if float(evals.min()) < -cls._K_TOL * scale:
+                raise ValueError(
+                    f"{what} is not positive semidefinite "
+                    f"(min eigenvalue {evals.min():.3e}); a non-PSD pair matrix "
+                    f"is not a valid GKSL generator"
+                )
+        return K
 
     @property
     def num_h_terms(self) -> int:
@@ -266,6 +278,90 @@ class Lindbladian:
                 f"set_h_coeffs: expected shape ({self._spec.num_h_terms},), got {arr.shape}"
             )
         self._spec.set_h_coeffs(arr)
+
+    @property
+    def num_jump_ops(self) -> int:
+        """Number of ``jump_terms`` given at construction (Kossakowski pairs excluded).
+
+        ``num_jump_terms`` counts the compiled dissipator entries, which
+        include one entry per retained Kossakowski pair.
+        """
+        return self._spec.num_jump_ops
+
+    @property
+    def jump_rates(self) -> np.ndarray:
+        """Current GKSL rates ``γ_k`` of the ``jump_terms``, shape ``(num_jump_ops,)``.
+
+        Construction order; a copy, so mutating it does not change the
+        Lindbladian. Empty when built without ``jump_terms``.
+        """
+        return self._spec.jump_rates
+
+    def set_jump_rates(self, rates) -> None:
+        """Overwrite the jump rates in place.
+
+        ``rates`` is converted to a 1-D float64 array that must have length
+        ``num_jump_ops`` (same order as the ``jump_terms`` given at
+        construction) with non-negative entries; otherwise ``ValueError``,
+        also when the object was built without ``jump_terms``. The jump
+        operators, the Hamiltonian and the Kossakowski block are left
+        untouched. Cost is ``O(num_jump_ops)``; afterwards every method
+        gives results bit-identical to a freshly built ``Lindbladian`` with
+        these rates (a zero rate keeps its term, as the constructor does).
+        """
+        m = self._spec.num_jump_ops
+        if m == 0:
+            raise ValueError("set_jump_rates: this Lindbladian was built without jump_terms")
+        arr = np.ascontiguousarray(rates, dtype=np.float64)
+        if arr.ndim != 1 or arr.shape[0] != m:
+            raise ValueError(f"set_jump_rates: expected shape ({m},), got {arr.shape}")
+        if arr.size and float(arr.min()) < 0.0:
+            k = int(np.argmin(arr))
+            raise ValueError(f"set_jump_rates: rates must be non-negative; got rates[{k}] = {arr[k]}")
+        self._spec.set_jump_rates(arr)
+
+    @property
+    def num_kossakowski_ops(self) -> int:
+        """Number ``M`` of operators in the ``kossakowski`` block (0 without one)."""
+        return self._spec.num_kossakowski_ops
+
+    @property
+    def kossakowski(self) -> np.ndarray | None:
+        """Current Kossakowski matrix ``K``, shape ``(M, M)`` complex128.
+
+        Same operator basis and order as the ``ops`` given at construction.
+        A copy; ``None`` when built without a ``kossakowski`` block.
+        """
+        if self._spec.num_kossakowski_ops == 0:
+            return None
+        return self._spec.kossakowski
+
+    def set_kossakowski(self, K, check_psd: bool = True) -> None:
+        """Replace the Kossakowski matrix in place, keeping the operator basis.
+
+        ``K`` is converted to an ``(M, M)`` complex128 array over the same
+        ``ops`` (same order) as given at construction, ``M =
+        num_kossakowski_ops``. ``ValueError`` on a shape mismatch, when the
+        object was built without a ``kossakowski`` block, when ``K`` is not
+        Hermitian to ``_K_TOL·max(‖K‖, 1)`` and, with ``check_psd=True``
+        (default), when it has an eigenvalue below ``−_K_TOL·max(‖K‖, 1)``;
+        ``check_psd=False`` skips the eigensolve (the caller vouches for
+        PSD). The Hamiltonian and the ``jump_terms`` are left untouched.
+
+        Rust folds ``K`` into the precompiled per-pair tables and drops
+        pairs with ``|K_nm| ≤ 1e-14·max|K|``, so the setter rebuilds those
+        tables from the stored operators — the Kossakowski part of
+        construction without any string parsing or Python-side work —
+        and afterwards every method gives results bit-identical to a
+        freshly built ``Lindbladian`` with ``K``.
+        """
+        m = self._spec.num_kossakowski_ops
+        if m == 0:
+            raise ValueError(
+                "set_kossakowski: this Lindbladian was built without a kossakowski block"
+            )
+        K = self._validate_k(K, m, check_psd=check_psd, what="set_kossakowski: K")
+        self._spec.set_kossakowski(K)
 
     # ── Pure-ndarray hot path ──
 

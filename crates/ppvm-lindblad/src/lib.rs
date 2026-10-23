@@ -276,13 +276,38 @@ struct PauliTerm {
 /// computed once per group and reused across its `P_b` partners.
 type SandwichGroups = Vec<(Word, Vec<(Word, Complex<f64>)>)>;
 
+/// The `K`-independent part of one Kossakowski pair `(n ≤ m)`, computed
+/// once per operator pair by [`LindbladSpec::add_kossakowski`] and reused
+/// by every [`LindbladSpec::set_kossakowski`]: the Pauli products of
+/// `A_n†A_m`, the sandwich word table with coefficients `λ_a*·μ_b` (no
+/// `K_nm` yet), the support masks and the per-qubit support union. Turning
+/// it into a `JumpKind::KossakowskiPair` is one complex multiply per
+/// stored coefficient.
+#[derive(Clone)]
+struct PairTemplate {
+    n: usize,
+    m: usize,
+    /// `A_n†A_m = Σ_w γ_w W` (FP-noise zeros dropped).
+    adag_b: Vec<PauliTerm>,
+    /// `(P_a, [(P_b, λ_a*·μ_b), …])` grouped by the left word.
+    sand: SandwichGroups,
+    left_mask: [Chunk; W_CHUNKS],
+    right_mask: [Chunk; W_CHUNKS],
+    /// Sorted union of the supports of `A_n` and `A_m`.
+    support: Vec<u32>,
+}
+
 /// One jump operator `L_k` with rate `γ_k`. The `HermitianPauli` variant
 /// is a fast path; `General` handles arbitrary complex Pauli sums.
 #[derive(Clone)]
 enum JumpKind {
     HermitianPauli {
         word: Word,
+        /// Effective rate `γ_k · c²` for `L_k = c · P` (what the action reads).
         rate: f64,
+        /// The real coefficient `c`, kept so [`LindbladSpec::set_jump_rates`]
+        /// can recompute `rate` exactly as [`LindbladSpec::new`] did.
+        coeff_re: f64,
     },
     General {
         terms: Vec<PauliTerm>,         // L = Σ_a λ_a P_a
@@ -343,6 +368,46 @@ fn precompute_adag_b(a_terms: &[PauliTerm], b_terms: &[PauliTerm]) -> Vec<PauliT
         .collect()
 }
 
+/// Validate a Kossakowski pair matrix: `m_ops × m_ops` and Hermitian to
+/// `1e-10 · max(max|K|, 1)`. A non-Hermitian K is not a valid GKSL pair
+/// matrix and would produce a non-Hermiticity-preserving action.
+fn check_k_matrix(
+    k: &[Vec<Complex<f64>>],
+    m_ops: usize,
+    what_rows: &'static str,
+    what_cols: &'static str,
+) -> Result<(), Error> {
+    if k.len() != m_ops {
+        return Err(Error::LengthMismatch {
+            what: what_rows,
+            a: m_ops,
+            b: k.len(),
+        });
+    }
+    for row in k.iter() {
+        if row.len() != m_ops {
+            return Err(Error::LengthMismatch {
+                what: what_cols,
+                a: row.len(),
+                b: m_ops,
+            });
+        }
+    }
+    let max_abs = k
+        .iter()
+        .flat_map(|row| row.iter().map(|c| c.norm()))
+        .fold(0.0_f64, f64::max);
+    let herm_tol = 1e-10 * max_abs.max(1.0);
+    for (n, row_n) in k.iter().enumerate() {
+        for (m, k_nm) in row_n.iter().enumerate().skip(n) {
+            if (k_nm - k[m][n].conj()).norm() > herm_tol {
+                return Err(Error::KMatrixNotHermitian { n, m });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Precompiled Lindbladian. Constructed once from string-form Hamiltonian
 /// terms + jump operators; reused across many calls to [`Self::action`],
 /// [`Self::leakage`], [`Self::generator`]. `L*(p)` is recomputed on every
@@ -362,6 +427,19 @@ pub struct LindbladSpec {
     /// combination of operator `A_i`, shared by every pair that
     /// references it.
     k_ops: Vec<Vec<PauliTerm>>,
+    /// Per-qubit support of each `k_ops` entry (sorted qubit indices).
+    k_op_support: Vec<Vec<u32>>,
+    /// `K`-independent precompilation of every pair `n ≤ m` of `k_ops`, in
+    /// the `(n, m)` lexicographic order the constructor compiles them in.
+    k_pairs: Vec<PairTemplate>,
+    /// Current Kossakowski matrix over the whole `k_ops` table, row-major
+    /// (`k_mat[n][m] = K_nm`); block-diagonal when several blocks were
+    /// added. Source of truth for [`Self::rebuild_kossakowski_pairs`].
+    k_mat: Vec<Vec<Complex<f64>>>,
+    /// User-facing GKSL rates `γ_k` of the jump operators given to
+    /// [`Self::new`], in construction order. `j_kinds[..j_rates.len()]`
+    /// are those jumps; every later entry is a `KossakowskiPair`.
+    j_rates: Vec<f64>,
 }
 
 /// User-facing description of one jump operator: a complex Pauli linear
@@ -402,6 +480,7 @@ impl LindbladSpec {
 
         let mut j_kinds: Vec<JumpKind> = Vec::with_capacity(jumps.len());
         let mut j_support_idx: Vec<Vec<u32>> = vec![Vec::new(); n_qubits];
+        let mut j_rates: Vec<f64> = Vec::with_capacity(jumps.len());
         for (k, jump) in jumps.iter().enumerate() {
             if jump.rate < 0.0 {
                 return Err(Error::NegativeRate {
@@ -412,6 +491,7 @@ impl LindbladSpec {
             if jump.lincomb.is_empty() {
                 return Err(Error::EmptyLincomb { index: k });
             }
+            j_rates.push(jump.rate);
 
             // Fast path: single-term, purely real → Hermitian Pauli.
             if jump.lincomb.len() == 1 && jump.lincomb[0].1.im == 0.0 {
@@ -423,6 +503,7 @@ impl LindbladSpec {
                 j_kinds.push(JumpKind::HermitianPauli {
                     word,
                     rate: jump.rate * c.re * c.re,
+                    coeff_re: c.re,
                 });
                 continue;
             }
@@ -456,6 +537,10 @@ impl LindbladSpec {
             h_support: h_support_idx,
             j_support: j_support_idx,
             k_ops: Vec::new(),
+            k_op_support: Vec::new(),
+            k_pairs: Vec::new(),
+            k_mat: Vec::new(),
+            j_rates,
         })
     }
 
@@ -480,42 +565,10 @@ impl LindbladSpec {
         k: &[Vec<Complex<f64>>],
     ) -> Result<(), Error> {
         let m_ops = ops.len();
-        if k.len() != m_ops {
-            return Err(Error::LengthMismatch {
-                what: "kossakowski ops and K rows",
-                a: m_ops,
-                b: k.len(),
-            });
-        }
-        for (i, row) in k.iter().enumerate() {
-            if row.len() != m_ops {
-                return Err(Error::LengthMismatch {
-                    what: "kossakowski K row and ops",
-                    a: row.len(),
-                    b: m_ops,
-                });
-            }
-            let _ = i;
-        }
-        let max_abs = k
-            .iter()
-            .flat_map(|row| row.iter().map(|c| c.norm()))
-            .fold(0.0_f64, f64::max);
-        // Hermiticity: K_nm must equal conj(K_mn); a non-Hermitian K is
-        // not a valid GKSL pair matrix and would produce a non-Hermiticity-
-        // preserving action.
-        let herm_tol = 1e-10 * max_abs.max(1.0);
-        for (n, row_n) in k.iter().enumerate() {
-            for (m, k_nm) in row_n.iter().enumerate().skip(n) {
-                if (k_nm - k[m][n].conj()).norm() > herm_tol {
-                    return Err(Error::KMatrixNotHermitian { n, m });
-                }
-            }
-        }
+        check_k_matrix(k, m_ops, "kossakowski ops and K rows", "kossakowski K row and ops")?;
 
         // Parse the operator table once; record per-op support.
         let base = self.k_ops.len();
-        let mut op_support: Vec<Vec<u32>> = Vec::with_capacity(m_ops);
         for (i, op) in ops.iter().enumerate() {
             if op.is_empty() {
                 return Err(Error::EmptyLincomb { index: i });
@@ -530,91 +583,248 @@ impl LindbladSpec {
                 }
                 terms.push(PauliTerm { word, coeff: *c });
             }
-            op_support.push(union_support.into_iter().collect());
+            self.k_op_support.push(union_support.into_iter().collect());
             self.k_ops.push(terms);
         }
+
+        // Extend the stored matrix block-diagonally: zero cross-block
+        // entries (dropped by the pair loop, so a second block behaves
+        // exactly as before this bookkeeping existed).
+        let total = base + m_ops;
+        let zero = Complex::new(0.0, 0.0);
+        for row in self.k_mat.iter_mut() {
+            row.resize(total, zero);
+        }
+        for row in k {
+            let mut full = vec![zero; total];
+            full[base..].copy_from_slice(row);
+            self.k_mat.push(full);
+        }
+
+        // K-independent part of every pair `n ≤ m` over the whole table
+        // (templates of earlier blocks are recomputed; the result is the
+        // same, and Python only ever adds one block).
+        let support_mask = |terms: &[PauliTerm]| {
+            let mut mask = [0 as Chunk; W_CHUNKS];
+            for t in terms {
+                for (i, slot) in mask.iter_mut().enumerate() {
+                    *slot |= t.word.xbits.data[i] | t.word.zbits.data[i];
+                }
+            }
+            mask
+        };
+        self.k_pairs.clear();
+        for n in 0..total {
+            for m in n..total {
+                let adag_b = precompute_adag_b(&self.k_ops[n], &self.k_ops[m]);
+                let mut sand = Vec::with_capacity(self.k_ops[n].len());
+                for a in &self.k_ops[n] {
+                    let rights = self.k_ops[m]
+                        .iter()
+                        .map(|b| (b.word, a.coeff.conj() * b.coeff))
+                        .collect();
+                    sand.push((a.word, rights));
+                }
+                let mut union: std::collections::BTreeSet<u32> =
+                    self.k_op_support[n].iter().copied().collect();
+                union.extend(self.k_op_support[m].iter().copied());
+                self.k_pairs.push(PairTemplate {
+                    n,
+                    m,
+                    adag_b,
+                    sand,
+                    left_mask: support_mask(&self.k_ops[n]),
+                    right_mask: support_mask(&self.k_ops[m]),
+                    support: union.into_iter().collect(),
+                });
+            }
+        }
+
+        self.rebuild_kossakowski_pairs();
+        Ok(())
+    }
+
+    /// Replace the Kossakowski matrix in place, keeping the operator basis
+    /// `A_n` given to [`Self::add_kossakowski`].
+    ///
+    /// `k` is the new `M × M` Hermitian pair matrix over the whole operator
+    /// table (`M = `[`Self::num_kossakowski_ops`]); positive
+    /// semi-definiteness is the caller's responsibility, as at
+    /// construction. `K` is folded into every precompiled
+    /// `KossakowskiPair` table (`sand`, `dd`, `dd_anti`) and decides which
+    /// pairs exist at all (entries below `1e-14 · max|K|` are dropped), so
+    /// the setter rebuilds the pair list from the stored operator table
+    /// with the very same loop the constructor runs: the result is
+    /// bit-identical to a spec freshly built with `k`. The Pauli products
+    /// of `A_n†A_m` and the sandwich word tables are `K`-independent and
+    /// cached per pair ([`PairTemplate`]) at `add_kossakowski`, so the
+    /// rebuild is one complex multiply per stored coefficient
+    /// (`O(Σ_{n≤m} |A_n|·|A_m|)` multiplies, no Pauli arithmetic, no
+    /// hashing). The Hamiltonian and plain jump data are untouched.
+    pub fn set_kossakowski(&mut self, k: &[Vec<Complex<f64>>]) -> Result<(), Error> {
+        let m_ops = self.k_ops.len();
+        if m_ops == 0 {
+            return Err(Error::NoKossakowski);
+        }
+        check_k_matrix(
+            k,
+            m_ops,
+            "set_kossakowski: num_kossakowski_ops vs K rows",
+            "set_kossakowski: K row and num_kossakowski_ops",
+        )?;
+        self.k_mat = k.to_vec();
+        self.rebuild_kossakowski_pairs();
+        Ok(())
+    }
+
+    /// Current Kossakowski matrix over the whole operator table, row-major
+    /// (`M × M`, empty when no block was added).
+    pub fn kossakowski(&self) -> Vec<Vec<Complex<f64>>> {
+        self.k_mat.clone()
+    }
+
+    /// Number `M` of Kossakowski operators `A_n` (0 without a block).
+    pub fn num_kossakowski_ops(&self) -> usize {
+        self.k_ops.len()
+    }
+
+    /// Drop every `KossakowskiPair` entry and rebuild them from `k_ops` /
+    /// `k_mat`. The plain jumps of [`Self::new`] occupy
+    /// `j_kinds[..j_rates.len()]` and are kept; `j_support` is pruned of
+    /// the old pair indices (`candidate_terms` sorts and dedups, so the
+    /// order of a support list is immaterial) and refilled.
+    fn rebuild_kossakowski_pairs(&mut self) {
+        let start = self.j_rates.len();
+        self.j_kinds.truncate(start);
+        for list in self.j_support.iter_mut() {
+            list.retain(|&i| (i as usize) < start);
+        }
+        let k = &self.k_mat;
+        let max_abs = k
+            .iter()
+            .flat_map(|row| row.iter().map(|c| c.norm()))
+            .fold(0.0_f64, f64::max);
 
         // One JumpKind entry per non-negligible pair, indexed by the union
         // support of A_n and A_m so the per-string candidate lookup only
         // visits pairs that can act nontrivially.
-        // Fold each Hermitian-conjugate pair `(n,m)`+`(m,n)` into one
+        // Each Hermitian-conjugate pair `(n,m)`+`(m,n)` is folded into one
         // upper-triangle entry (`n ≤ m`). Both sandwiches produce the same
         // output words with conjugate phase, and the final action keeps only
         // the real part, so `(n,m)` alone suffices if it doubles-and-takes-Re
         // — halving the pair count. The diagonal `(n,n)` is a single pair.
         let pair_tol = 1e-14 * max_abs;
-        for n in 0..m_ops {
-            for m in n..m_ops {
-                if k[n][m].norm() <= pair_tol {
-                    continue;
-                }
-                let off_diag = n != m;
-                // A_n†A_m as `Σ γ_w W`, scaled by `K_nm`.
-                let adag_b = precompute_adag_b(&self.k_ops[base + n], &self.k_ops[base + m]);
-                let (dd, dd_anti): (Vec<PauliTerm>, Vec<PauliTerm>) = if off_diag {
-                    // dd = 2·Re(K_nm γ_w) (Hermitian sum, both-sided anticomm);
-                    // dd_anti = −2i·Im(K_nm γ_w) (anti-Herm diff, one-sided).
-                    let mut dd = Vec::with_capacity(adag_b.len());
-                    let mut da = Vec::with_capacity(adag_b.len());
-                    for t in &adag_b {
-                        let c = k[n][m] * t.coeff;
-                        if c.re.abs() > 1e-14 {
-                            dd.push(PauliTerm {
-                                word: t.word,
-                                coeff: Complex::new(2.0 * c.re, 0.0),
-                            });
-                        }
-                        if c.im.abs() > 1e-14 {
-                            da.push(PauliTerm {
-                                word: t.word,
-                                coeff: Complex::new(0.0, -2.0 * c.im),
-                            });
-                        }
+        for t in &self.k_pairs {
+            let k_nm = k[t.n][t.m];
+            if k_nm.norm() <= pair_tol {
+                continue;
+            }
+            let off_diag = t.n != t.m;
+            // A_n†A_m as `Σ γ_w W`, scaled by `K_nm`.
+            let (dd, dd_anti): (Vec<PauliTerm>, Vec<PauliTerm>) = if off_diag {
+                // dd = 2·Re(K_nm γ_w) (Hermitian sum, both-sided anticomm);
+                // dd_anti = −2i·Im(K_nm γ_w) (anti-Herm diff, one-sided).
+                let mut dd = Vec::with_capacity(t.adag_b.len());
+                let mut da = Vec::with_capacity(t.adag_b.len());
+                for term in &t.adag_b {
+                    let c = k_nm * term.coeff;
+                    if c.re.abs() > 1e-14 {
+                        dd.push(PauliTerm {
+                            word: term.word,
+                            coeff: Complex::new(2.0 * c.re, 0.0),
+                        });
                     }
-                    (dd, da)
-                } else {
-                    let dd = adag_b
-                        .iter()
-                        .map(|t| PauliTerm {
-                            word: t.word,
-                            coeff: k[n][m] * t.coeff,
-                        })
-                        .collect();
-                    (dd, Vec::new())
-                };
-                let mut sand = Vec::with_capacity(self.k_ops[base + n].len());
-                for a in &self.k_ops[base + n] {
-                    let rights = self.k_ops[base + m]
-                        .iter()
-                        .map(|b| (b.word, a.coeff.conj() * b.coeff * k[n][m]))
-                        .collect();
-                    sand.push((a.word, rights));
-                }
-                let support_mask = |terms: &[PauliTerm]| {
-                    let mut mask = [0 as Chunk; W_CHUNKS];
-                    for t in terms {
-                        for (i, slot) in mask.iter_mut().enumerate() {
-                            *slot |= t.word.xbits.data[i] | t.word.zbits.data[i];
-                        }
+                    if c.im.abs() > 1e-14 {
+                        da.push(PauliTerm {
+                            word: term.word,
+                            coeff: Complex::new(0.0, -2.0 * c.im),
+                        });
                     }
-                    mask
-                };
-                let left_mask = support_mask(&self.k_ops[base + n]);
-                let right_mask = support_mask(&self.k_ops[base + m]);
-                let idx = self.j_kinds.len() as u32;
-                self.j_kinds.push(JumpKind::KossakowskiPair {
-                    sand,
-                    dd,
-                    dd_anti,
-                    off_diag,
-                    left_mask,
-                    right_mask,
-                });
-                let mut union: std::collections::BTreeSet<u32> =
-                    op_support[n].iter().copied().collect();
-                union.extend(op_support[m].iter().copied());
-                for q in union {
-                    self.j_support[q as usize].push(idx);
+                }
+                (dd, da)
+            } else {
+                let dd = t
+                    .adag_b
+                    .iter()
+                    .map(|term| PauliTerm {
+                        word: term.word,
+                        coeff: k_nm * term.coeff,
+                    })
+                    .collect();
+                (dd, Vec::new())
+            };
+            let sand: SandwichGroups = t
+                .sand
+                .iter()
+                .map(|(wa, rights)| {
+                    (*wa, rights.iter().map(|(wb, c0)| (*wb, c0 * k_nm)).collect())
+                })
+                .collect();
+            let idx = self.j_kinds.len() as u32;
+            self.j_kinds.push(JumpKind::KossakowskiPair {
+                sand,
+                dd,
+                dd_anti,
+                off_diag,
+                left_mask: t.left_mask,
+                right_mask: t.right_mask,
+            });
+            for &q in &t.support {
+                self.j_support[q as usize].push(idx);
+            }
+        }
+    }
+
+    /// Current GKSL rates `γ_k` of the jump operators given to
+    /// [`Self::new`], in construction order (Kossakowski pairs excluded).
+    pub fn jump_rates(&self) -> Vec<f64> {
+        self.j_rates.clone()
+    }
+
+    /// Number of jump operators given to [`Self::new`] (the length of
+    /// [`Self::jump_rates`]); unlike [`Self::num_jump_terms`] this does not
+    /// count Kossakowski pairs.
+    pub fn num_jump_ops(&self) -> usize {
+        self.j_rates.len()
+    }
+
+    /// Overwrite the jump rates in place, keeping the jump operators, the
+    /// support index and the Kossakowski block.
+    ///
+    /// `rates[k]` is the new non-negative `γ_k` of the `k`-th jump of
+    /// [`Self::new`]. The rate is read directly by the action for a
+    /// general jump, and as `γ_k · c²` for the Hermitian-Pauli fast path
+    /// (recomputed here exactly as the constructor does), so this is an
+    /// `O(num_jump_ops)` update and every later `action` / `leakage` /
+    /// `generator` / `pc_step` is bit-identical to a spec freshly built
+    /// with `rates`. A zero rate keeps its term, as the constructor does.
+    pub fn set_jump_rates(&mut self, rates: &[f64]) -> Result<(), Error> {
+        if self.j_rates.is_empty() {
+            return Err(Error::NoJumpOps);
+        }
+        if rates.len() != self.j_rates.len() {
+            return Err(Error::LengthMismatch {
+                what: "set_jump_rates: num_jump_ops vs rates",
+                a: self.j_rates.len(),
+                b: rates.len(),
+            });
+        }
+        for (k, &r) in rates.iter().enumerate() {
+            if r < 0.0 {
+                return Err(Error::NegativeRate { index: k, rate: r });
+            }
+        }
+        for (k, &r) in rates.iter().enumerate() {
+            self.j_rates[k] = r;
+            match &mut self.j_kinds[k] {
+                JumpKind::HermitianPauli { rate, coeff_re, .. } => {
+                    *rate = r * *coeff_re * *coeff_re;
+                }
+                JumpKind::General { rate, .. } => {
+                    *rate = r;
+                }
+                JumpKind::KossakowskiPair { .. } => {
+                    unreachable!("Kossakowski pairs follow the plain jumps in j_kinds")
                 }
             }
         }
@@ -1078,7 +1288,7 @@ impl LindbladSpec {
         candidate_terms(scratch_support, &self.j_support, scratch_cands);
         for &k in scratch_cands.iter() {
             match &self.j_kinds[k as usize] {
-                JumpKind::HermitianPauli { word, rate } => {
+                JumpKind::HermitianPauli { word, rate, .. } => {
                     if anti_commutes(word, p) {
                         *local.entry(*p).or_insert(zero) += Complex::new(-2.0 * *rate, 0.0);
                     }
@@ -1498,6 +1708,147 @@ mod tests {
         ];
         let err = spec.add_kossakowski(&[sigma_minus_lincomb(0, n), sigma_minus_lincomb(1, n)], &k);
         assert!(matches!(err, Err(Error::KMatrixNotHermitian { .. })));
+    }
+
+    /// Exact bit-level equality of two action maps (same words, same f64s).
+    fn assert_actions_identical(a: &FxHashMap<Word, f64>, b: &FxHashMap<Word, f64>) {
+        assert_eq!(a.len(), b.len(), "different numbers of output words");
+        for (w, va) in a {
+            let vb = b.get(w).expect("word missing from the other action");
+            assert!(va.to_bits() == vb.to_bits(), "{va} != {vb} (bitwise)");
+        }
+    }
+
+    /// Deterministic complex Hermitian PSD `M × M` matrix `A A†` with a
+    /// seed-dependent `A` (no RNG dependency in the crate).
+    fn psd_matrix(m: usize, seed: u64) -> Vec<Vec<Complex<f64>>> {
+        let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+        };
+        let a: Vec<Vec<Complex<f64>>> = (0..m)
+            .map(|_| (0..m).map(|_| Complex::new(next(), next())).collect())
+            .collect();
+        (0..m)
+            .map(|i| {
+                (0..m)
+                    .map(|j| (0..m).map(|l| a[i][l] * a[j][l].conj()).sum::<Complex<f64>>())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn setter_fixture(
+        n: usize,
+        rates: &[f64],
+        k: &[Vec<Complex<f64>>],
+    ) -> LindbladSpec {
+        let h: Vec<(String, f64)> = (0..n)
+            .map(|q| {
+                let mut s = vec!['Z'; n];
+                s[q] = 'X';
+                (s.into_iter().collect(), 0.3 + 0.1 * q as f64)
+            })
+            .collect();
+        let jumps = vec![
+            // Hermitian-Pauli fast path with a non-unit coefficient (rate · c²).
+            JumpInput {
+                lincomb: vec![(format!("Z{}", "I".repeat(n - 1)), Complex::new(0.7, 0.0))],
+                rate: rates[0],
+            },
+            JumpInput {
+                lincomb: sigma_minus_lincomb(1, n),
+                rate: rates[1],
+            },
+            jump_hpauli(&format!("{}Z", "I".repeat(n - 1)), rates[2]),
+        ];
+        let mut spec = LindbladSpec::new(n, &h, &jumps).unwrap();
+        let ops: Vec<_> = (0..n).map(|q| sigma_minus_lincomb(q, n)).collect();
+        spec.add_kossakowski(&ops, k).unwrap();
+        spec
+    }
+
+    /// `set_kossakowski` / `set_jump_rates` followed by `action` are
+    /// bit-identical to a freshly built spec, including a K with an exact
+    /// zero entry (a pair that is dropped) and a zero rate.
+    #[test]
+    fn setters_match_fresh_construction_bitwise() {
+        let n = 3;
+        let rates0 = [0.2, 0.5, 0.1];
+        let rates1 = [0.9, 0.0, 0.35];
+        let k0 = psd_matrix(n, 1);
+        let mut k1 = psd_matrix(n, 2);
+        k1[0][2] = Complex::new(0.0, 0.0);
+        k1[2][0] = Complex::new(0.0, 0.0);
+
+        let mut spec = setter_fixture(n, &rates0, &k0);
+        assert_eq!(spec.num_jump_ops(), 3);
+        assert_eq!(spec.num_kossakowski_ops(), n);
+        assert_eq!(spec.jump_rates(), rates0.to_vec());
+        assert_eq!(spec.kossakowski(), k0);
+
+        spec.set_kossakowski(&k1).unwrap();
+        assert_eq!(spec.kossakowski(), k1);
+        let fresh = setter_fixture(n, &rates0, &k1);
+        assert_eq!(spec.num_jump_terms(), fresh.num_jump_terms());
+        for s in ["ZII", "IZI", "IIZ", "XII", "IYI", "XXI", "ZYZ", "XYZ", "IXX"] {
+            let (p, _) = parse_pauli_string(s, n).unwrap();
+            assert_actions_identical(&action_map(&spec, &p), &action_map(&fresh, &p));
+        }
+
+        spec.set_jump_rates(&rates1).unwrap();
+        assert_eq!(spec.jump_rates(), rates1.to_vec());
+        let fresh = setter_fixture(n, &rates1, &k1);
+        for s in ["ZII", "IZI", "IIZ", "XII", "IYI", "XXI", "ZYZ", "XYZ", "IXX"] {
+            let (p, _) = parse_pauli_string(s, n).unwrap();
+            assert_actions_identical(&action_map(&spec, &p), &action_map(&fresh, &p));
+        }
+
+        // Back to the original K: identical to the original construction.
+        spec.set_kossakowski(&k0).unwrap();
+        let fresh = setter_fixture(n, &rates1, &k0);
+        for s in ["ZII", "XXI", "ZYZ"] {
+            let (p, _) = parse_pauli_string(s, n).unwrap();
+            assert_actions_identical(&action_map(&spec, &p), &action_map(&fresh, &p));
+        }
+    }
+
+    #[test]
+    fn setters_reject_bad_input() {
+        let n = 2;
+        let k0 = psd_matrix(n, 3);
+        let mut spec = setter_fixture(n, &[0.1, 0.2, 0.3], &k0);
+        // Wrong shapes.
+        assert!(matches!(
+            spec.set_kossakowski(&psd_matrix(3, 4)),
+            Err(Error::LengthMismatch { .. })
+        ));
+        assert!(matches!(
+            spec.set_kossakowski(&[vec![Complex::new(1.0, 0.0)], vec![Complex::new(1.0, 0.0)]]),
+            Err(Error::LengthMismatch { .. })
+        ));
+        assert!(matches!(spec.set_jump_rates(&[0.1, 0.2]), Err(Error::LengthMismatch { .. })));
+        assert!(matches!(
+            spec.set_jump_rates(&[0.1, -0.2, 0.3]),
+            Err(Error::NegativeRate { index: 1, .. })
+        ));
+        // Non-Hermitian K.
+        let mut bad = k0.clone();
+        bad[0][1] += Complex::new(0.0, 1e-3);
+        assert!(matches!(spec.set_kossakowski(&bad), Err(Error::KMatrixNotHermitian { .. })));
+        // Nothing changed after the failures.
+        assert_eq!(spec.kossakowski(), k0);
+        assert_eq!(spec.jump_rates(), vec![0.1, 0.2, 0.3]);
+        // Specs without the corresponding block.
+        let mut plain = LindbladSpec::new(n, &[], &[jump_hpauli("ZI", 0.1)]).unwrap();
+        assert!(matches!(plain.set_kossakowski(&k0), Err(Error::NoKossakowski)));
+        let mut none = LindbladSpec::new(n, &[("XX".to_string(), 1.0)], &[]).unwrap();
+        assert!(matches!(none.set_jump_rates(&[]), Err(Error::NoJumpOps)));
+        assert_eq!(none.jump_rates(), Vec::<f64>::new());
+        assert!(none.kossakowski().is_empty());
     }
 
     fn jump_hpauli(s: &str, rate: f64) -> JumpInput {

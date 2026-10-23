@@ -38,6 +38,10 @@ pub enum Error {
         n: usize,
         m: usize,
     },
+    /// `set_kossakowski` on a spec built without a Kossakowski block.
+    NoKossakowski,
+    /// `set_jump_rates` on a spec built without jump operators.
+    NoJumpOps,
     Internal(String),
 }
 
@@ -75,6 +79,14 @@ impl fmt::Display for Error {
             Error::KMatrixNotHermitian { n, m } => write!(
                 f,
                 "Kossakowski matrix is not Hermitian: K[{n}][{m}] != conj(K[{m}][{n}])"
+            ),
+            Error::NoKossakowski => write!(
+                f,
+                "set_kossakowski: this LindbladSpec was built without a Kossakowski block"
+            ),
+            Error::NoJumpOps => write!(
+                f,
+                "set_jump_rates: this LindbladSpec was built without jump operators"
             ),
             Error::Internal(msg) => write!(f, "internal error: {msg}"),
         }
