@@ -14,6 +14,7 @@ use pyo3::prelude::*;
 pub mod interface;
 pub mod interface_tableau;
 pub mod interface_tableau_sum;
+pub mod block_lindblad;
 pub mod lindblad;
 pub mod stim_program;
 pub mod symmetry;
@@ -309,6 +310,8 @@ pub mod _core {
     // Lindbladian time evolution
     #[pymodule_export]
     pub use crate::lindblad::LindbladSpec;
+    #[pymodule_export]
+    pub use crate::block_lindblad::BlockLindbladSpec;
 
     // Symmetry merging
     #[pymodule_export]

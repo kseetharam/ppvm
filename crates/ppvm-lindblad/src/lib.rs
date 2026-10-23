@@ -40,6 +40,7 @@ use ppvm_traits::PauliWordTrait;
 use rayon::prelude::*;
 use std::time::Instant;
 
+pub mod block;
 pub mod config;
 pub mod error;
 pub(crate) mod expm;
@@ -75,6 +76,7 @@ pub const MAX_QUBITS: usize = 128;
 /// `REHASH=true` means `set()` keeps the cached hash in sync.
 pub type Word = PauliWord<[Chunk; W_CHUNKS], FxBuildHasher, true>;
 
+pub use block::BlockLindbladSpec;
 pub use config::PcStepConfig;
 pub use error::Error;
 
@@ -1237,7 +1239,7 @@ impl LindbladSpec {
 /// cached hash once through `FxHasher` and never touches the 32-byte
 /// payload.
 #[inline(always)]
-fn word_hash(w: &Word) -> u64 {
+pub(crate) fn word_hash(w: &Word) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = fxhash::FxHasher::default();
     w.hash(&mut h);
@@ -1247,7 +1249,7 @@ fn word_hash(w: &Word) -> u64 {
 /// Compact `basis` / `coeffs` in place: drop entries whose absolute
 /// coefficient is below `drop_tol` unless the word appears in `protected`.
 /// No-op when `drop_tol ≤ 0`.
-fn prune_basis(basis: &mut Vec<Word>, coeffs: &mut Vec<f64>, drop_tol: f64, protected: &[Word]) {
+pub(crate) fn prune_basis(basis: &mut Vec<Word>, coeffs: &mut Vec<f64>, drop_tol: f64, protected: &[Word]) {
     if drop_tol <= 0.0 {
         return;
     }
@@ -1271,7 +1273,7 @@ fn prune_basis(basis: &mut Vec<Word>, coeffs: &mut Vec<f64>, drop_tol: f64, prot
 /// `max_basis` largest-|coeff| terms (protected strings always kept),
 /// dropping the rest. Rank-based total-basis bound; dual of `drop_tol`.
 /// A `max_basis` large enough to cover the whole basis is a no-op.
-fn cap_basis(basis: &mut Vec<Word>, coeffs: &mut Vec<f64>, max_basis: usize, protected: &[Word]) {
+pub(crate) fn cap_basis(basis: &mut Vec<Word>, coeffs: &mut Vec<f64>, max_basis: usize, protected: &[Word]) {
     if basis.len() <= max_basis {
         return;
     }
@@ -1314,7 +1316,7 @@ fn cap_basis(basis: &mut Vec<Word>, coeffs: &mut Vec<f64>, max_basis: usize, pro
 /// expm/leakage peak memory) never exceeds `max_basis`. New strings get
 /// coefficient 0; the surrounding expm fills them. No magnitude filter: the
 /// top-`room` by `|leakage|` are added (a large `max_basis` adds them all).
-fn add_leakage_capped(
+pub(crate) fn add_leakage_capped(
     basis: &mut Vec<Word>,
     coeffs: &mut Vec<f64>,
     mut leak: Vec<(Word, f64)>,

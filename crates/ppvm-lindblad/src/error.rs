@@ -38,6 +38,16 @@ pub enum Error {
         n: usize,
         m: usize,
     },
+    /// Block Lindbladian: a species index at or beyond `n_species`.
+    SpeciesOutOfRange {
+        got: usize,
+        n_species: usize,
+    },
+    /// Block Lindbladian: a matching that is not a permutation of the qubits.
+    InvalidMatching {
+        c: usize,
+        d: usize,
+    },
     Internal(String),
 }
 
@@ -75,6 +85,13 @@ impl fmt::Display for Error {
             Error::KMatrixNotHermitian { n, m } => write!(
                 f,
                 "Kossakowski matrix is not Hermitian: K[{n}][{m}] != conj(K[{m}][{n}])"
+            ),
+            Error::SpeciesOutOfRange { got, n_species } => {
+                write!(f, "species index {got} out of range for n_species = {n_species}")
+            }
+            Error::InvalidMatching { c, d } => write!(
+                f,
+                "matching ({c}, {d}) is not a permutation of the qubit positions"
             ),
             Error::Internal(msg) => write!(f, "internal error: {msg}"),
         }
