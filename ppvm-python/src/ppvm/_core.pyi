@@ -431,6 +431,61 @@ class LindbladSpec:
     ) -> tuple[np.ndarray, np.ndarray]: ...
     def generator(self, basis: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]: ...
 
+class BlockLindbladSpec:
+    def __init__(
+        self,
+        n_qubits: int,
+        n_species: int,
+        h_terms: list[list[str]],
+        h_coeffs: list[list[float]],
+        jump_lincombs: list[list[list[tuple[str, float, float]]]],
+        jump_rates: list[list[float]],
+        kossakowski_ops: list[list[list[tuple[str, float, float]]]],
+        kossakowski_k: list[list[list[tuple[float, float]]]],
+        exchange: list[list[float]],
+        matchings: list[tuple[int, int, list[int]]],
+    ) -> None: ...
+    @property
+    def n_qubits(self) -> int: ...
+    @property
+    def n_species(self) -> int: ...
+    @property
+    def n_digits(self) -> int: ...
+    @property
+    def exchange(self) -> list[list[float]]: ...
+    @property
+    def rate_out(self) -> list[float]: ...
+    def num_h_terms(self, species: int) -> int: ...
+    def num_jump_terms(self, species: int) -> int: ...
+    def h_coeffs(self, species: int) -> np.ndarray: ...
+    def set_h_coeffs(self, species: int, coeffs: np.ndarray) -> None: ...
+    def action(self, species: int, p: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]: ...
+    def leakage(
+        self,
+        basis: np.ndarray,
+        species: np.ndarray,
+        coeffs: np.ndarray,
+        protected_basis: np.ndarray | None = None,
+        protected_species: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]: ...
+    def pc_step(
+        self,
+        basis: np.ndarray,
+        species: np.ndarray,
+        coeffs: np.ndarray,
+        dt: float,
+        max_basis: int,
+        drop_tol: float = 0.0,
+        protected_basis: np.ndarray | None = None,
+        protected_species: np.ndarray | None = None,
+        num_threads: int | None = None,
+        admit_basis: int | None = None,
+        tau_add: float | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]: ...
+    def generator(
+        self, basis: np.ndarray, species: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]: ...
+
 class TranslationGroup:
     @staticmethod
     def chain_1d(n: int) -> TranslationGroup: ...

@@ -28,6 +28,40 @@ use num::Complex;
 use quspin_types::{ExpmComputation, LinearOperator, QuSpinError};
 use rayon::prelude::*;
 
+/// A generator whose action on one Pauli word can be enumerated: the
+/// [`LindbladSpec`] itself and the block (chemical-exchange) spec of
+/// [`crate::block`]. The expm engine below is generic over it; everything it
+/// needs is the per-word `(output, coefficient)` list.
+pub(crate) trait ActionTerms: Sync {
+    /// Capacity hint for the support scratch vector (the physical qubit count).
+    fn scratch_qubits(&self) -> usize;
+    /// `L*(p)` as deduplicated `(word, coefficient)` pairs, without the input
+    /// coefficient; the scratch buffers are reused across calls on a thread.
+    fn action_terms(
+        &self,
+        p: &Word,
+        s1: &mut Vec<u32>,
+        s2: &mut Vec<u32>,
+        lm: &mut FxHashMap<Word, Complex<f64>>,
+    ) -> Vec<(Word, f64)>;
+}
+
+impl ActionTerms for LindbladSpec {
+    fn scratch_qubits(&self) -> usize {
+        self.n_qubits()
+    }
+
+    fn action_terms(
+        &self,
+        p: &Word,
+        s1: &mut Vec<u32>,
+        s2: &mut Vec<u32>,
+        lm: &mut FxHashMap<Word, Complex<f64>>,
+    ) -> Vec<(Word, f64)> {
+        self.compute_action_terms(p, s1, s2, lm)
+    }
+}
+
 /// Per-column in-basis action of the real generator `M`, plus the data the
 /// `(m, s)`/`μ` selection needs — all from ONE action pass over the basis.
 ///
@@ -43,8 +77,8 @@ type MfCols = Vec<Vec<(u32, f64)>>;
 /// Per-column `(raw, diag)` for the `μ`/1-norm selection.
 type MfPerCol = Vec<(f64, f64)>;
 
-fn build_mf_cols(
-    spec: &LindbladSpec,
+fn build_mf_cols<S: ActionTerms + ?Sized>(
+    spec: &S,
     basis: &[Word],
     index: &FxHashMap<Word, u32>,
 ) -> (MfCols, MfPerCol) {
@@ -53,7 +87,7 @@ fn build_mf_cols(
         .map_init(
             || {
                 (
-                    Vec::<u32>::with_capacity(spec.n_qubits()),
+                    Vec::<u32>::with_capacity(spec.scratch_qubits()),
                     Vec::<u32>::with_capacity(128),
                     FxHashMap::<Word, Complex<f64>>::with_capacity_and_hasher(
                         128,
@@ -62,7 +96,7 @@ fn build_mf_cols(
                 )
             },
             |(s1, s2, lm), p| {
-                let terms = spec.compute_action_terms(p, s1, s2, lm);
+                let terms = spec.action_terms(p, s1, s2, lm);
                 let mut out = Vec::with_capacity(terms.len());
                 let mut raw = 0.0;
                 let mut diag = 0.0;
@@ -225,8 +259,8 @@ where
 /// exact column 1-norm of `M − μ·I`; from `‖dt·(M−μI)‖₁` we pick the Taylor
 /// partition `(m*, s)` and hand everything to
 /// [`quspin_expm::ExpmOp::from_parts`].
-pub(crate) fn expm_apply_mf(
-    spec: &LindbladSpec,
+pub(crate) fn expm_apply_mf<S: ActionTerms + ?Sized>(
+    spec: &S,
     basis: &[Word],
     dt: f64,
     coeffs: &[f64],

@@ -42,6 +42,16 @@ pub enum Error {
     NoKossakowski,
     /// `set_jump_rates` on a spec built without jump operators.
     NoJumpOps,
+    /// Block Lindbladian: a species index at or beyond `n_species`.
+    SpeciesOutOfRange {
+        got: usize,
+        n_species: usize,
+    },
+    /// Block Lindbladian: a matching that is not a permutation of the qubits.
+    InvalidMatching {
+        c: usize,
+        d: usize,
+    },
     Internal(String),
 }
 
@@ -87,6 +97,13 @@ impl fmt::Display for Error {
             Error::NoJumpOps => write!(
                 f,
                 "set_jump_rates: this LindbladSpec was built without jump operators"
+            ),
+            Error::SpeciesOutOfRange { got, n_species } => {
+                write!(f, "species index {got} out of range for n_species = {n_species}")
+            }
+            Error::InvalidMatching { c, d } => write!(
+                f,
+                "matching ({c}, {d}) is not a permutation of the qubit positions"
             ),
             Error::Internal(msg) => write!(f, "internal error: {msg}"),
         }
