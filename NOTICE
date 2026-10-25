@@ -4,3 +4,9 @@ Copyright 2026 The PPVM Authors.
 This product was initially developed at QuEra Computing Inc.
 (https://www.quera.com/). See the AUTHORS file for the full list of
 copyright holders.
+
+Modifications in this fork (branch capability-requests and its descendants):
+Copyright 2026 Kushal Seetharam. Licensed under the Apache License, Version 2.0.
+Additions: Lindbladian.set_h_coeffs (time-dependent Hamiltonian coefficients),
+set_kossakowski / set_jump_rates (dissipator setters), BlockLindbladian (block
+structure for chemical exchange), and the related Python bindings and tests.
