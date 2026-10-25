@@ -410,6 +410,103 @@ fn check_k_matrix(
     Ok(())
 }
 
+/// One stored entry `(row, col, K[row][col])` of the Kossakowski matrix.
+pub type KEntry = (u32, u32, Complex<f64>);
+
+/// Bring `(row, col, value)` triples over an `m_ops`-operator table into the
+/// stored form: indices checked, sorted by `(row, col)`, duplicates summed
+/// (the COO convention), exact zeros dropped. No Hermiticity check here
+/// ([`hermitian_completion`] does it on the merged list).
+fn ingest_k_entries(
+    entries: impl IntoIterator<Item = (usize, usize, Complex<f64>)>,
+    m_ops: usize,
+    what: &'static str,
+) -> Result<Vec<KEntry>, Error> {
+    let mut out: Vec<KEntry> = Vec::new();
+    for (r, c, v) in entries {
+        for &i in &[r, c] {
+            if i >= m_ops {
+                return Err(Error::KIndexOutOfRange {
+                    what,
+                    index: i,
+                    m_ops,
+                });
+            }
+        }
+        out.push((r as u32, c as u32, v));
+    }
+    out.sort_by_key(|&(r, c, _)| (r, c));
+    let mut merged: Vec<KEntry> = Vec::with_capacity(out.len());
+    for e in out {
+        if let Some(last) = merged.last_mut() {
+            if last.0 == e.0 && last.1 == e.1 {
+                last.2 += e.2;
+                continue;
+            }
+        }
+        merged.push(e);
+    }
+    merged.retain(|e| e.2.re != 0.0 || e.2.im != 0.0);
+    Ok(merged)
+}
+
+/// The nonzero entries of a dense (already Hermitian-checked) `K`, offset
+/// by `base` on both indices, in row-major order — the stored form of a
+/// dense input.
+fn dense_k_entries(k: &[Vec<Complex<f64>>], base: usize) -> impl Iterator<Item = KEntry> + '_ {
+    k.iter().enumerate().flat_map(move |(n, row)| {
+        row.iter().enumerate().filter_map(move |(m, &v)| {
+            (v.re != 0.0 || v.im != 0.0).then_some(((base + n) as u32, (base + m) as u32, v))
+        })
+    })
+}
+
+/// Check sorted, deduplicated entries for Hermiticity to
+/// `1e-10·max(max|K|, 1)` — the tolerance of [`check_k_matrix`] — and return
+/// the Hermitian completion: every entry as stored plus the conjugate mirror
+/// of each off-diagonal entry whose mirror was not given (a one-sided COO
+/// input: "only one triangle" means "the other is its conjugate"). A
+/// diagonal entry must be real to the tolerance; an off-diagonal entry
+/// present in both triangles must match its mirror's conjugate. Sorted by
+/// `(row, col)`.
+fn hermitian_completion(entries: &[KEntry]) -> Result<Vec<KEntry>, Error> {
+    let max_abs = entries
+        .iter()
+        .map(|e| e.2.norm())
+        .fold(0.0_f64, f64::max);
+    let tol = 1e-10 * max_abs.max(1.0);
+    let mut out: Vec<KEntry> = Vec::with_capacity(entries.len());
+    for &(r, c, v) in entries {
+        if r == c {
+            if (v - v.conj()).norm() > tol {
+                return Err(Error::KMatrixNotHermitian {
+                    n: r as usize,
+                    m: c as usize,
+                });
+            }
+            out.push((r, c, v));
+            continue;
+        }
+        match entries.binary_search_by_key(&(c, r), |e| (e.0, e.1)) {
+            Ok(j) => {
+                if (v - entries[j].2.conj()).norm() > tol {
+                    return Err(Error::KMatrixNotHermitian {
+                        n: r.min(c) as usize,
+                        m: r.max(c) as usize,
+                    });
+                }
+                out.push((r, c, v));
+            }
+            Err(_) => {
+                out.push((r, c, v));
+                out.push((c, r, v.conj()));
+            }
+        }
+    }
+    out.sort_by_key(|&(r, c, _)| (r, c));
+    Ok(out)
+}
+
 /// Precompiled Lindbladian. Constructed once from string-form Hamiltonian
 /// terms + jump operators; reused across many calls to [`Self::action`],
 /// [`Self::leakage`], [`Self::generator`]. `L*(p)` is recomputed on every
@@ -431,13 +528,23 @@ pub struct LindbladSpec {
     k_ops: Vec<Vec<PauliTerm>>,
     /// Per-qubit support of each `k_ops` entry (sorted qubit indices).
     k_op_support: Vec<Vec<u32>>,
-    /// `K`-independent precompilation of every pair `n ≤ m` of `k_ops`, in
-    /// the `(n, m)` lexicographic order the constructor compiles them in.
+    /// `K`-independent precompilation of the pairs `n ≤ m` of `k_ops` that
+    /// are non-negligible in the current `K` (`|K_nm| > 1e-14·max|K|`), in
+    /// `(n, m)` lexicographic order — the order the dense constructor always
+    /// compiled them in. Pairs that are zero in `K` (the off-block entries
+    /// of a block-diagonal `K`) get no template, so the memory is
+    /// `O(nonzero pairs)`, never `O(M²)`. Templates survive a
+    /// `set_kossakowski*` call while their pair stays non-negligible
+    /// ([`Self::recompile_kossakowski`]).
     k_pairs: Vec<PairTemplate>,
-    /// Current Kossakowski matrix over the whole `k_ops` table, row-major
-    /// (`k_mat[n][m] = K_nm`); block-diagonal when several blocks were
-    /// added. Source of truth for [`Self::rebuild_kossakowski_pairs`].
-    k_mat: Vec<Vec<Complex<f64>>>,
+    /// `K_nm` of each `k_pairs` entry (parallel to `k_pairs`).
+    k_vals: Vec<Complex<f64>>,
+    /// Current Kossakowski matrix over the whole `k_ops` table in sparse
+    /// form: every nonzero `(row, col, K[row][col])`, both triangles,
+    /// Hermitian-completed, sorted by `(row, col)`. Source of truth for
+    /// [`Self::kossakowski`] / [`Self::kossakowski_entries`]; the dense
+    /// matrix is never stored.
+    k_entries: Vec<KEntry>,
     /// User-facing GKSL rates `γ_k` of the jump operators given to
     /// [`Self::new`], in construction order. `j_kinds[..j_rates.len()]`
     /// are those jumps; every later entry is a `KossakowskiPair`.
@@ -541,7 +648,8 @@ impl LindbladSpec {
             k_ops: Vec::new(),
             k_op_support: Vec::new(),
             k_pairs: Vec::new(),
-            k_mat: Vec::new(),
+            k_vals: Vec::new(),
+            k_entries: Vec::new(),
             j_rates,
         })
     }
@@ -568,9 +676,45 @@ impl LindbladSpec {
     ) -> Result<(), Error> {
         let m_ops = ops.len();
         check_k_matrix(k, m_ops, "kossakowski ops and K rows", "kossakowski K row and ops")?;
+        let base = self.push_k_ops(ops)?;
+        let mut entries = self.k_entries.clone();
+        entries.extend(dense_k_entries(k, base));
+        self.recompile_kossakowski(entries)
+    }
 
-        // Parse the operator table once; record per-op support.
-        let base = self.k_ops.len();
+    /// [`Self::add_kossakowski`] with the pair matrix given as COO triples
+    /// `(row, col, K[row][col])` over the indices `0..ops.len()` of this
+    /// block (both triangles, or one triangle to be Hermitian-completed —
+    /// see [`Self::set_kossakowski_sparse`]), so a block-sparse `K` over
+    /// thousands of operators is never materialised.
+    pub fn add_kossakowski_sparse(
+        &mut self,
+        ops: &[Vec<(String, Complex<f64>)>],
+        entries: &[(usize, usize, Complex<f64>)],
+    ) -> Result<(), Error> {
+        let m_ops = ops.len();
+        let block = ingest_k_entries(
+            entries.iter().copied(),
+            m_ops,
+            "add_kossakowski_sparse",
+        )?;
+        hermitian_completion(&block)?;
+        let base = self.push_k_ops(ops)?;
+        let mut all = self.k_entries.clone();
+        all.extend(
+            block
+                .into_iter()
+                .map(|(r, c, v)| (r + base as u32, c + base as u32, v)),
+        );
+        self.recompile_kossakowski(all)
+    }
+
+    /// Parse an operator table into `k_ops` / `k_op_support` (appended;
+    /// nothing is pushed when a string fails to parse). Returns the index
+    /// of the first new operator.
+    fn push_k_ops(&mut self, ops: &[Vec<(String, Complex<f64>)>]) -> Result<usize, Error> {
+        let mut parsed: Vec<Vec<PauliTerm>> = Vec::with_capacity(ops.len());
+        let mut supports: Vec<Vec<u32>> = Vec::with_capacity(ops.len());
         for (i, op) in ops.iter().enumerate() {
             if op.is_empty() {
                 return Err(Error::EmptyLincomb { index: i });
@@ -585,27 +729,18 @@ impl LindbladSpec {
                 }
                 terms.push(PauliTerm { word, coeff: *c });
             }
-            self.k_op_support.push(union_support.into_iter().collect());
-            self.k_ops.push(terms);
+            supports.push(union_support.into_iter().collect());
+            parsed.push(terms);
         }
+        let base = self.k_ops.len();
+        self.k_ops.extend(parsed);
+        self.k_op_support.extend(supports);
+        Ok(base)
+    }
 
-        // Extend the stored matrix block-diagonally: zero cross-block
-        // entries (dropped by the pair loop, so a second block behaves
-        // exactly as before this bookkeeping existed).
-        let total = base + m_ops;
-        let zero = Complex::new(0.0, 0.0);
-        for row in self.k_mat.iter_mut() {
-            row.resize(total, zero);
-        }
-        for row in k {
-            let mut full = vec![zero; total];
-            full[base..].copy_from_slice(row);
-            self.k_mat.push(full);
-        }
-
-        // K-independent part of every pair `n ≤ m` over the whole table
-        // (templates of earlier blocks are recomputed; the result is the
-        // same, and Python only ever adds one block).
+    /// The `K`-independent template of the pair `(n, m)`: `A_n†A_m`, the
+    /// sandwich table `λ_a*·μ_b`, the support masks and the support union.
+    fn pair_template(&self, n: usize, m: usize) -> PairTemplate {
         let support_mask = |terms: &[PauliTerm]| {
             let mut mask = [0 as Chunk; W_CHUNKS];
             for t in terms {
@@ -615,33 +750,71 @@ impl LindbladSpec {
             }
             mask
         };
-        self.k_pairs.clear();
-        for n in 0..total {
-            for m in n..total {
-                let adag_b = precompute_adag_b(&self.k_ops[n], &self.k_ops[m]);
-                let mut sand = Vec::with_capacity(self.k_ops[n].len());
-                for a in &self.k_ops[n] {
-                    let rights = self.k_ops[m]
-                        .iter()
-                        .map(|b| (b.word, a.coeff.conj() * b.coeff))
-                        .collect();
-                    sand.push((a.word, rights));
-                }
-                let mut union: std::collections::BTreeSet<u32> =
-                    self.k_op_support[n].iter().copied().collect();
-                union.extend(self.k_op_support[m].iter().copied());
-                self.k_pairs.push(PairTemplate {
-                    n,
-                    m,
-                    adag_b,
-                    sand,
-                    left_mask: support_mask(&self.k_ops[n]),
-                    right_mask: support_mask(&self.k_ops[m]),
-                    support: union.into_iter().collect(),
-                });
-            }
+        let adag_b = precompute_adag_b(&self.k_ops[n], &self.k_ops[m]);
+        let mut sand = Vec::with_capacity(self.k_ops[n].len());
+        for a in &self.k_ops[n] {
+            let rights = self.k_ops[m]
+                .iter()
+                .map(|b| (b.word, a.coeff.conj() * b.coeff))
+                .collect();
+            sand.push((a.word, rights));
         }
+        let mut union: std::collections::BTreeSet<u32> =
+            self.k_op_support[n].iter().copied().collect();
+        union.extend(self.k_op_support[m].iter().copied());
+        PairTemplate {
+            n,
+            m,
+            adag_b,
+            sand,
+            left_mask: support_mask(&self.k_ops[n]),
+            right_mask: support_mask(&self.k_ops[m]),
+            support: union.into_iter().collect(),
+        }
+    }
 
+    /// Install a new Kossakowski matrix given as ingested entries
+    /// ([`ingest_k_entries`] form, over the whole operator table): check
+    /// Hermiticity and complete the mirrors, select the non-negligible
+    /// upper-triangle pairs (`|K_nm| > 1e-14·max|K|`, `n ≤ m`) in `(n, m)`
+    /// order, reuse the template of every pair that already has one and
+    /// build the templates of the new pairs, then rebuild the
+    /// `KossakowskiPair` entries. Nothing is modified when the check fails.
+    ///
+    /// The pair list, its order and every compiled coefficient are exactly
+    /// what the dense constructor produced for the same `K`, so the action
+    /// is bit-identical however `K` was given (dense, COO or blocks).
+    fn recompile_kossakowski(&mut self, entries: Vec<KEntry>) -> Result<(), Error> {
+        let full = hermitian_completion(&entries)?;
+        let max_abs = full.iter().map(|e| e.2.norm()).fold(0.0_f64, f64::max);
+        let pair_tol = 1e-14 * max_abs;
+        let kept: Vec<KEntry> = full
+            .iter()
+            .filter(|e| e.0 <= e.1 && e.2.norm() > pair_tol)
+            .copied()
+            .collect();
+
+        // Merge-walk the old templates (sorted by (n, m)) against the kept
+        // pairs (sorted the same way): reuse, else build.
+        let mut old = std::mem::take(&mut self.k_pairs).into_iter().peekable();
+        let mut pairs: Vec<PairTemplate> = Vec::with_capacity(kept.len());
+        let mut vals: Vec<Complex<f64>> = Vec::with_capacity(kept.len());
+        for &(n, m, v) in &kept {
+            let key = (n as usize, m as usize);
+            while old.peek().is_some_and(|t| (t.n, t.m) < key) {
+                old.next();
+            }
+            let template = if old.peek().is_some_and(|t| (t.n, t.m) == key) {
+                old.next().expect("peeked")
+            } else {
+                self.pair_template(key.0, key.1)
+            };
+            pairs.push(template);
+            vals.push(v);
+        }
+        self.k_pairs = pairs;
+        self.k_vals = vals;
+        self.k_entries = full;
         self.rebuild_kossakowski_pairs();
         Ok(())
     }
@@ -659,10 +832,15 @@ impl LindbladSpec {
     /// with the very same loop the constructor runs: the result is
     /// bit-identical to a spec freshly built with `k`. The Pauli products
     /// of `A_n†A_m` and the sandwich word tables are `K`-independent and
-    /// cached per pair ([`PairTemplate`]) at `add_kossakowski`, so the
-    /// rebuild is one complex multiply per stored coefficient
-    /// (`O(Σ_{n≤m} |A_n|·|A_m|)` multiplies, no Pauli arithmetic, no
-    /// hashing). The Hamiltonian and plain jump data are untouched.
+    /// cached per non-negligible pair ([`PairTemplate`]), so while the
+    /// zero pattern of `K` is unchanged (a drive rescaling a block-diagonal
+    /// `K`) the rebuild is one complex multiply per stored coefficient
+    /// (`O(Σ_{nonzero n≤m} |A_n|·|A_m|)` multiplies, no Pauli arithmetic,
+    /// no hashing); pairs new to the pattern are templated on the spot and
+    /// pairs that left it are dropped. The Hamiltonian and plain jump data
+    /// are untouched. For a large block-sparse `K` prefer
+    /// [`Self::set_kossakowski_sparse`] / [`Self::set_kossakowski_blocks`],
+    /// which never see the `M × M` matrix.
     pub fn set_kossakowski(&mut self, k: &[Vec<Complex<f64>>]) -> Result<(), Error> {
         let m_ops = self.k_ops.len();
         if m_ops == 0 {
@@ -674,15 +852,119 @@ impl LindbladSpec {
             "set_kossakowski: num_kossakowski_ops vs K rows",
             "set_kossakowski: K row and num_kossakowski_ops",
         )?;
-        self.k_mat = k.to_vec();
-        self.rebuild_kossakowski_pairs();
-        Ok(())
+        let entries: Vec<KEntry> = dense_k_entries(k, 0).collect();
+        self.recompile_kossakowski(entries)
+    }
+
+    /// [`Self::set_kossakowski`] with `K` given as COO triples
+    /// `(row, col, K[row][col])` over the operator index
+    /// `0..num_kossakowski_ops`, in any order; duplicate `(row, col)`
+    /// triples are summed (the COO convention), exact zeros ignored.
+    /// Hermiticity (to `1e-10·max(max|K|, 1)`) is checked on the merged
+    /// entries: a diagonal entry must be real, an off-diagonal entry given
+    /// in both triangles must equal its mirror's conjugate, and an
+    /// off-diagonal entry given in one triangle only is Hermitian-completed
+    /// (its mirror is taken to be the conjugate), so a single triangle is a
+    /// valid input. The compiled dissipator is bit-identical to
+    /// [`Self::set_kossakowski`] with the dense matrix these triples
+    /// describe; the dense matrix is never formed (`O(nnz)` memory and
+    /// `O(nnz log nnz)` time plus the templates of pairs new to the
+    /// pattern).
+    pub fn set_kossakowski_sparse(
+        &mut self,
+        entries: &[(usize, usize, Complex<f64>)],
+    ) -> Result<(), Error> {
+        let m_ops = self.k_ops.len();
+        if m_ops == 0 {
+            return Err(Error::NoKossakowski);
+        }
+        let ingested = ingest_k_entries(entries.iter().copied(), m_ops, "set_kossakowski_sparse")?;
+        self.recompile_kossakowski(ingested)
+    }
+
+    /// [`Self::set_kossakowski`] with `K` given as blocks: `blocks[b] =
+    /// (indices, K_b)` places the Hermitian `|indices| × |indices|` matrix
+    /// `K_b` at the operator indices `indices` (row-major, `K[indices[i]]
+    /// [indices[j]] += K_b[i][j]`). Blocks normally partition the operator
+    /// table (a block-diagonal `K`); blocks sharing operators add up (`K =
+    /// Σ_b P_b K_b P_bᵀ`, PSD when every `K_b` is). An index listed twice
+    /// in one block, an index outside the table or a non-Hermitian `K_b`
+    /// is an error and leaves the spec unchanged. Operators in no block
+    /// have zero rows. Bit-identical to the dense setter with the assembled
+    /// matrix, which is never formed.
+    pub fn set_kossakowski_blocks(
+        &mut self,
+        blocks: &[(Vec<usize>, Vec<Vec<Complex<f64>>>)],
+    ) -> Result<(), Error> {
+        let m_ops = self.k_ops.len();
+        if m_ops == 0 {
+            return Err(Error::NoKossakowski);
+        }
+        let mut triples: Vec<(usize, usize, Complex<f64>)> = Vec::new();
+        for (b, (idx, kb)) in blocks.iter().enumerate() {
+            check_k_matrix(
+                kb,
+                idx.len(),
+                "set_kossakowski_blocks: block indices vs K_block rows",
+                "set_kossakowski_blocks: K_block row and block indices",
+            )?;
+            let mut seen = vec![false; m_ops];
+            for &i in idx {
+                if i >= m_ops {
+                    return Err(Error::KIndexOutOfRange {
+                        what: "set_kossakowski_blocks",
+                        index: i,
+                        m_ops,
+                    });
+                }
+                if seen[i] {
+                    return Err(Error::KBlockDuplicateIndex { block: b, index: i });
+                }
+                seen[i] = true;
+            }
+            for (i, &r) in idx.iter().enumerate() {
+                for (j, &c) in idx.iter().enumerate() {
+                    let v = kb[i][j];
+                    if v.re != 0.0 || v.im != 0.0 {
+                        triples.push((r, c, v));
+                    }
+                }
+            }
+        }
+        let ingested = ingest_k_entries(triples, m_ops, "set_kossakowski_blocks")?;
+        self.recompile_kossakowski(ingested)
     }
 
     /// Current Kossakowski matrix over the whole operator table, row-major
-    /// (`M × M`, empty when no block was added).
+    /// (`M × M`, empty when no block was added). Materialises the dense
+    /// matrix from the stored entries: `O(M²)` memory — use
+    /// [`Self::kossakowski_entries`] for a large sparse `K`.
     pub fn kossakowski(&self) -> Vec<Vec<Complex<f64>>> {
-        self.k_mat.clone()
+        let m = self.k_ops.len();
+        let mut out = vec![vec![Complex::new(0.0, 0.0); m]; m];
+        for &(r, c, v) in &self.k_entries {
+            out[r as usize][c as usize] = v;
+        }
+        out
+    }
+
+    /// Current Kossakowski matrix as sorted COO triples
+    /// `(row, col, K[row][col])`: every nonzero entry, both triangles
+    /// (Hermitian-completed), the stored form.
+    pub fn kossakowski_entries(&self) -> &[KEntry] {
+        &self.k_entries
+    }
+
+    /// Number of stored nonzero entries of the Kossakowski matrix (both
+    /// triangles).
+    pub fn num_kossakowski_nonzeros(&self) -> usize {
+        self.k_entries.len()
+    }
+
+    /// Number of pair templates currently held: the pairs `n ≤ m` with
+    /// `|K_nm| > 1e-14·max|K|`, one `KossakowskiPair` each.
+    pub fn num_pair_templates(&self) -> usize {
+        self.k_pairs.len()
     }
 
     /// Number `M` of Kossakowski operators `A_n` (0 without a block).
@@ -690,22 +972,19 @@ impl LindbladSpec {
         self.k_ops.len()
     }
 
-    /// Drop every `KossakowskiPair` entry and rebuild them from `k_ops` /
-    /// `k_mat`. The plain jumps of [`Self::new`] occupy
-    /// `j_kinds[..j_rates.len()]` and are kept; `j_support` is pruned of
-    /// the old pair indices (`candidate_terms` sorts and dedups, so the
-    /// order of a support list is immaterial) and refilled.
+    /// Drop every `KossakowskiPair` entry and rebuild them from the pair
+    /// templates `k_pairs` and their values `k_vals` (the non-negligible
+    /// upper-triangle pairs of the current `K`, in `(n, m)` order). The
+    /// plain jumps of [`Self::new`] occupy `j_kinds[..j_rates.len()]` and
+    /// are kept; `j_support` is pruned of the old pair indices
+    /// (`candidate_terms` sorts and dedups, so the order of a support list
+    /// is immaterial) and refilled.
     fn rebuild_kossakowski_pairs(&mut self) {
         let start = self.j_rates.len();
         self.j_kinds.truncate(start);
         for list in self.j_support.iter_mut() {
             list.retain(|&i| (i as usize) < start);
         }
-        let k = &self.k_mat;
-        let max_abs = k
-            .iter()
-            .flat_map(|row| row.iter().map(|c| c.norm()))
-            .fold(0.0_f64, f64::max);
 
         // One JumpKind entry per non-negligible pair, indexed by the union
         // support of A_n and A_m so the per-string candidate lookup only
@@ -715,12 +994,7 @@ impl LindbladSpec {
         // output words with conjugate phase, and the final action keeps only
         // the real part, so `(n,m)` alone suffices if it doubles-and-takes-Re
         // — halving the pair count. The diagonal `(n,n)` is a single pair.
-        let pair_tol = 1e-14 * max_abs;
-        for t in &self.k_pairs {
-            let k_nm = k[t.n][t.m];
-            if k_nm.norm() <= pair_tol {
-                continue;
-            }
+        for (t, &k_nm) in self.k_pairs.iter().zip(self.k_vals.iter()) {
             let off_diag = t.n != t.m;
             // A_n†A_m as `Σ γ_w W`, scaled by `K_nm`.
             let (dd, dd_anti): (Vec<PauliTerm>, Vec<PauliTerm>) = if off_diag {
@@ -1851,6 +2125,197 @@ mod tests {
         assert!(matches!(none.set_jump_rates(&[]), Err(Error::NoJumpOps)));
         assert_eq!(none.jump_rates(), Vec::<f64>::new());
         assert!(none.kossakowski().is_empty());
+    }
+
+    /// Dense, block and COO inputs compile the same dissipator: bitwise
+    /// identical actions for every way of giving one block-diagonal `K`
+    /// (dense setter, blocks, COO in both triangles with shuffled and split
+    /// entries, COO upper triangle only, fresh `add_kossakowski_sparse`);
+    /// the templates follow the zero pattern and the stored entries round
+    /// trip through `kossakowski()`.
+    #[test]
+    fn block_and_sparse_setters_match_dense() {
+        let n = 4;
+        let rates = [0.2, 0.5, 0.1];
+        let zero = Complex::new(0.0, 0.0);
+        // blocks {0, 2} and {1, 3} of a complex PSD matrix
+        let mut block_k = psd_matrix(n, 11);
+        for i in 0..n {
+            for j in 0..n {
+                if (i % 2) != (j % 2) {
+                    block_k[i][j] = zero;
+                }
+            }
+        }
+        let words = [
+            "ZIII", "IZII", "XIII", "IYII", "XXII", "ZYZI", "XYZZ", "IXXI", "IIZX", "YIIY",
+        ];
+        let same_actions = |a: &LindbladSpec, b: &LindbladSpec| {
+            assert_eq!(a.num_jump_terms(), b.num_jump_terms());
+            for s in words {
+                let (p, _) = parse_pauli_string(s, n).unwrap();
+                assert_actions_identical(&action_map(a, &p), &action_map(b, &p));
+            }
+        };
+
+        let dense = setter_fixture(n, &rates, &block_k);
+        assert_eq!(dense.num_pair_templates(), 6); // 3 upper-triangle pairs per block
+        assert_eq!(dense.num_kossakowski_nonzeros(), 8);
+        assert_eq!(dense.kossakowski(), block_k);
+        assert_eq!(dense.num_jump_terms(), rates.len() + 6);
+
+        // blocks, on a spec that held a dense K with another pattern
+        let sub = |idx: &[usize]| -> Vec<Vec<Complex<f64>>> {
+            idx.iter()
+                .map(|&i| idx.iter().map(|&j| block_k[i][j]).collect())
+                .collect()
+        };
+        let mut spec = setter_fixture(n, &rates, &psd_matrix(n, 3));
+        assert_eq!(spec.num_pair_templates(), 10);
+        spec.set_kossakowski_blocks(&[(vec![0, 2], sub(&[0, 2])), (vec![1, 3], sub(&[1, 3]))])
+            .unwrap();
+        assert_eq!(spec.num_pair_templates(), 6);
+        assert_eq!(spec.kossakowski(), block_k);
+        same_actions(&spec, &dense);
+
+        // the same blocks in another order and with a block's rows permuted
+        let perm = |idx: &[usize]| -> Vec<Vec<Complex<f64>>> { sub(idx) };
+        spec.set_kossakowski_blocks(&[(vec![3, 1], perm(&[3, 1])), (vec![0, 2], sub(&[0, 2]))])
+            .unwrap();
+        assert_eq!(spec.kossakowski(), block_k);
+        same_actions(&spec, &dense);
+
+        // COO, both triangles, reversed order, the (0, 0) entry split in two
+        let mut triples: Vec<(usize, usize, Complex<f64>)> = Vec::new();
+        for i in 0..n {
+            for j in 0..n {
+                if block_k[i][j] != zero {
+                    triples.push((i, j, block_k[i][j]));
+                }
+            }
+        }
+        triples.reverse();
+        let k00 = block_k[0][0];
+        triples.retain(|t| !(t.0 == 0 && t.1 == 0));
+        triples.push((0, 0, k00 * 0.5));
+        triples.insert(0, (0, 0, k00 * 0.5));
+        spec.set_kossakowski_sparse(&triples).unwrap();
+        assert_eq!(spec.kossakowski(), block_k);
+        same_actions(&spec, &dense);
+
+        // the upper triangle alone: Hermitian completion fills the mirrors
+        let upper: Vec<(usize, usize, Complex<f64>)> = (0..n)
+            .flat_map(|i| (i..n).map(move |j| (i, j)))
+            .filter(|&(i, j)| block_k[i][j] != zero)
+            .map(|(i, j)| (i, j, block_k[i][j]))
+            .collect();
+        let mut spec2 = setter_fixture(n, &rates, &psd_matrix(n, 5));
+        spec2.set_kossakowski_sparse(&upper).unwrap();
+        assert_eq!(spec2.kossakowski(), block_k);
+        assert_eq!(spec2.num_kossakowski_nonzeros(), 8);
+        same_actions(&spec2, &dense);
+
+        // the lower triangle alone, likewise
+        let lower: Vec<(usize, usize, Complex<f64>)> =
+            upper.iter().map(|&(i, j, v)| (j, i, v.conj())).collect();
+        spec2.set_kossakowski_sparse(&lower).unwrap();
+        assert_eq!(spec2.kossakowski(), block_k);
+        same_actions(&spec2, &dense);
+
+        // a fresh spec built through add_kossakowski_sparse
+        let h = vec![("XZZZ".to_string(), 0.3), ("ZXZZ".to_string(), 0.4)];
+        let ops: Vec<_> = (0..n).map(|q| sigma_minus_lincomb(q, n)).collect();
+        let mut fresh_dense = LindbladSpec::new(n, &h, &[]).unwrap();
+        fresh_dense.add_kossakowski(&ops, &block_k).unwrap();
+        let mut fresh_sparse = LindbladSpec::new(n, &h, &[]).unwrap();
+        fresh_sparse.add_kossakowski_sparse(&ops, &upper).unwrap();
+        assert_eq!(fresh_sparse.kossakowski(), block_k);
+        same_actions(&fresh_sparse, &fresh_dense);
+
+        // templates are reused when the pattern is unchanged and rebuilt
+        // when it grows: a dense K after the blocks has all 10 pairs
+        spec.set_kossakowski(&psd_matrix(n, 3)).unwrap();
+        assert_eq!(spec.num_pair_templates(), 10);
+        let fresh = setter_fixture(n, &rates, &psd_matrix(n, 3));
+        same_actions(&spec, &fresh);
+    }
+
+    /// Overlapping blocks add up (`K = Σ_b P_b K_b P_bᵀ`), an empty block
+    /// list is the zero dissipator, and bad input leaves the spec unchanged.
+    #[test]
+    fn block_and_sparse_setters_overlap_and_reject_bad_input() {
+        let n = 3;
+        let rates = [0.2, 0.5, 0.1];
+        let k0 = psd_matrix(n, 2);
+        let mut spec = setter_fixture(n, &rates, &k0);
+        let (p, _) = parse_pauli_string("XYZ", n).unwrap();
+        let before = action_map(&spec, &p);
+
+        // overlap: blocks {0, 1} and {1, 2} sum on the shared operator 1
+        let a = psd_matrix(2, 4);
+        let b = psd_matrix(2, 6);
+        let zero = Complex::new(0.0, 0.0);
+        let mut expect = vec![vec![zero; n]; n];
+        for i in 0..2 {
+            for j in 0..2 {
+                expect[i][j] += a[i][j];
+                expect[i + 1][j + 1] += b[i][j];
+            }
+        }
+        spec.set_kossakowski_blocks(&[(vec![0, 1], a.clone()), (vec![1, 2], b.clone())])
+            .unwrap();
+        assert_eq!(spec.kossakowski(), expect);
+        let dense = setter_fixture(n, &rates, &expect);
+        assert_actions_identical(&action_map(&spec, &p), &action_map(&dense, &p));
+
+        // no blocks: K = 0, no Kossakowski pairs
+        spec.set_kossakowski_blocks(&[]).unwrap();
+        assert_eq!(spec.num_pair_templates(), 0);
+        assert_eq!(spec.num_jump_terms(), rates.len());
+        spec.set_kossakowski_sparse(&[]).unwrap();
+        assert_eq!(spec.num_kossakowski_nonzeros(), 0);
+
+        // back to k0, then every rejection leaves it there
+        spec.set_kossakowski(&k0).unwrap();
+        assert_actions_identical(&action_map(&spec, &p), &before);
+        let one = Complex::new(1.0, 0.0);
+        assert!(matches!(
+            spec.set_kossakowski_blocks(&[(vec![0, 3], psd_matrix(2, 1))]),
+            Err(Error::KIndexOutOfRange { index: 3, m_ops: 3, .. })
+        ));
+        assert!(matches!(
+            spec.set_kossakowski_blocks(&[(vec![1, 1], psd_matrix(2, 1))]),
+            Err(Error::KBlockDuplicateIndex { block: 0, index: 1 })
+        ));
+        assert!(matches!(
+            spec.set_kossakowski_blocks(&[(vec![0, 1], psd_matrix(3, 1))]),
+            Err(Error::LengthMismatch { .. })
+        ));
+        let mut bad = psd_matrix(2, 1);
+        bad[0][1] += Complex::new(0.0, 1e-3);
+        assert!(matches!(
+            spec.set_kossakowski_blocks(&[(vec![0, 1], bad)]),
+            Err(Error::KMatrixNotHermitian { .. })
+        ));
+        assert!(matches!(
+            spec.set_kossakowski_sparse(&[(0, 5, one)]),
+            Err(Error::KIndexOutOfRange { index: 5, .. })
+        ));
+        // mirror mismatch and an imaginary diagonal
+        assert!(matches!(
+            spec.set_kossakowski_sparse(&[(0, 1, one), (1, 0, Complex::new(1.0, 0.5))]),
+            Err(Error::KMatrixNotHermitian { n: 0, m: 1 })
+        ));
+        assert!(matches!(
+            spec.set_kossakowski_sparse(&[(2, 2, Complex::new(1.0, 1e-3))]),
+            Err(Error::KMatrixNotHermitian { n: 2, m: 2 })
+        ));
+        assert_eq!(spec.kossakowski(), k0);
+        assert_actions_identical(&action_map(&spec, &p), &before);
+        // without a block
+        let mut plain = LindbladSpec::new(n, &[], &[jump_hpauli("ZII", 0.1)]).unwrap();
+        assert!(matches!(plain.set_kossakowski_blocks(&[]), Err(Error::NoKossakowski)));
+        assert!(matches!(plain.set_kossakowski_sparse(&[]), Err(Error::NoKossakowski)));
     }
 
     fn jump_hpauli(s: &str, rate: f64) -> JumpInput {

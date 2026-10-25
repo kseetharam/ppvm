@@ -40,6 +40,18 @@ pub enum Error {
     },
     /// `set_kossakowski` on a spec built without a Kossakowski block.
     NoKossakowski,
+    /// Sparse / block Kossakowski input: an operator index at or beyond
+    /// the operator table.
+    KIndexOutOfRange {
+        what: &'static str,
+        index: usize,
+        m_ops: usize,
+    },
+    /// Block Kossakowski input: the same operator listed twice in one block.
+    KBlockDuplicateIndex {
+        block: usize,
+        index: usize,
+    },
     /// `set_jump_rates` on a spec built without jump operators.
     NoJumpOps,
     /// Block Lindbladian: a species index at or beyond `n_species`.
@@ -97,6 +109,14 @@ impl fmt::Display for Error {
             Error::NoJumpOps => write!(
                 f,
                 "set_jump_rates: this LindbladSpec was built without jump operators"
+            ),
+            Error::KIndexOutOfRange { what, index, m_ops } => write!(
+                f,
+                "{what}: Kossakowski operator index {index} out of range for {m_ops} operators"
+            ),
+            Error::KBlockDuplicateIndex { block, index } => write!(
+                f,
+                "set_kossakowski_blocks: block {block} lists operator {index} more than once"
             ),
             Error::SpeciesOutOfRange { got, n_species } => {
                 write!(f, "species index {got} out of range for n_species = {n_species}")

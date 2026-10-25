@@ -31,6 +31,46 @@ fn map_err(e: ppvm_lindblad::Error) -> PyErr {
     PyValueError::new_err(e.to_string())
 }
 
+/// `(pauli_string, re, im)` triples per operator into complex lincombs.
+fn lincombs_from_triples(ops: Vec<Vec<(String, f64, f64)>>) -> Vec<Vec<(String, Complex<f64>)>> {
+    ops.into_iter()
+        .map(|op| {
+            op.into_iter()
+                .map(|(s, re, im)| (s, Complex::new(re, im)))
+                .collect()
+        })
+        .collect()
+}
+
+/// Validate COO arrays (equal lengths, non-negative indices) and turn them
+/// into the core's `(row, col, value)` triples.
+fn coo_entries(
+    rows: &PyReadonlyArray1<'_, i64>,
+    cols: &PyReadonlyArray1<'_, i64>,
+    vals: &PyReadonlyArray1<'_, Complex64>,
+    what: &str,
+) -> PyResult<Vec<(usize, usize, Complex<f64>)>> {
+    let (r, c, v) = (rows.as_array(), cols.as_array(), vals.as_array());
+    if r.len() != c.len() || r.len() != v.len() {
+        return Err(PyValueError::new_err(format!(
+            "{what}: rows, cols and vals must have the same length; got {}, {} and {}",
+            r.len(),
+            c.len(),
+            v.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(r.len());
+    for ((&ri, &ci), &vi) in r.iter().zip(c.iter()).zip(v.iter()) {
+        if ri < 0 || ci < 0 {
+            return Err(PyValueError::new_err(format!(
+                "{what}: operator indices must be non-negative; got ({ri}, {ci})"
+            )));
+        }
+        out.push((ri as usize, ci as usize, Complex::new(vi.re, vi.im)));
+    }
+    Ok(out)
+}
+
 /// Reject a basis that contains the same Pauli word at two distinct rows.
 /// Duplicate rows would silently overwrite each other in the generator's
 /// row-index map and produce an incorrect sparse matrix.
@@ -108,9 +148,14 @@ impl LindbladSpec {
     /// dissipator `D*(O) = Σ_nm K_nm (A_n† O A_m − ½{A_n†A_m, O})`:
     /// `kossakowski_ops[i]` is the Pauli lincomb of `A_i` in the same triple
     /// encoding, `kossakowski_k[n][m] = (re, im)` the Hermitian pair matrix.
+    /// `kossakowski_coo = (rows, cols, vals)` (int64, int64, complex128 1-D
+    /// arrays over the operator index) gives `K` as COO triples instead, so
+    /// a block-sparse `K` over thousands of operators is never materialised
+    /// (same rules as `set_kossakowski_sparse`); `kossakowski_k` must then
+    /// be empty.
     #[new]
     #[pyo3(signature = (n_qubits, h_terms, h_coeffs, jump_lincombs, jump_rates,
-                        kossakowski_ops = vec![], kossakowski_k = vec![]))]
+                        kossakowski_ops = vec![], kossakowski_k = vec![], kossakowski_coo = None))]
     fn new(
         n_qubits: usize,
         h_terms: Vec<String>,
@@ -119,6 +164,7 @@ impl LindbladSpec {
         jump_rates: Vec<f64>,
         kossakowski_ops: Vec<Vec<(String, f64, f64)>>,
         kossakowski_k: Vec<Vec<(f64, f64)>>,
+        kossakowski_coo: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         if h_terms.len() != h_coeffs.len() {
             return Err(PyValueError::new_err(
@@ -143,15 +189,31 @@ impl LindbladSpec {
             })
             .collect();
         let mut inner = CoreSpec::new(n_qubits, &h, &jumps).map_err(map_err)?;
-        if !kossakowski_ops.is_empty() || !kossakowski_k.is_empty() {
-            let ops: Vec<Vec<(String, Complex<f64>)>> = kossakowski_ops
-                .into_iter()
-                .map(|op| {
-                    op.into_iter()
-                        .map(|(s, re, im)| (s, Complex::new(re, im)))
-                        .collect()
-                })
-                .collect();
+        if let Some(coo) = kossakowski_coo {
+            if !kossakowski_k.is_empty() {
+                return Err(PyValueError::new_err(
+                    "kossakowski_k and kossakowski_coo are alternatives; give one of them",
+                ));
+            }
+            if kossakowski_ops.is_empty() {
+                return Err(PyValueError::new_err(
+                    "kossakowski_coo needs a non-empty kossakowski_ops",
+                ));
+            }
+            let (rows, cols, vals): (
+                PyReadonlyArray1<'_, i64>,
+                PyReadonlyArray1<'_, i64>,
+                PyReadonlyArray1<'_, Complex64>,
+            ) = coo.extract().map_err(|_| {
+                PyValueError::new_err(
+                    "kossakowski_coo: expected a tuple (rows: int64[nnz], cols: int64[nnz], vals: complex128[nnz])",
+                )
+            })?;
+            let entries = coo_entries(&rows, &cols, &vals, "kossakowski_coo")?;
+            let ops = lincombs_from_triples(kossakowski_ops);
+            inner.add_kossakowski_sparse(&ops, &entries).map_err(map_err)?;
+        } else if !kossakowski_ops.is_empty() || !kossakowski_k.is_empty() {
+            let ops = lincombs_from_triples(kossakowski_ops);
             let k: Vec<Vec<Complex<f64>>> = kossakowski_k
                 .into_iter()
                 .map(|row| {
@@ -308,6 +370,109 @@ impl LindbladSpec {
             .map(|i| (0..m).map(|j| Complex::new(view[[i, j]].re, view[[i, j]].im)).collect())
             .collect();
         self.inner.set_kossakowski(&rows).map_err(map_err)
+    }
+
+    /// Replace the Kossakowski matrix in place from COO triples over the
+    /// operator index: `rows`, `cols` (int64, `nnz` each) and `vals`
+    /// (complex128, `nnz`). Any order; duplicates are summed; exact zeros
+    /// are ignored; an off-diagonal entry given in one triangle only is
+    /// Hermitian-completed, one given in both must match its mirror's
+    /// conjugate and a diagonal entry must be real (to
+    /// `1e-10·max(‖K‖, 1)`), otherwise `ValueError`. The dense `(M, M)`
+    /// matrix is never formed; the result is bit-identical to
+    /// `set_kossakowski` with it. PSD is checked in the Python layer.
+    fn set_kossakowski_sparse(
+        &mut self,
+        rows: PyReadonlyArray1<'_, i64>,
+        cols: PyReadonlyArray1<'_, i64>,
+        vals: PyReadonlyArray1<'_, Complex64>,
+    ) -> PyResult<()> {
+        if self.inner.num_kossakowski_ops() == 0 {
+            return Err(PyValueError::new_err(
+                "set_kossakowski_sparse: this LindbladSpec was built without a Kossakowski block",
+            ));
+        }
+        let entries = coo_entries(&rows, &cols, &vals, "set_kossakowski_sparse")?;
+        self.inner.set_kossakowski_sparse(&entries).map_err(map_err)
+    }
+
+    /// Replace the Kossakowski matrix in place from blocks: `blocks[b] =
+    /// (indices, K_block)` with `indices` an int64 array of distinct
+    /// operator indices and `K_block` a Hermitian complex128
+    /// `(len, len)` array placed at those indices (`K[indices[i],
+    /// indices[j]] += K_block[i, j]`; blocks sharing operators add up).
+    /// `ValueError` on an index out of range or repeated within a block,
+    /// a shape mismatch or a non-Hermitian block, leaving the spec
+    /// unchanged. The dense matrix is never formed; the result is
+    /// bit-identical to `set_kossakowski` with it. PSD is checked in the
+    /// Python layer.
+    fn set_kossakowski_blocks<'py>(
+        &mut self,
+        blocks: Vec<(PyReadonlyArray1<'py, i64>, PyReadonlyArray2<'py, Complex64>)>,
+    ) -> PyResult<()> {
+        if self.inner.num_kossakowski_ops() == 0 {
+            return Err(PyValueError::new_err(
+                "set_kossakowski_blocks: this LindbladSpec was built without a Kossakowski block",
+            ));
+        }
+        let mut core: Vec<(Vec<usize>, Vec<Vec<Complex<f64>>>)> = Vec::with_capacity(blocks.len());
+        for (b, (idx, kb)) in blocks.iter().enumerate() {
+            let idx_view = idx.as_array();
+            let mut indices: Vec<usize> = Vec::with_capacity(idx_view.len());
+            for &i in idx_view.iter() {
+                if i < 0 {
+                    return Err(PyValueError::new_err(format!(
+                        "set_kossakowski_blocks: block {b} has a negative operator index {i}"
+                    )));
+                }
+                indices.push(i as usize);
+            }
+            let kv = kb.as_array();
+            let shape = kv.shape();
+            if shape[0] != indices.len() || shape[1] != indices.len() {
+                return Err(PyValueError::new_err(format!(
+                    "set_kossakowski_blocks: block {b} has {} indices but K_block has shape {:?}",
+                    indices.len(),
+                    shape
+                )));
+            }
+            let mat: Vec<Vec<Complex<f64>>> = (0..shape[0])
+                .map(|i| (0..shape[1]).map(|j| Complex::new(kv[[i, j]].re, kv[[i, j]].im)).collect())
+                .collect();
+            core.push((indices, mat));
+        }
+        self.inner.set_kossakowski_blocks(&core).map_err(map_err)
+    }
+
+    /// Current Kossakowski matrix as COO arrays `(rows, cols, vals)`
+    /// (uint64, uint64, complex128): every nonzero entry, both triangles,
+    /// sorted by `(row, col)`. The sparse twin of `kossakowski`.
+    #[getter]
+    fn kossakowski_coo<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> (
+        Bound<'py, PyArray1<u64>>,
+        Bound<'py, PyArray1<u64>>,
+        Bound<'py, PyArray1<Complex64>>,
+    ) {
+        let entries = self.inner.kossakowski_entries();
+        let rows: Vec<u64> = entries.iter().map(|e| e.0 as u64).collect();
+        let cols: Vec<u64> = entries.iter().map(|e| e.1 as u64).collect();
+        let vals: Vec<Complex64> = entries.iter().map(|e| Complex64::new(e.2.re, e.2.im)).collect();
+        (rows.into_pyarray(py), cols.into_pyarray(py), vals.into_pyarray(py))
+    }
+
+    /// Number of stored nonzero entries of `K` (both triangles).
+    #[getter]
+    fn num_kossakowski_nonzeros(&self) -> usize {
+        self.inner.num_kossakowski_nonzeros()
+    }
+
+    /// Number of compiled Kossakowski pairs `n ≤ m` (one template each).
+    #[getter]
+    fn num_pair_templates(&self) -> usize {
+        self.inner.num_pair_templates()
     }
 
     /// Apply `L*` to a single Pauli string `p`.
