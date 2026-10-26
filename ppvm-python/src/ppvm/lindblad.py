@@ -649,8 +649,36 @@ class Lindbladian:
 
     @property
     def num_pair_templates(self) -> int:
-        """Number of compiled Kossakowski pairs ``n ≤ m`` (``|K_nm| > 1e-14·max|K|``)."""
+        """Number of distinct pair templates among the compiled Kossakowski pairs.
+
+        A template is the ``K``-independent compilation of one operator-pattern
+        relationship: the Pauli structure of ``(A_n, A_m)`` up to a qubit
+        relabelling (both operators' terms, in order, with their exact
+        coefficients, over the pair's qubits numbered by first appearance).
+        Pairs with the same structure on other qubits — the same tensor
+        components of a dipolar / CSA dissipator on other spins — share one
+        template, so this count is bounded by the number of distinct patterns,
+        not by `num_compiled_pairs`, and the compiled memory scales with it.
+        """
         return self._spec.num_pair_templates
+
+    @property
+    def num_compiled_pairs(self) -> int:
+        """Number of compiled Kossakowski pairs ``n ≤ m`` (``|K_nm| > 1e-14·max|K|``), one record each."""
+        return self._spec.num_compiled_pairs
+
+    @property
+    def kossakowski_memory_bytes(self) -> dict[str, int]:
+        """Heap bytes of the Kossakowski compilation: ``{'templates', 'pairs', 'entries'}``.
+
+        ``templates``: the shared pair templates (Pauli tables, keys and index);
+        ``pairs``: the per-pair records (template index, qubit map, ``K_nm``,
+        support slots); ``entries``: the stored nonzero ``K`` entries (24 B
+        each). Vector capacities, i.e. what was asked of the allocator; the
+        operator table is not counted.
+        """
+        t, p, e = self._spec.kossakowski_memory_bytes
+        return {"templates": int(t), "pairs": int(p), "entries": int(e)}
 
     # ── Pure-ndarray hot path ──
 

@@ -67,15 +67,15 @@ def test_blocks_and_sparse_match_dense(n, sizes, seed):
     rates = _random_rates(rng, n)
     blocks, K = _block_pattern(rng, n, sizes)
     L_dense = _build(n, rates, K)
-    assert L_dense.num_pair_templates == _pair_count(blocks)
+    assert L_dense.num_compiled_pairs == _pair_count(blocks)
     assert L_dense.num_kossakowski_nonzeros == int(np.count_nonzero(K))
     np.testing.assert_array_equal(L_dense.kossakowski, K)
 
     # blocks on an object that held a dense K with the full pattern
     L = _build(n, rates, _random_psd(rng, n))
-    assert L.num_pair_templates == n * (n + 1) // 2
+    assert L.num_compiled_pairs == n * (n + 1) // 2
     L.set_kossakowski_blocks(blocks)
-    assert L.num_pair_templates == _pair_count(blocks)
+    assert L.num_compiled_pairs == _pair_count(blocks)
     np.testing.assert_array_equal(L.kossakowski, K)
     _compare_all(L, L_dense, n, np.random.default_rng(seed))
 
@@ -157,7 +157,7 @@ def test_20_ops_four_blocks_of_five():
     L_blocks = Lindbladian(n, h_terms, jumps, kossakowski=(ops, {"blocks": blocks}))
     rows, cols, vals = _coo_of(K)
     L_coo = Lindbladian(n, h_terms, jumps, kossakowski=(ops, {"rows": rows, "cols": cols, "vals": vals}))
-    assert L_dense.num_pair_templates == L_blocks.num_pair_templates == L_coo.num_pair_templates == 4 * 15
+    assert L_dense.num_compiled_pairs == L_blocks.num_compiled_pairs == L_coo.num_compiled_pairs == 4 * 15
     assert L_dense.num_jump_terms == len(jumps) + 60
     _compare_all(L_blocks, L_dense, n, np.random.default_rng(1))
     _compare_all(L_coo, L_dense, n, np.random.default_rng(2))
@@ -166,7 +166,7 @@ def test_20_ops_four_blocks_of_five():
     blocks2, K2 = _block_pattern(rng, m, [7, 6, 4, 3])
     L_dense.set_kossakowski_blocks(blocks2)
     L_fresh2 = Lindbladian(n, h_terms, jumps, kossakowski=(ops, K2))
-    assert L_dense.num_pair_templates == _pair_count(blocks2)
+    assert L_dense.num_compiled_pairs == _pair_count(blocks2)
     _compare_all(L_dense, L_fresh2, n, np.random.default_rng(3))
     L_dense.set_kossakowski_sparse(*_upper_of(K), n_ops=m)
     _compare_all(L_dense, L_blocks, n, np.random.default_rng(4))
@@ -190,7 +190,7 @@ def test_overlapping_blocks_add_and_empty_is_zero():
     np.testing.assert_array_equal(L.kossakowski, K)
     _compare_all(L, _build(n, rates, K), n, np.random.default_rng(0))
     L.set_kossakowski_blocks([])
-    assert L.num_pair_templates == 0
+    assert L.num_compiled_pairs == 0
     assert L.num_kossakowski_nonzeros == 0
     assert L.num_jump_terms == L.num_jump_ops
     _compare_all(L, _build(n, rates, np.zeros((n, n))), n, np.random.default_rng(0))
@@ -305,7 +305,7 @@ def test_timing_600_ops_30_blocks():
     t0 = time.perf_counter()
     L_blocks = Lindbladian(n, h_terms, jumps, kossakowski=(ops, {"blocks": blocks}))
     t_build_blocks = time.perf_counter() - t0
-    assert L_dense.num_pair_templates == L_blocks.num_pair_templates == n_blocks * 20 * 21 // 2
+    assert L_dense.num_compiled_pairs == L_blocks.num_compiled_pairs == n_blocks * 20 * 21 // 2
     assert L_blocks.num_kossakowski_nonzeros == n_blocks * 400
 
     scaled = [(idx, 0.5 * K_b) for idx, K_b in blocks]
@@ -333,7 +333,7 @@ def test_timing_600_ops_30_blocks():
     rss1 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     print(
         f"\n{n} qubits, {m} three-term two-local ops, {n_blocks} blocks of 20 "
-        f"({L_blocks.num_pair_templates} templates of {m * (m + 1) // 2} pairs): "
+        f"({L_blocks.num_compiled_pairs} compiled pairs of {m * (m + 1) // 2}): "
         f"construction dense {t_build_dense * 1e3:.0f} ms / blocks {t_build_blocks * 1e3:.0f} ms; "
         f"setter dense {t_dense * 1e3:.1f} ms, blocks {t_blocks * 1e3:.1f} ms "
         f"(+PSD {t_blocks_psd * 1e3:.1f} ms), COO {t_coo * 1e3:.1f} ms (+PSD {t_coo_psd * 1e3:.1f} ms); "

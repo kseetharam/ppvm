@@ -469,10 +469,24 @@ impl LindbladSpec {
         self.inner.num_kossakowski_nonzeros()
     }
 
-    /// Number of compiled Kossakowski pairs `n ≤ m` (one template each).
+    /// Number of distinct pair templates: operator-pattern relationships
+    /// (the Pauli structure of `(A_n, A_m)` up to a qubit relabelling)
+    /// shared by the compiled pairs.
     #[getter]
     fn num_pair_templates(&self) -> usize {
         self.inner.num_pair_templates()
+    }
+
+    /// Number of compiled Kossakowski pairs `n ≤ m` (`|K_nm| > 1e-14·max|K|`).
+    #[getter]
+    fn num_compiled_pairs(&self) -> usize {
+        self.inner.num_compiled_pairs()
+    }
+
+    /// Heap bytes of the Kossakowski compilation: `(templates, pairs, entries)`.
+    #[getter]
+    fn kossakowski_memory_bytes(&self) -> (usize, usize, usize) {
+        self.inner.kossakowski_memory_bytes()
     }
 
     /// Apply `L*` to a single Pauli string `p`.
