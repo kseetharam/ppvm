@@ -725,6 +725,7 @@ class Lindbladian:
         num_threads: int | None = None,
         admit_basis: int | None = None,
         tau_add: float | None = None,
+        locality: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
         """One predictor-corrector adaptive step.
 
@@ -759,6 +760,19 @@ class Lindbladian:
         turnover. With the default ``None``, admission is bounded by
         ``max_basis`` and turnover requires ``drop_tol > 0``.
 
+        ``locality`` (default ``False``) runs the locality-aware step: the
+        in-basis generator is built from the dissipator's difference-word
+        index and a per-word cache of the column 1-norm / diagonal instead
+        of a full action pass, the leakage merge is sharded over the
+        threads, the second leakage pass is skipped when the working set is
+        full and the corrector reuses the predictor's generator when nothing
+        was admitted. Every action coefficient, generator entry and leakage
+        value is the legacy one bit for bit; the admitted strings enter the
+        basis sorted by word instead of in hash-map order, so the propagated
+        coefficients differ from the legacy step at round-off (the same kind
+        of difference as a change of thread count). See
+        ``locality_stats`` / ``build_locality_index``.
+
         Returns ``(new_basis_arr, new_coeffs)``; the basis may have grown
         (or shrunk, if ``max_basis`` / ``drop_tol`` pruned entries).
         """
@@ -775,7 +789,29 @@ class Lindbladian:
             None if num_threads is None else int(num_threads),
             None if admit_basis is None else int(admit_basis),
             None if tau_add is None else float(tau_add),
+            bool(locality),
         )
+
+    @property
+    def locality_stats(self) -> dict[str, int | bool]:
+        """The locality-aware step's structures (``pc_step_arr(..., locality=True)``):
+        ``index_built``, ``index_bytes``, ``index_entries`` (one per table entry of
+        every compiled pair and general jump), ``index_keys`` (distinct difference
+        words), ``max_delta`` (largest difference-word support) and ``cache_len``
+        (words with a cached column 1-norm / diagonal)."""
+        built, nbytes, entries, keys, max_delta, cache_len = self._spec.locality_stats
+        return {
+            "index_built": bool(built),
+            "index_bytes": int(nbytes),
+            "index_entries": int(entries),
+            "index_keys": int(keys),
+            "max_delta": int(max_delta),
+            "cache_len": int(cache_len),
+        }
+
+    def build_locality_index(self) -> int:
+        """Build the difference-word index now (else the first locality step does); returns its bytes."""
+        return int(self._spec.build_locality_index())
 
     def pc_step_orbit_rep(
         self,

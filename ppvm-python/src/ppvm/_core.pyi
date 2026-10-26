@@ -399,6 +399,9 @@ class LindbladSpec:
     def num_compiled_pairs(self) -> int: ...
     @property
     def kossakowski_memory_bytes(self) -> tuple[int, int, int]: ...
+    @property
+    def locality_stats(self) -> tuple[bool, int, int, int, int, int]: ...
+    def build_locality_index(self) -> int: ...
     def action(self, p: np.ndarray) -> tuple[np.ndarray, np.ndarray]: ...
     def leakage(
         self,
@@ -417,6 +420,7 @@ class LindbladSpec:
         num_threads: int | None = None,
         admit_basis: int | None = None,
         tau_add: float | None = None,
+        locality: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]: ...
     def pc_step_timed(
         self,
@@ -429,6 +433,7 @@ class LindbladSpec:
         num_threads: int | None = None,
         admit_basis: int | None = None,
         tau_add: float | None = None,
+        locality: bool = False,
     ) -> tuple[tuple[np.ndarray, np.ndarray], dict[str, int]]: ...
     def pc_step_orbit_rep(
         self,

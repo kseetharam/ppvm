@@ -489,6 +489,19 @@ impl LindbladSpec {
         self.inner.kossakowski_memory_bytes()
     }
 
+    /// The locality-aware step's structures: `(index_built, index_bytes,
+    /// index_entries, index_keys, max_delta, cache_len)`.
+    #[getter]
+    fn locality_stats(&self) -> (bool, usize, usize, usize, u32, usize) {
+        self.inner.locality_stats()
+    }
+
+    /// Build the transfer index now (it is otherwise built by the first
+    /// locality step); returns its heap bytes.
+    fn build_locality_index(&self) -> usize {
+        self.inner.transfer_index().bytes
+    }
+
     /// Apply `L*` to a single Pauli string `p`.
     fn action<'py>(
         &self,
@@ -557,6 +570,7 @@ impl LindbladSpec {
         num_threads = None,
         admit_basis = None,
         tau_add = None,
+        locality = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn pc_step<'py>(
@@ -571,6 +585,7 @@ impl LindbladSpec {
         num_threads: Option<usize>,
         admit_basis: Option<usize>,
         tau_add: Option<f64>,
+        locality: bool,
     ) -> PyResult<PyPauliMap<'py>> {
         let n_q = self.inner.n_qubits();
         let basis_view = basis.as_array();
@@ -601,6 +616,7 @@ impl LindbladSpec {
                     drop_tol,
                     tau_add,
                     num_threads,
+                    locality,
                 },
             )
             .map_err(map_err)?;
@@ -619,6 +635,7 @@ impl LindbladSpec {
         num_threads = None,
         admit_basis = None,
         tau_add = None,
+        locality = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn pc_step_timed<'py>(
@@ -633,6 +650,7 @@ impl LindbladSpec {
         num_threads: Option<usize>,
         admit_basis: Option<usize>,
         tau_add: Option<f64>,
+        locality: bool,
     ) -> PyResult<(PyPauliMap<'py>, Bound<'py, pyo3::types::PyDict>)> {
         let n_q = self.inner.n_qubits();
         let basis_view = basis.as_array();
@@ -664,6 +682,7 @@ impl LindbladSpec {
                     drop_tol,
                     tau_add,
                     num_threads,
+                    locality,
                 },
             )
             .map_err(map_err)?;
@@ -774,6 +793,7 @@ impl LindbladSpec {
                 drop_tol,
                 tau_add,
                 num_threads: None,
+                locality: false,
             },
         )
         .map_err(map_err)?;

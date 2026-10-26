@@ -52,6 +52,11 @@ pub(crate) mod mf_expm;
 /// phase-aware complex action. See module docs.
 pub mod orbit_rep;
 
+/// Locality-aware predictor-corrector step (`PcStepConfig::locality`): the
+/// transfer index of the compiled dissipator, the basis-local generator
+/// build, the raw / diag cache and the sharded leakage merge. See module docs.
+pub mod locality;
+
 /// Pauli-word storage chunk: `u64` on 64-bit targets, `u32` elsewhere
 /// (`bitvec` implements `BitStore` for `u64` only on 64-bit targets, so
 /// e.g. wasm32 builds use four 32-bit chunks instead of two 64-bit ones).
@@ -635,6 +640,14 @@ pub struct LindbladSpec {
     /// [`Self::new`], in construction order. `j_kinds[..j_rates.len()]`
     /// are those jumps; every later entry is a `KossakowskiPair`.
     j_rates: Vec<f64>,
+    /// The difference-word index of the locality-aware step
+    /// ([`locality::TransferIndex`]), built on first use and dropped when
+    /// the jump list or the compiled pair set changes.
+    transfer: std::sync::OnceLock<locality::TransferIndex>,
+    /// Per-word `(raw, diag)` of the full action — the column 1-norm and the
+    /// diagonal the generator build needs — filled by the locality step's
+    /// leakage pass and generator build, dropped on any coefficient change.
+    rd_cache: std::sync::Mutex<FxHashMap<Word, (f64, f64)>>,
 }
 
 /// User-facing description of one jump operator: a complex Pauli linear
@@ -740,6 +753,8 @@ impl LindbladSpec {
             k_pair_qubits: Vec::new(),
             k_entries: Vec::new(),
             j_rates,
+            transfer: std::sync::OnceLock::new(),
+            rd_cache: std::sync::Mutex::new(FxHashMap::default()),
         })
     }
 
@@ -998,6 +1013,8 @@ impl LindbladSpec {
         // Merge-walk the old records (sorted by (n, m)) against the kept
         // pairs (sorted the same way): reuse the record — its template and
         // qubit map, the map copied into the fresh arena — else build one.
+        let old_pattern: Vec<(u32, u32, u32)> =
+            self.k_pairs.iter().map(|r| (r.n, r.m, r.template)).collect();
         let old_qubits = std::mem::take(&mut self.k_pair_qubits);
         let mut old = std::mem::take(&mut self.k_pairs).into_iter().peekable();
         let mut pairs: Vec<PairRef> = Vec::with_capacity(kept.len());
@@ -1026,6 +1043,17 @@ impl LindbladSpec {
         self.k_entries = full;
         self.prune_templates();
         self.rebuild_kossakowski_pairs();
+        // the raw / diag cache depends on `K`; the transfer index only on the pair
+        // set and its templates (a rescaled pattern keeps it)
+        self.clear_locality_cache();
+        let same_pattern = old_pattern.len() == self.k_pairs.len()
+            && old_pattern
+                .iter()
+                .zip(self.k_pairs.iter())
+                .all(|(o, r)| *o == (r.n, r.m, r.template));
+        if !same_pattern {
+            self.clear_transfer_index();
+        }
         Ok(())
     }
 
@@ -1322,6 +1350,7 @@ impl LindbladSpec {
                 }
             }
         }
+        self.clear_locality_cache();
         Ok(())
     }
 
@@ -1359,6 +1388,7 @@ impl LindbladSpec {
         for (h, &c) in self.h_terms.iter_mut().zip(coeffs) {
             h.coeff = c;
         }
+        self.clear_locality_cache(); // raw / diag depend on the coefficients; the index does not
         Ok(())
     }
 
@@ -1667,6 +1697,10 @@ impl LindbladSpec {
         let admit = admit_basis.unwrap_or(max_basis).max(max_basis);
         let tau_add = tau_add.unwrap_or(0.0);
         let mut t = PcStepTimings::default();
+        if cfg.locality {
+            self.pc_step_inner_locality(basis, coeffs, dt, protected, admit, tau_add, max_basis, drop_tol, Some(&mut t));
+            return Ok(t);
+        }
 
         let t0 = Instant::now();
         let leak = self.leakage_with_prune(basis, coeffs, protected, admit, tau_add)?;
@@ -1724,6 +1758,10 @@ impl LindbladSpec {
         // a no-op, and membership turnover requires `drop_tol > 0`.
         let admit = admit_basis.unwrap_or(max_basis).max(max_basis);
         let tau_add = tau_add.unwrap_or(0.0);
+        if cfg.locality {
+            self.pc_step_inner_locality(basis, coeffs, dt, protected, admit, tau_add, max_basis, drop_tol, None);
+            return Ok(());
+        }
         // 1. First-hop expansion. After this, `coeffs` contains the pre-step
         // coefficients followed by zeros for the newly-added leakage strings.
         // We rely on `coeffs` itself as the pre-step buffer for the corrector
@@ -1746,6 +1784,55 @@ impl LindbladSpec {
         prune_basis(basis, coeffs, drop_tol, protected);
         cap_basis(basis, coeffs, max_basis, protected);
         Ok(())
+    }
+
+    /// The locality-aware step ([`locality`]): the same five phases as
+    /// [`Self::pc_step_inner`] with the sharded leakage merge and the
+    /// `room == 0` early return in the leakage passes, the transfer-index
+    /// generator build in the exponentials and the predictor's generator
+    /// reused by the corrector when the second pass admitted nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn pc_step_inner_locality(
+        &self,
+        basis: &mut Vec<Word>,
+        coeffs: &mut Vec<f64>,
+        dt: f64,
+        protected: &[Word],
+        admit: usize,
+        tau_add: f64,
+        max_basis: usize,
+        drop_tol: f64,
+        mut timings: Option<&mut PcStepTimings>,
+    ) {
+        let mut lap = |slot: fn(&mut PcStepTimings) -> &mut u64, t0: Instant| {
+            if let Some(t) = timings.as_deref_mut() {
+                *slot(t) = t0.elapsed().as_micros() as u64;
+            }
+        };
+        let t0 = Instant::now();
+        let leak = self.leakage_locality(basis, coeffs, protected, admit, tau_add);
+        lap(|t| &mut t.leakage1_us, t0);
+        let t0 = Instant::now();
+        add_leakage_capped(basis, coeffs, leak, admit);
+        lap(|t| &mut t.expand1_us, t0);
+        let t0 = Instant::now();
+        let cache = self.mf_cache_local(basis);
+        let coeffs_predict = mf_expm::apply_cache(&cache, dt, coeffs, drop_tol);
+        lap(|t| &mut t.expm1_us, t0);
+        let t0 = Instant::now();
+        let n1 = basis.len();
+        let leak2 = self.leakage_locality(basis, &coeffs_predict, protected, admit, tau_add);
+        drop(coeffs_predict);
+        lap(|t| &mut t.leakage2_us, t0);
+        let t0 = Instant::now();
+        add_leakage_capped(basis, coeffs, leak2, admit);
+        lap(|t| &mut t.expand2_us, t0);
+        let t0 = Instant::now();
+        let cache = if basis.len() == n1 { cache } else { self.mf_cache_local(basis) };
+        *coeffs = mf_expm::apply_cache(&cache, dt, coeffs, drop_tol);
+        lap(|t| &mut t.expm2_us, t0);
+        prune_basis(basis, coeffs, drop_tol, protected);
+        cap_basis(basis, coeffs, max_basis, protected);
     }
 
     /// Compute `exp(dt · M) · b` for the in-basis-restricted generator

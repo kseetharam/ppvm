@@ -391,6 +391,7 @@ impl BlockLindbladSpec {
                     drop_tol,
                     tau_add,
                     num_threads,
+                    locality: false,
                 },
             )
             .map_err(map_err)?;
