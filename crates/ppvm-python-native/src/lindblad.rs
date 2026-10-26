@@ -696,6 +696,8 @@ impl LindbladSpec {
         d.set_item("leakage2_us", timings.leakage2_us)?;
         d.set_item("expand2_us", timings.expand2_us)?;
         d.set_item("expm2_us", timings.expm2_us)?;
+        d.set_item("build1_us", timings.build1_us)?;
+        d.set_item("build2_us", timings.build2_us)?;
         Ok((map, d))
     }
 

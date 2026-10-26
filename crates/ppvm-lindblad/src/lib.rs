@@ -95,6 +95,10 @@ pub struct PcStepTimings {
     pub leakage2_us: u64,
     pub expand2_us: u64,
     pub expm2_us: u64,
+    /// The generator-build part of `expm1_us` / `expm2_us` (the action pass
+    /// or the locality build; the remainder is the Taylor matvecs).
+    pub build1_us: u64,
+    pub build2_us: u64,
 }
 
 impl PcStepTimings {
@@ -1713,7 +1717,10 @@ impl LindbladSpec {
         // `coeffs` is read-only in the predictor, so it also serves as the
         // pre-step input for the corrector below — no clone needed.
         let t0 = Instant::now();
-        let coeffs_predict = self.expm_step(basis, dt, coeffs, drop_tol);
+        let cache = mf_expm::mf_cache_full(self, basis);
+        t.build1_us = t0.elapsed().as_micros() as u64;
+        let coeffs_predict = mf_expm::apply_cache(&cache, dt, coeffs, drop_tol);
+        drop(cache);
         t.expm1_us = t0.elapsed().as_micros() as u64;
 
         let t0 = Instant::now();
@@ -1726,7 +1733,10 @@ impl LindbladSpec {
         t.expand2_us = t0.elapsed().as_micros() as u64;
 
         let t0 = Instant::now();
-        *coeffs = self.expm_step(basis, dt, coeffs, drop_tol);
+        let cache = mf_expm::mf_cache_full(self, basis);
+        t.build2_us = t0.elapsed().as_micros() as u64;
+        *coeffs = mf_expm::apply_cache(&cache, dt, coeffs, drop_tol);
+        drop(cache);
         t.expm2_us = t0.elapsed().as_micros() as u64;
 
         prune_basis(basis, coeffs, drop_tol, protected);
@@ -1817,6 +1827,7 @@ impl LindbladSpec {
         lap(|t| &mut t.expand1_us, t0);
         let t0 = Instant::now();
         let cache = self.mf_cache_local(basis);
+        lap(|t| &mut t.build1_us, t0);
         let coeffs_predict = mf_expm::apply_cache(&cache, dt, coeffs, drop_tol);
         lap(|t| &mut t.expm1_us, t0);
         let t0 = Instant::now();
@@ -1829,6 +1840,7 @@ impl LindbladSpec {
         lap(|t| &mut t.expand2_us, t0);
         let t0 = Instant::now();
         let cache = if basis.len() == n1 { cache } else { self.mf_cache_local(basis) };
+        lap(|t| &mut t.build2_us, t0);
         *coeffs = mf_expm::apply_cache(&cache, dt, coeffs, drop_tol);
         lap(|t| &mut t.expm2_us, t0);
         prune_basis(basis, coeffs, drop_tol, protected);
