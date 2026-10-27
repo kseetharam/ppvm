@@ -554,6 +554,37 @@ impl LindbladSpec {
             .collect())
     }
 
+    /// Profiling of the grouped action over the rows of `basis`, in parallel (the thread pool's size): per row
+    /// `[merge_us, dense_us, generic_us, final_us, pairs, dense emissions, deferred emissions, wall_us]` in
+    /// `mode` 0 (normal), 1 (values computed, not accumulated) or 2 (entry loops skipped). Modes 1–2 give wrong
+    /// actions and are for the attribution only.
+    fn action_locality_profile<'py>(
+        &self,
+        basis: PyReadonlyArray2<'py, u8>,
+        mode: u8,
+    ) -> PyResult<Vec<Vec<u64>>> {
+        let n_q = self.inner.n_qubits();
+        let words = decode_basis(&basis.as_array(), n_q)?;
+        let _ = self.inner.support_stats();
+        use rayon::prelude::*;
+        Ok(words
+            .par_iter()
+            .map_init(
+                || {
+                    let mut sc = ppvm_lindblad::support::ActScratch::default();
+                    sc.prof_mode = mode;
+                    sc
+                },
+                |sc, w| {
+                    let t0 = std::time::Instant::now();
+                    let _ = self.inner.action_terms_locality_pub(w, sc);
+                    let wall = t0.elapsed().as_micros() as u64;
+                    vec![sc.phase_us[0], sc.phase_us[1], sc.phase_us[2], sc.phase_us[3], sc.stats[1], sc.stats[2], sc.stats[3], wall]
+                },
+            )
+            .collect())
+    }
+
     /// `(tuples, sets, exclusive sets, bytes)` of the support tables (builds the index).
     fn support_stats(&self) -> (usize, usize, usize, usize) {
         self.inner.support_stats()

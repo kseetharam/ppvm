@@ -421,6 +421,12 @@ pub struct ActScratch {
     /// Counters of the last call: `[dense groups, pairs in groups, dense emissions, deferred emissions from
     /// groups, generic candidates, generic emissions, Hamiltonian emissions, distinct deferred words]`.
     pub stats: [u64; 8],
+    /// Profiling: microseconds of the last call's phases `[candidate merge, dense groups, generic, final reduction]`.
+    pub phase_us: [u64; 4],
+    /// Profiling mode: 0 normal; 1 the dense groups' values are computed but not accumulated (the per-entry
+    /// arithmetic without the accumulators); 2 the dense groups' entry loops are skipped (per-pair overhead only).
+    /// Modes 1 and 2 produce a wrong result and exist for the attribution only.
+    pub prof_mode: u8,
 }
 
 impl Default for ActScratch {
@@ -440,6 +446,8 @@ impl Default for ActScratch {
             touched: Vec::new(),
             sup8: Vec::new(),
             stats: [0; 8],
+            phase_us: [0; 4],
+            prof_mode: 0,
         }
     }
 }
@@ -630,6 +638,8 @@ impl LindbladSpec {
         sc.wmap.clear();
         sc.n_wslots = 0;
         sc.stats = [0; 8];
+        let prof_mode = sc.prof_mode;
+        let t_start = std::time::Instant::now();
         let mut out: Vec<(Word, f64)> = Vec::new();
 
         // ── i [H, p] (legacy: first, in term order) ──
@@ -649,6 +659,8 @@ impl LindbladSpec {
             let lists: Vec<&[u64]> = sc.sup.iter().map(|&q| st.by_group[q as usize].as_slice()).collect();
             merge_candidates(&lists, &mut sc.merged);
         }
+        sc.phase_us[0] = t_start.elapsed().as_micros() as u64;
+        let t_dense = std::time::Instant::now();
         let n_merged = sc.merged.len();
         let mut i = 0usize;
         while i < n_merged {
@@ -693,6 +705,10 @@ impl LindbladSpec {
                     Complex::new(0.0, -0.5)
                 };
                 let seq_k = SEQ_DISS | ((k as u64) << 16);
+                if prof_mode == 2 {
+                    std::hint::black_box((half_i, list.len, seq_k));
+                    continue;
+                }
                 for ei in list.start as usize..list.start as usize + list.len as usize {
                     let e = st.tp_entries[ei];
                     let v = match e.flags & 3 {
@@ -726,6 +742,10 @@ impl LindbladSpec {
                             -(coeff * Complex::new(sign, 0.0))
                         }
                     };
+                    if prof_mode == 1 {
+                        std::hint::black_box((v, e.d, seq_k));
+                        continue;
+                    }
                     // the canonical layout over the set: permute the local positions by rank
                     let (dx, dz) = (e.d & 0xF, e.d >> 4);
                     let (mut cx, mut cz) = (0u8, 0u8);
@@ -772,6 +792,8 @@ impl LindbladSpec {
             sc.touched.clear();
             i = j;
         }
+        sc.phase_us[1] = t_dense.elapsed().as_micros() as u64;
+        let t_generic = std::time::Instant::now();
         // ── the generic candidates (ascending k), recorded for the ordered sum ──
         while i < n_merged {
             let k = (sc.merged[i].0 & 0xffff_ffff) as u32;
@@ -887,6 +909,8 @@ impl LindbladSpec {
                 }
             }
         }
+        sc.phase_us[2] = t_generic.elapsed().as_micros() as u64;
+        let t_final = std::time::Instant::now();
         // ── the deferred words: per word, the contributions in legacy (sequence) order ──
         for si in 0..sc.n_dslots {
             let (key, list) = &mut sc.dslots[si];
@@ -921,6 +945,7 @@ impl LindbladSpec {
                 out.push((*w, acc.re));
             }
         }
+        sc.phase_us[3] = t_final.elapsed().as_micros() as u64;
         let _ = &mut sc.sup8;
         out
     }
