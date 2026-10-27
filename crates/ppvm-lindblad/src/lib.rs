@@ -657,6 +657,8 @@ pub struct LindbladSpec {
     /// diagonal the generator build needs — filled by the locality step's
     /// leakage pass and generator build, dropped on any coefficient change.
     rd_cache: std::sync::Mutex<FxHashMap<Word, (f64, f64)>>,
+    /// The leakage merge's shard maps, kept across steps (their allocation and release cost a step 0.1–0.2 s).
+    merge_scratch: std::sync::Mutex<Vec<FxHashMap<Word, f64>>>,
 }
 
 /// User-facing description of one jump operator: a complex Pauli linear
@@ -764,6 +766,7 @@ impl LindbladSpec {
             j_rates,
             transfer: std::sync::OnceLock::new(),
             rd_cache: std::sync::Mutex::new(FxHashMap::default()),
+            merge_scratch: std::sync::Mutex::new(Vec::new()),
         })
     }
 

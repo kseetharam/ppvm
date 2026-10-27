@@ -804,7 +804,17 @@ impl LindbladSpec {
         const CHUNK_SIZE: usize = 4096;
         let shards = rayon::current_num_threads().clamp(1, 64);
         let shard_of = |h: u64| ((h >> 24) as usize) % shards;
-        let mut merged: Vec<FxHashMap<Word, f64>> = (0..shards).map(|_| FxHashMap::default()).collect();
+        // the shard maps of the previous step, cleared (capacity kept)
+        let mut merged: Vec<FxHashMap<Word, f64>> = self
+            .merge_scratch
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default();
+        merged.truncate(shards);
+        merged.resize_with(shards, FxHashMap::default);
+        for m in merged.iter_mut() {
+            m.clear();
+        }
         for chunk_indices in order.chunks(CHUNK_SIZE) {
             // the action of every string of the chunk, its outputs bucketed by shard
             let t0 = std::time::Instant::now();
@@ -849,23 +859,41 @@ impl LindbladSpec {
             let total: usize = merged.iter().map(|m| m.len()).sum();
             count!(leak_merged, total as u64);
             if total > room {
-                let mut mags: Vec<f64> = Vec::with_capacity(total);
-                for m in &merged {
-                    mags.extend(m.values().map(|v| v.abs()));
-                }
-                let k = room.min(mags.len() - 1);
-                mags.select_nth_unstable_by(k, |a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-                let cutoff = mags[k];
+                // the global k-th largest magnitude is the k-th largest of the shards' top-(k + 1) candidates
+                let k = room.min(total - 1);
+                let desc = |a: &f64, b: &f64| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal);
+                let mut cands: Vec<f64> = merged
+                    .par_iter()
+                    .map(|m| {
+                        let mut v: Vec<f64> = m.values().map(|v| v.abs()).collect();
+                        if v.len() > k + 1 {
+                            v.select_nth_unstable_by(k, desc);
+                            v.truncate(k + 1);
+                        }
+                        v
+                    })
+                    .reduce(Vec::new, |mut a, b| {
+                        a.extend(b);
+                        a
+                    });
+                cands.select_nth_unstable_by(k, desc);
+                let cutoff = cands[k];
                 merged.par_iter_mut().for_each(|m| m.retain(|_, &mut v| v.abs() >= cutoff));
             }
             lap!(leak_cap_us, t0);
         }
         let t0 = std::time::Instant::now();
         let mut out: Vec<(Word, f64)> = merged
-            .into_iter()
-            .flat_map(|m| m.into_iter().filter(|(_, c)| c.abs() > tau_add))
+            .iter()
+            .flat_map(|m| m.iter().filter(|(_, c)| c.abs() > tau_add).map(|(w, c)| (*w, *c)))
             .collect();
         out.sort_unstable_by(|a, b| (a.0.xbits.data, a.0.zbits.data).cmp(&(b.0.xbits.data, b.0.zbits.data)));
+        for m in merged.iter_mut() {
+            m.clear();
+        }
+        if let Ok(mut g) = self.merge_scratch.lock() {
+            *g = merged;
+        }
         lap!(leak_sort_us, t0);
         out
     }

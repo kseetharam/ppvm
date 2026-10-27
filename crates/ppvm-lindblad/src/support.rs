@@ -74,6 +74,37 @@ fn local_mask(w: &Word) -> u8 {
     ((w.xbits.data[0] | w.zbits.data[0]) & 0xF) as u8
 }
 
+/// One compiled pair as the grouped loop reads it (streamed in group order next to its key).
+#[derive(Clone, Copy)]
+struct PairRec {
+    template: u32,
+    tuple: u32,
+    off_diag: u8,
+    _pad: [u8; 7],
+    k_nm: Complex<f64>,
+}
+
+/// One entry of a `(template, local input pattern)` table (8 bytes): the local output difference `d`, flags
+/// (bits 0–1 kind: 0 one-sided anticommutator, 1 sandwich, 2 both-sided anticommutator; bit 2 full support; bits
+/// 3–4 the sandwich phase; bit 5 the anticommutator sign `+`; bit 6 `eps = +2`), the legacy entry position and
+/// the table indices.
+#[derive(Clone, Copy)]
+struct TpEntry {
+    d: u8,
+    flags: u8,
+    pos: u16,
+    a: u16,
+    b: u16,
+}
+
+#[derive(Clone, Copy, Default)]
+struct TpList {
+    start: u32,
+    len: u16,
+    hit_r: u8,
+    _pad: u8,
+}
+
 /// The support-set tables of a compiled dissipator (built with the transfer index).
 #[allow(dead_code)]
 pub struct SupportTables {
@@ -81,21 +112,24 @@ pub struct SupportTables {
     pair_tuple: Vec<u32>,
     tuple_nl: Vec<u8>,
     tuple_qubits: Vec<[u8; MAX_LOCAL]>,
+    /// Per tuple: rank of each local position among the tuple's qubits (the canonical layout's permutation).
+    tuple_rank: Vec<[u8; MAX_LOCAL]>,
     tuple_set: Vec<u32>,
-    /// Per tuple: local difference word → the same word in the set's canonical (sorted-qubit) layout.
-    tuple_canon: Vec<[u8; 256]>,
-    /// Per tuple: local support mask (bit per local position) → the set id of that sub-support.
-    tuple_subset_set: Vec<[u32; 16]>,
-    /// Per tuple: local difference word → its canonical layout over its OWN support (the sub-support's sorted qubits).
-    tuple_sub_canon: Vec<[u8; 256]>,
     set_size: Vec<u8>,
     set_qubits: Vec<[u8; MAX_LOCAL]>,
     set_exclusive: Vec<bool>,
+    /// Per set: support mask over the set's sorted positions → the set id of that sub-support.
+    set_subset: Vec<[u32; 16]>,
     /// `(size, sorted qubits)` → set id (the generic path's lookup).
     set_index: FxHashMap<(u8, [u8; MAX_LOCAL]), u32>,
     /// Per qubit: `(group << 32) | k` for every `k` of `j_support[q]`, sorted; `group` = the set
     /// of a dense-eligible pair on an exclusive set, else `NO_GROUP`.
     by_group: Vec<Vec<u64>>,
+    /// Per qubit, parallel to `by_group`: the pair record (`template == u32::MAX` for the generic kinds).
+    by_group_rec: Vec<Vec<PairRec>>,
+    /// `tp_index[template * 256 + pattern]` → the entries of that template on that local input pattern.
+    tp_index: Vec<TpList>,
+    tp_entries: Vec<TpEntry>,
     pub n_tuples: usize,
     pub n_sets: usize,
     pub n_exclusive: usize,
@@ -247,17 +281,20 @@ impl SupportTables {
         let tuple_set: Vec<u32> = (0..tuple_nl.len())
             .map(|ti| reg.get(&tuple_qubits[ti][..tuple_nl[ti] as usize]))
             .collect();
-        // every sub-support of every tuple is a registered set (the deferred emissions are keyed by it)
-        let tuple_subset_set: Vec<[u32; 16]> = (0..tuple_nl.len())
-            .map(|ti| {
-                let nl = tuple_nl[ti] as usize;
-                let qs = &tuple_qubits[ti][..nl];
+        let set_exclusive: Vec<bool> = reg.marked.iter().map(|m| !m).collect();
+        // every sub-support of every set is a registered set (the deferred emissions are keyed by it);
+        // the registry grows here, the exclusivity flags are already fixed (a new sub-support set is never dense)
+        let n_sets_fixed = reg.size.len();
+        let set_subset: Vec<[u32; 16]> = (0..n_sets_fixed)
+            .map(|si| {
+                let n = reg.size[si] as usize;
+                let qs = reg.qubits[si];
                 let mut row = [u32::MAX; 16];
-                for m in 0..(1usize << nl) {
+                for m in 0..(1usize << n) {
                     sup.clear();
-                    for (li, &q) in qs.iter().enumerate() {
-                        if m >> li & 1 == 1 {
-                            sup.push(q);
+                    for i in 0..n {
+                        if m >> i & 1 == 1 {
+                            sup.push(qs[i]);
                         }
                     }
                     row[m] = reg.get(&sup);
@@ -265,9 +302,12 @@ impl SupportTables {
                 row
             })
             .collect();
-        let set_exclusive: Vec<bool> = reg.marked.iter().map(|m| !m).collect();
-        // canonical layout per tuple: local position t → rank of its qubit in the sorted set
-        let tuple_canon: Vec<[u8; 256]> = (0..tuple_nl.len())
+        let mut set_exclusive = set_exclusive;
+        set_exclusive.resize(reg.size.len(), false);
+        let mut set_subset = set_subset;
+        set_subset.resize(reg.size.len(), [u32::MAX; 16]);
+        // the canonical layout's permutation per tuple: rank of local position t among the tuple's qubits
+        let tuple_rank: Vec<[u8; MAX_LOCAL]> = (0..tuple_nl.len())
             .map(|ti| {
                 let nl = tuple_nl[ti] as usize;
                 let qs = &tuple_qubits[ti][..nl];
@@ -275,67 +315,66 @@ impl SupportTables {
                 for t in 0..nl {
                     rank[t] = qs.iter().filter(|&&q| q < qs[t]).count() as u8;
                 }
-                let mut tab = [0u8; 256];
-                for d in 0..256usize {
-                    let (x, z) = ((d & 0xF) as u8, (d >> 4) as u8);
-                    let (mut cx, mut cz) = (0u8, 0u8);
-                    for t in 0..nl {
-                        cx |= ((x >> t) & 1) << rank[t];
-                        cz |= ((z >> t) & 1) << rank[t];
-                    }
-                    tab[d] = cx | (cz << 4);
+                rank
+            })
+            .collect();
+        // the (template, local pattern) tables, all 256 patterns of every template, shared read-only
+        let mut tp_index: Vec<TpList> = vec![TpList::default(); spec.k_templates.len() * 256];
+        let mut tp_entries: Vec<TpEntry> = Vec::new();
+        for (ti, t) in spec.k_templates.iter().enumerate() {
+            let nl = t.n_local as usize;
+            if nl > MAX_LOCAL {
+                continue;
+            }
+            for pattern in 0..256usize {
+                let (x8, z8) = ((pattern & 0xF) as u8, (pattern >> 4) as u8);
+                if ((x8 | z8) as usize) >> nl != 0 {
+                    continue;
                 }
-                tab
-            })
-            .collect();
-        // canonical layout of a local word over its own support: bits in ascending order of the support's qubits
-        let tuple_sub_canon: Vec<[u8; 256]> = (0..tuple_nl.len())
-            .map(|ti| {
-                let nl = tuple_nl[ti] as usize;
-                let qs = &tuple_qubits[ti][..nl];
-                let mut tab = [0u8; 256];
-                for d in 0..256usize {
-                    let (x, z) = ((d & 0xF) as u8, (d >> 4) as u8);
-                    let m = (x | z) as usize;
-                    if m >> nl != 0 {
-                        continue;
+                tp_index[ti * 256 + pattern] = build_tp(spec, ti as u32, x8, z8, &mut tp_entries);
+            }
+        }
+        let mut by_group: Vec<Vec<u64>> = Vec::with_capacity(spec.j_support.len());
+        let mut by_group_rec: Vec<Vec<PairRec>> = Vec::with_capacity(spec.j_support.len());
+        for list in &spec.j_support {
+            let mut v: Vec<u64> = list
+                .iter()
+                .map(|&k| {
+                    let t = pair_tuple[k as usize];
+                    let group = if t != NO_TUPLE && set_exclusive[tuple_set[t as usize] as usize] {
+                        tuple_set[t as usize]
+                    } else {
+                        NO_GROUP
+                    };
+                    ((group as u64) << 32) | k as u64
+                })
+                .collect();
+            v.sort_unstable();
+            let recs: Vec<PairRec> = v
+                .iter()
+                .map(|&key| {
+                    let k = (key & 0xffff_ffff) as usize;
+                    match &spec.j_kinds[k] {
+                        JumpKind::KossakowskiPair { template, off_diag, k_nm, .. } if pair_tuple[k] != NO_TUPLE => PairRec {
+                            template: *template,
+                            tuple: pair_tuple[k],
+                            off_diag: *off_diag as u8,
+                            _pad: [0; 7],
+                            k_nm: *k_nm,
+                        },
+                        _ => PairRec { template: u32::MAX, tuple: NO_TUPLE, off_diag: 0, _pad: [0; 7], k_nm: Complex::new(0.0, 0.0) },
                     }
-                    let mut pos: Vec<usize> = (0..nl).filter(|&t| m >> t & 1 == 1).collect();
-                    pos.sort_by_key(|&t| qs[t]);
-                    let (mut cx, mut cz) = (0u8, 0u8);
-                    for (i, &t) in pos.iter().enumerate() {
-                        cx |= ((x >> t) & 1) << i;
-                        cz |= ((z >> t) & 1) << i;
-                    }
-                    tab[d] = cx | (cz << 4);
-                }
-                tab
-            })
-            .collect();
-        let by_group: Vec<Vec<u64>> = spec
-            .j_support
-            .iter()
-            .map(|list| {
-                let mut v: Vec<u64> = list
-                    .iter()
-                    .map(|&k| {
-                        let t = pair_tuple[k as usize];
-                        let group = if t != NO_TUPLE && set_exclusive[tuple_set[t as usize] as usize] {
-                            tuple_set[t as usize]
-                        } else {
-                            NO_GROUP
-                        };
-                        ((group as u64) << 32) | k as u64
-                    })
-                    .collect();
-                v.sort_unstable();
-                v
-            })
-            .collect();
+                })
+                .collect();
+            by_group.push(v);
+            by_group_rec.push(recs);
+        }
         let bytes = pair_tuple.len() * 4
-            + tuple_nl.len() * (1 + MAX_LOCAL + 4 + 256 + 64 + 256)
-            + reg.size.len() * (1 + MAX_LOCAL + 1)
-            + by_group.iter().map(|v| v.len() * 8).sum::<usize>();
+            + tuple_nl.len() * (1 + MAX_LOCAL + MAX_LOCAL + 4)
+            + reg.size.len() * (1 + MAX_LOCAL + 1 + 64)
+            + by_group.iter().map(|v| v.len() * (8 + std::mem::size_of::<PairRec>())).sum::<usize>()
+            + tp_index.len() * std::mem::size_of::<TpList>()
+            + tp_entries.len() * std::mem::size_of::<TpEntry>();
         let n_exclusive = set_exclusive.iter().filter(|&&e| e).count();
         let n_tuples = tuple_nl.len();
         let n_sets = reg.size.len();
@@ -344,14 +383,16 @@ impl SupportTables {
             tuple_nl,
             tuple_qubits,
             tuple_set,
-            tuple_canon,
-            tuple_subset_set,
-            tuple_sub_canon,
+            tuple_rank,
             set_size: reg.size,
             set_qubits: reg.qubits,
             set_exclusive,
+            set_subset,
             set_index: reg.index,
             by_group,
+            by_group_rec,
+            tp_index,
+            tp_entries,
             n_tuples,
             n_sets,
             n_exclusive,
@@ -360,36 +401,11 @@ impl SupportTables {
     }
 }
 
-/// One cached table entry of a `(template, local input pattern)`: the local
-/// output difference `d`, whether it has full local support, its legacy
-/// position in the pair's visiting order and the geometric factor.
-#[derive(Clone, Copy)]
-struct TpEntry {
-    d: u8,
-    full: bool,
-    /// 0 = one-sided anticommutator (`geo` = eps), 1 = sandwich (`ph` = phase), 2 = both-sided anticommutator (`geo` = sign).
-    kind: u8,
-    ph: u8,
-    pos: u16,
-    a: u16,
-    b: u16,
-    geo: f64,
-}
-
-#[derive(Clone, Copy)]
-struct TpList {
-    start: u32,
-    len: u32,
-    hit_r: bool,
-}
-
 /// Per-thread scratch of the support-grouped action.
 pub struct ActScratch {
     sup: Vec<u32>,
     cands: Vec<u32>,
-    merged: Vec<u64>,
-    tp: FxHashMap<u32, TpList>,
-    tp_entries: Vec<TpEntry>,
+    merged: Vec<(u64, u32, u32)>,
     /// Deferred contributions keyed by `(set << 8) | canonical word`: slot per key, `(seq, value)` per contribution.
     dmap: FxHashMap<u32, u32>,
     dslots: Vec<(u32, Vec<(u64, Complex<f64>)>)>,
@@ -413,8 +429,6 @@ impl Default for ActScratch {
             sup: Vec::new(),
             cands: Vec::new(),
             merged: Vec::new(),
-            tp: FxHashMap::default(),
-            tp_entries: Vec::new(),
             dmap: FxHashMap::default(),
             dslots: Vec::new(),
             n_dslots: 0,
@@ -429,8 +443,6 @@ impl Default for ActScratch {
         }
     }
 }
-
-const TP_CAP: usize = 1 << 24;
 
 impl ActScratch {
     #[inline(always)]
@@ -524,12 +536,14 @@ fn build_tp(spec: &LindbladSpec, template: u32, x8: u8, z8: u8, out: &mut Vec<Tp
     let hits = |mask: &[Chunk; W_CHUNKS]| (0..W_CHUNKS).any(|i| mask[i] & (p_loc.xbits.data[i] | p_loc.zbits.data[i]) != 0);
     let (hit_l, hit_r) = (hits(&t.left_mask), hits(&t.right_mask));
     let start = out.len() as u32;
+    let full_flag = |d: u8| if support_of_local8(d) == full { 4u8 } else { 0u8 };
     if !(hit_l && hit_r) {
         for (ti, term) in t.adag_b.iter().enumerate() {
             let (o, eps) = comm_product_local(&term.word, &p_loc);
             if eps != 0.0 {
                 let d = local8(&o) ^ p8;
-                out.push(TpEntry { d, full: support_of_local8(d) == full, kind: 0, ph: 0, pos: ti as u16, a: ti as u16, b: 0, geo: eps });
+                let eps_flag = if eps > 0.0 { 64u8 } else { 0u8 };
+                out.push(TpEntry { d, flags: full_flag(d) | eps_flag, pos: ti as u16, a: ti as u16, b: 0 });
             }
         }
     } else {
@@ -537,22 +551,24 @@ fn build_tp(spec: &LindbladSpec, template: u32, x8: u8, z8: u8, out: &mut Vec<Tp
         for (ga, (wa, rights)) in t.sand.iter().enumerate() {
             let (r_ap, phi1) = pauli_mul_local(wa, &p_loc);
             for (gb, (wb, _)) in rights.iter().enumerate() {
-                let (s, phi2) = pauli_mul_local(&r_ap, wb);
-                let d = local8(&s) ^ p8;
-                out.push(TpEntry { d, full: support_of_local8(d) == full, kind: 1, ph: phi1 + phi2, pos, a: ga as u16, b: gb as u16, geo: 0.0 });
+                let (sw, phi2) = pauli_mul_local(&r_ap, wb);
+                let d = local8(&sw) ^ p8;
+                out.push(TpEntry { d, flags: 1 | full_flag(d) | (((phi1 + phi2) & 3) << 3), pos, a: ga as u16, b: gb as u16 });
                 pos += 1;
             }
         }
         for (ti, term) in t.adag_b.iter().enumerate() {
             let (r, phase) = pauli_mul_local(&term.word, &p_loc);
             if phase & 1 == 0 {
-                let sign = if phase == 0 { 1.0 } else { -1.0 };
+                let sign_flag = if phase == 0 { 32u8 } else { 0u8 };
                 let d = local8(&r) ^ p8;
-                out.push(TpEntry { d, full: support_of_local8(d) == full, kind: 2, ph: 0, pos: pos + ti as u16, a: ti as u16, b: 0, geo: sign });
+                out.push(TpEntry { d, flags: 2 | full_flag(d) | sign_flag, pos: pos + ti as u16, a: ti as u16, b: 0 });
             }
         }
     }
-    TpList { start, len: out.len() as u32 - start, hit_r }
+    let len = out.len() as u32 - start;
+    assert!(len < u16::MAX as u32, "template table wider than u16");
+    TpList { start, len: len as u16, hit_r: hit_r as u8, _pad: 0 }
 }
 
 /// `p ⊕ Δ` with the local difference `d` (local layout) placed on `qs`.
@@ -569,33 +585,36 @@ fn xor_local(p: &Word, d: u8, qs: &[u8]) -> Word {
     out
 }
 
-/// Merge the sorted `(group, k)` lists of the support qubits, deduplicated.
-fn merge_candidates(lists: &[&[u64]], out: &mut Vec<u64>) {
+/// Merge the sorted `(group, k)` lists of the support qubits, deduplicated; each output carries the list and
+/// the position its record is read from.
+fn merge_candidates(lists: &[&[u64]], out: &mut Vec<(u64, u32, u32)>) {
     out.clear();
     if lists.len() > 8 {
-        for l in lists {
-            out.extend_from_slice(l);
+        for (li, l) in lists.iter().enumerate() {
+            out.extend(l.iter().enumerate().map(|(pi, &v)| (v, li as u32, pi as u32)));
         }
-        out.sort_unstable();
-        out.dedup();
+        out.sort_unstable_by_key(|e| e.0);
+        out.dedup_by_key(|e| e.0);
         return;
     }
     let mut pos = vec![0usize; lists.len()];
     loop {
-        let mut best: Option<u64> = None;
+        let mut best: Option<(u64, usize)> = None;
         for (i, l) in lists.iter().enumerate() {
             if pos[i] < l.len() {
                 let v = l[pos[i]];
-                best = Some(best.map_or(v, |b| b.min(v)));
+                if best.is_none_or(|(b, _)| v < b) {
+                    best = Some((v, i));
+                }
             }
         }
-        let Some(v) = best else { break };
+        let Some((v, li)) = best else { break };
+        out.push((v, li as u32, pos[li] as u32));
         for (i, l) in lists.iter().enumerate() {
             if pos[i] < l.len() && l[pos[i]] == v {
                 pos[i] += 1;
             }
         }
-        out.push(v);
     }
 }
 
@@ -630,14 +649,10 @@ impl LindbladSpec {
             let lists: Vec<&[u64]> = sc.sup.iter().map(|&q| st.by_group[q as usize].as_slice()).collect();
             merge_candidates(&lists, &mut sc.merged);
         }
-        if sc.tp_entries.len() > TP_CAP {
-            sc.tp.clear();
-            sc.tp_entries.clear();
-        }
         let n_merged = sc.merged.len();
         let mut i = 0usize;
         while i < n_merged {
-            let group = (sc.merged[i] >> 32) as u32;
+            let group = (sc.merged[i].0 >> 32) as u32;
             if group == NO_GROUP {
                 break;
             }
@@ -645,80 +660,81 @@ impl LindbladSpec {
             let set = group as usize;
             let nl_set = st.set_size[set] as usize;
             let set_qs = &st.set_qubits[set][..nl_set];
+            let subset = &st.set_subset[set];
             sc.stats[0] += 1;
             let mut j = i;
-            while j < n_merged && (sc.merged[j] >> 32) as u32 == group {
-                let k = (sc.merged[j] & 0xffff_ffff) as u32;
+            while j < n_merged && (sc.merged[j].0 >> 32) as u32 == group {
+                let (key, li, pi) = sc.merged[j];
+                let k = (key & 0xffff_ffff) as u32;
                 j += 1;
-                let JumpKind::KossakowskiPair { template, q_off, off_diag, k_nm } = &self.j_kinds[k as usize] else {
-                    unreachable!("dense group holds Kossakowski pairs only")
-                };
-                let t = &self.k_templates[*template as usize];
-                let nl = t.n_local as usize;
-                let start = *q_off as usize;
-                let qs = &self.k_pair_qubits[start..start + nl];
-                let tuple = st.pair_tuple[k as usize] as usize;
-                let canon = &st.tuple_canon[tuple];
-                let sub_set = &st.tuple_subset_set[tuple];
-                let sub_canon = &st.tuple_sub_canon[tuple];
+                let rec = st.by_group_rec[sc.sup[li as usize] as usize][pi as usize];
+                let t = &self.k_templates[rec.template as usize];
+                let tuple = rec.tuple as usize;
+                let nl = st.tuple_nl[tuple] as usize;
+                let qs = &st.tuple_qubits[tuple][..nl];
+                let rank = st.tuple_rank[tuple];
+                let off_diag = rec.off_diag != 0;
+                let k_nm = rec.k_nm;
                 sc.stats[1] += 1;
                 let (mut x8, mut z8) = (0u8, 0u8);
-                for (li, &q) in qs.iter().enumerate() {
+                for (li2, &q) in qs.iter().enumerate() {
                     let q = q as usize;
                     let (ci, bi) = (q / CHUNK_BITS, q % CHUNK_BITS);
-                    x8 |= (((p.xbits.data[ci] >> bi) & 1) as u8) << li;
-                    z8 |= (((p.zbits.data[ci] >> bi) & 1) as u8) << li;
+                    x8 |= (((p.xbits.data[ci] >> bi) & 1) as u8) << li2;
+                    z8 |= (((p.zbits.data[ci] >> bi) & 1) as u8) << li2;
                 }
-                let key = (*template << 8) | (x8 as u32) | ((z8 as u32) << 4);
-                let list = match sc.tp.get(&key) {
-                    Some(l) => *l,
-                    None => {
-                        let l = build_tp(self, *template, x8, z8, &mut sc.tp_entries);
-                        sc.tp.insert(key, l);
-                        l
-                    }
-                };
-                let half_i = if *off_diag {
-                    if list.hit_r { Complex::new(0.0, -0.5) } else { Complex::new(0.0, 0.5) }
-                } else if list.hit_r {
+                let list = st.tp_index[rec.template as usize * 256 + (x8 as usize) + ((z8 as usize) << 4)];
+                let hit_r = list.hit_r != 0;
+                let half_i = if off_diag {
+                    if hit_r { Complex::new(0.0, -0.5) } else { Complex::new(0.0, 0.5) }
+                } else if hit_r {
                     Complex::new(0.0, 0.5)
                 } else {
                     Complex::new(0.0, -0.5)
                 };
                 let seq_k = SEQ_DISS | ((k as u64) << 16);
-                for ei in list.start as usize..(list.start + list.len) as usize {
-                    let e = sc.tp_entries[ei];
-                    let v = match e.kind {
+                for ei in list.start as usize..list.start as usize + list.len as usize {
+                    let e = st.tp_entries[ei];
+                    let v = match e.flags & 3 {
                         0 => {
                             let term = &t.adag_b[e.a as usize];
-                            let c = *k_nm * term.coeff;
-                            let coeff = if *off_diag {
+                            let c = k_nm * term.coeff;
+                            let coeff = if off_diag {
                                 if c.im.abs() > 1e-14 { Complex::new(0.0, -2.0 * c.im) } else { continue }
                             } else {
                                 c
                             };
-                            coeff * half_i * e.geo
+                            let eps = if e.flags & 64 != 0 { 2.0 } else { -2.0 };
+                            coeff * half_i * eps
                         }
                         1 => {
                             let (_, rights) = &t.sand[e.a as usize];
                             let (_, c0) = &rights[e.b as usize];
-                            let v = (c0 * k_nm) * phase_factor(e.ph);
-                            if *off_diag { Complex::new(2.0 * v.re, 0.0) } else { v }
+                            let v = (c0 * k_nm) * phase_factor((e.flags >> 3) & 3);
+                            if off_diag { Complex::new(2.0 * v.re, 0.0) } else { v }
                         }
                         _ => {
                             let term = &t.adag_b[e.a as usize];
-                            let c = *k_nm * term.coeff;
-                            let coeff = if *off_diag {
+                            let c = k_nm * term.coeff;
+                            let coeff = if off_diag {
                                 if c.re.abs() > 1e-14 { Complex::new(2.0 * c.re, 0.0) } else { continue }
                             } else {
                                 c
                             };
+                            let sign = if e.flags & 32 != 0 { 1.0 } else { -1.0 };
                             // the legacy action does `local -= coeff · sign`; `a − b == a + (−b)` in IEEE
-                            -(coeff * Complex::new(e.geo, 0.0))
+                            -(coeff * Complex::new(sign, 0.0))
                         }
                     };
-                    if e.full {
-                        let idx = canon[e.d as usize] as usize;
+                    // the canonical layout over the set: permute the local positions by rank
+                    let (dx, dz) = (e.d & 0xF, e.d >> 4);
+                    let (mut cx, mut cz) = (0u8, 0u8);
+                    for tt in 0..nl {
+                        cx |= ((dx >> tt) & 1) << rank[tt];
+                        cz |= ((dz >> tt) & 1) << rank[tt];
+                    }
+                    if e.flags & 4 != 0 {
+                        let idx = (cx | (cz << 4)) as usize;
                         sc.acc[idx] += v;
                         if !sc.seen[idx] {
                             sc.seen[idx] = true;
@@ -726,8 +742,18 @@ impl LindbladSpec {
                         }
                         sc.stats[2] += 1;
                     } else {
-                        let set = sub_set[support_of_local8(e.d) as usize];
-                        sc.defer_key((set << 8) | sub_canon[e.d as usize] as u32, seq_k | e.pos as u64, v);
+                        // sub-support: its own set, the word compacted to that set's sorted positions
+                        let mask = (cx | cz) as usize;
+                        let sub = subset[mask];
+                        let (mut sx, mut sz, mut jj) = (0u8, 0u8, 0u8);
+                        for i2 in 0..nl_set {
+                            if mask >> i2 & 1 == 1 {
+                                sx |= ((cx >> i2) & 1) << jj;
+                                sz |= ((cz >> i2) & 1) << jj;
+                                jj += 1;
+                            }
+                        }
+                        sc.defer_key((sub << 8) | sx as u32 | ((sz as u32) << 4), seq_k | e.pos as u64, v);
                         sc.stats[3] += 1;
                     }
                 }
@@ -748,7 +774,7 @@ impl LindbladSpec {
         }
         // ── the generic candidates (ascending k), recorded for the ordered sum ──
         while i < n_merged {
-            let k = (sc.merged[i] & 0xffff_ffff) as u32;
+            let k = (sc.merged[i].0 & 0xffff_ffff) as u32;
             i += 1;
             sc.stats[4] += 1;
             let seq_k = SEQ_DISS | ((k as u64) << 16);
