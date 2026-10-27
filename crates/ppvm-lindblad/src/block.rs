@@ -25,6 +25,18 @@
 //! string's letters permuted by the matching, no phase) and
 //! `−(Σ_c k_dc) · P` in species `d` itself.
 //!
+//! **Reset masks (unequal species padded to a common qubit set).** A
+//! transition `c → d` may carry a set of qubit positions of `c` whose state is
+//! *not* carried into `d` but replaced by the unit state (spins that exist
+//! only in `c` are traced out; spins that exist only in `d` arrive
+//! unpolarised): Schrödinger `ρ_d += k_cd Π_cd [ Tr_R(ρ_c) ⊗ 1_R / 2^|R| ]`.
+//! On Pauli strings this map is the projector onto strings that are the
+//! identity on `R`, followed by the permutation; it is self-adjoint, so in the
+//! Heisenberg picture the inflow term `+k_cd (P ∘ π_cd)` is simply dropped
+//! whenever `P ∘ π_cd` has a non-identity letter on a masked position of `c`.
+//! The drain `−k_cd P` is unchanged (the whole reactant block leaves at the
+//! rate). Without masks the block is the ordinary permutation exchange.
+//!
 //! **Representation.** A block row `(species, P)` is stored as one ordinary
 //! [`Word`] of `N + a` positions: the first `N` hold `P`, the trailing
 //! `a = ⌈log₄ M⌉` positions hold the species index as base-4 digits (each
@@ -53,6 +65,9 @@ struct Inflow {
     target: usize,
     rate: f64,
     perm: Vec<u8>,
+    /// Reset mask of the transition `target → d` as an `n_qubits` word with
+    /// the x bit set on every masked position of `target`; `None` = no mask.
+    reset: Option<Word>,
 }
 
 /// `M` per-species Lindbladians coupled by first-order exchange; see the
@@ -70,6 +85,8 @@ pub struct BlockLindbladSpec {
     /// `inflow[d]`: the species `c` whose observables receive weight from
     /// the rows of species `d` (`k_cd > 0`), with the matching `π_cd`.
     inflow: Vec<Vec<Inflow>>,
+    /// Reset masks as given: `(c, d, positions of c reset on c → d)`.
+    resets: Vec<(usize, usize, Vec<usize>)>,
 }
 
 impl BlockLindbladSpec {
@@ -84,6 +101,22 @@ impl BlockLindbladSpec {
         species: Vec<LindbladSpec>,
         exchange: &[Vec<f64>],
         matchings: &[(usize, usize, Vec<usize>)],
+    ) -> Result<Self, Error> {
+        Self::with_resets(n_qubits, species, exchange, matchings, &[])
+    }
+
+    /// [`Self::new`] with reset masks: `resets` lists `(c, d, positions)` with
+    /// `positions` the qubit positions **of species `c`** whose state is
+    /// replaced by the unit state on the transition `c → d` (module docs). A
+    /// pair may appear once; a pair without a transition (`k_cd = 0`) is an
+    /// error, as is a position at or beyond `n_qubits`. An empty list is
+    /// [`Self::new`] exactly.
+    pub fn with_resets(
+        n_qubits: usize,
+        species: Vec<LindbladSpec>,
+        exchange: &[Vec<f64>],
+        matchings: &[(usize, usize, Vec<usize>)],
+        resets: &[(usize, usize, Vec<usize>)],
     ) -> Result<Self, Error> {
         let m = species.len();
         if m == 0 {
@@ -156,6 +189,24 @@ impl BlockLindbladSpec {
                 perms.insert((d, c), inv);
             }
         }
+        // Reset masks: one word per (c, d) with the x bit set on the masked positions of c.
+        let mut masks: FxHashMap<(usize, usize), Word> = FxHashMap::default();
+        for (c, d, positions) in resets {
+            if *c >= m || *d >= m || c == d || k[*c][*d] == 0.0 || masks.contains_key(&(*c, *d)) {
+                return Err(Error::InvalidReset { c: *c, d: *d });
+            }
+            let mut w = Word::new(n_qubits);
+            for &q in positions {
+                if q >= n_qubits {
+                    return Err(Error::InvalidReset { c: *c, d: *d });
+                }
+                w.xbits.set(q, true);
+            }
+            w.rehash();
+            if !positions.is_empty() {
+                masks.insert((*c, *d), w);
+            }
+        }
         let mut rate_out = vec![0.0; m];
         let mut inflow: Vec<Vec<Inflow>> = (0..m).map(|_| Vec::new()).collect();
         for c in 0..m {
@@ -168,6 +219,7 @@ impl BlockLindbladSpec {
                     target: c,
                     rate: k[c][d],
                     perm: perms.get(&(c, d)).cloned().unwrap_or_else(|| identity.clone()),
+                    reset: masks.get(&(c, d)).cloned(),
                 });
             }
         }
@@ -179,7 +231,25 @@ impl BlockLindbladSpec {
             exchange: k,
             rate_out,
             inflow,
+            resets: resets.to_vec(),
         })
+    }
+
+    /// The reset masks as given to [`Self::with_resets`] (empty for [`Self::new`]).
+    pub fn resets(&self) -> &[(usize, usize, Vec<usize>)] {
+        &self.resets
+    }
+
+    /// Whether `w` (an `n_qubits` word) has a non-identity letter on a
+    /// position of `mask` (x bits).
+    #[inline]
+    fn hits_mask(w: &Word, mask: &Word) -> bool {
+        w.xbits
+            .data
+            .iter()
+            .zip(w.zbits.data.iter())
+            .zip(mask.xbits.data.iter())
+            .any(|((x, z), m)| (*x | *z) & *m != 0)
     }
 
     pub fn n_qubits(&self) -> usize {
@@ -375,7 +445,13 @@ impl BlockLindbladSpec {
             out.push((*p, -r));
         }
         for f in inflow {
-            out.push((self.attach(&self.permute(&phys, &f.perm), f.target), f.rate));
+            let w = self.permute(&phys, &f.perm);
+            if let Some(mask) = &f.reset {
+                if Self::hits_mask(&w, mask) {
+                    continue; // traced / fresh spin: the string has no expectation on the unit state
+                }
+            }
+            out.push((self.attach(&w, f.target), f.rate));
         }
         out
     }
@@ -690,6 +766,53 @@ mod tests {
         assert!((out[&(1, "XZI".into())] - 5.0).abs() < 1e-14);
         assert!((out[&(0, "ZIX".into())] + 2.0).abs() < 1e-14);
         assert!(BlockLindbladSpec::new(3, vec![spec(3, &[]), spec(3, &[])], &k, &[(0, 1, vec![0, 0, 1])]).is_err());
+    }
+
+    /// A reset mask drops the inflow of strings with a non-identity letter on
+    /// a masked position of the target species (after the permutation) and
+    /// leaves everything else, the drain included, unchanged; the total
+    /// identity stays conserved (trace preservation).
+    #[test]
+    fn reset_mask_drops_masked_inflow_only() {
+        let specs: Vec<LindbladSpec> = (0..2).map(|_| spec(2, &[])).collect();
+        let k = vec![vec![0.0, 2.0], vec![5.0, 0.0]];
+        // species 0 = {F, pad}, species 1 = {F, P}: on 0 -> 1 the pad (position 1 of 0) is
+        // replaced by the unit state, on 1 -> 0 the P (position 1 of 1) is traced out.
+        let resets = vec![(0usize, 1usize, vec![1usize]), (1, 0, vec![1])];
+        let block = BlockLindbladSpec::with_resets(2, specs, &k, &[], &resets).unwrap();
+        assert_eq!(block.resets().len(), 2);
+        // row (1, "ZI"): identity on the masked position -> feeds (0, "ZI") at k_01 = 2
+        let out = as_map(&block, block.action(&row(&block, "ZI", 1)));
+        assert!((out[&(0, "ZI".into())] - 2.0).abs() < 1e-14);
+        assert!((out[&(1, "ZI".into())] + 5.0).abs() < 1e-14);
+        assert_eq!(out.len(), 2);
+        // row (1, "IZ"): P letter -> no inflow into species 0, the drain stays
+        let out = as_map(&block, block.action(&row(&block, "IZ", 1)));
+        assert!((out[&(1, "IZ".into())] + 5.0).abs() < 1e-14);
+        assert_eq!(out.len(), 1);
+        // row (0, "ZX"): pad letter -> no inflow into species 1
+        let out = as_map(&block, block.action(&row(&block, "ZX", 0)));
+        assert!((out[&(0, "ZX".into())] + 2.0).abs() < 1e-14);
+        assert_eq!(out.len(), 1);
+        // total identity conserved
+        let basis: Vec<Word> = (0..2).map(|s| row(&block, "II", s)).collect();
+        let mut rowsum = [0.0; 2];
+        for (r, _, v) in block.generator(&basis) {
+            rowsum[r] += v;
+        }
+        assert!(rowsum.iter().all(|v| v.abs() < 1e-14));
+        // errors: no transition, bad qubit, duplicate pair
+        let mk = || (0..2).map(|_| spec(2, &[])).collect::<Vec<_>>();
+        let k0 = vec![vec![0.0, 2.0], vec![0.0, 0.0]];
+        assert!(BlockLindbladSpec::with_resets(2, mk(), &k0, &[], &[(1, 0, vec![1])]).is_err());
+        assert!(BlockLindbladSpec::with_resets(2, mk(), &k, &[], &[(0, 1, vec![2])]).is_err());
+        assert!(BlockLindbladSpec::with_resets(2, mk(), &k, &[], &[(0, 1, vec![0]), (0, 1, vec![1])]).is_err());
+        // no masks: bit-identical to `new`
+        let a = BlockLindbladSpec::with_resets(2, mk(), &k, &[], &[]).unwrap();
+        let b = BlockLindbladSpec::new(2, mk(), &k, &[]).unwrap();
+        let ra = as_map(&a, a.action(&row(&a, "XZ", 1)));
+        let rb = as_map(&b, b.action(&row(&b, "XZ", 1)));
+        assert_eq!(ra, rb);
     }
 
     /// `pc_step` without truncation equals the Taylor series of the

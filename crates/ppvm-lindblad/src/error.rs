@@ -52,6 +52,12 @@ pub enum Error {
         c: usize,
         d: usize,
     },
+    /// Block Lindbladian: a reset mask naming a species pair without a
+    /// transition in that direction or a qubit beyond `n_qubits`.
+    InvalidReset {
+        c: usize,
+        d: usize,
+    },
     Internal(String),
 }
 
@@ -104,6 +110,10 @@ impl fmt::Display for Error {
             Error::InvalidMatching { c, d } => write!(
                 f,
                 "matching ({c}, {d}) is not a permutation of the qubit positions"
+            ),
+            Error::InvalidReset { c, d } => write!(
+                f,
+                "reset mask ({c}, {d}): species pair out of range, equal, or a qubit beyond n_qubits"
             ),
             Error::Internal(msg) => write!(f, "internal error: {msg}"),
         }

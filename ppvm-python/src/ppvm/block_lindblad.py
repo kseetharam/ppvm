@@ -30,6 +30,18 @@ single species' Lindbladian per row: ``M ×`` the strings of one species, not
 ``admit_basis``, ``drop_tol``, ``tau_add``, protected rows) has exactly the
 semantics of `Lindbladian.pc_step_arr`, with ``max_basis`` counting rows
 over all species.
+
+**Reset masks** (species of unequal size padded to a common qubit set): a
+transition ``c → d`` may name positions of ``c`` whose state is not carried
+but replaced by the unit state (spins that exist only in ``c`` are traced
+out, spins that exist only in ``d`` arrive unpolarised),
+
+    ρ_d += k_cd Π_cd [ Tr_R(ρ_c) ⊗ 1_R / 2^|R| ].
+
+On Pauli strings this is the projector onto strings that are the identity on
+``R`` followed by the permutation (self-adjoint), so in the Heisenberg
+picture the inflow ``+k_cd (P ∘ π_cd)`` is dropped whenever ``P ∘ π_cd`` has
+a non-identity letter on a masked position; the drain is unchanged.
 """
 
 from __future__ import annotations
@@ -78,6 +90,12 @@ class BlockLindbladian:
         ``{(c, d): perm}`` with ``perm[p]`` the position in species ``d`` of
         the qubit at position ``p`` of species ``c``; a missing reverse pair
         uses the inverse permutation, a missing pair the identity.
+    resets:
+        ``None`` or ``{(c, d): positions}``: the qubit positions **of species
+        c** whose state is replaced by the unit state on the transition
+        ``c → d`` (module docs). Only pairs with ``exchange[c, d] > 0`` may
+        appear; no reverse pair is inferred. ``None`` / all-empty is the plain
+        permutation exchange, bit for bit.
 
     Examples
     --------
@@ -99,6 +117,7 @@ class BlockLindbladian:
         kossakowski: Sequence[tuple[Sequence[str | PauliLincomb], object] | None] | None = None,
         exchange=None,
         matchings: dict[tuple[int, int], Sequence[int]] | None = None,
+        resets: dict[tuple[int, int], Iterable[int]] | None = None,
     ):
         self.n_qubits = int(n_qubits)
         self.n_species = int(n_species)
@@ -154,9 +173,14 @@ class BlockLindbladian:
         match_list = []
         for (c, d), perm in (matchings or {}).items():
             match_list.append((int(c), int(d), [int(q) for q in perm]))
+        reset_list = []
+        for (c, d), positions in (resets or {}).items():
+            positions = sorted({int(q) for q in positions})
+            if positions:                                   # an empty mask is no mask
+                reset_list.append((int(c), int(d), positions))
         self._spec = _BlockLindbladSpec(
             self.n_qubits, self.n_species, h_strs, h_coeffs, j_lincombs, j_rates, k_ops, k_mats,
-            ex.tolist(), match_list,
+            ex.tolist(), match_list, reset_list or None,
         )
 
     # ── bookkeeping ──
@@ -175,6 +199,11 @@ class BlockLindbladian:
     def rate_out(self) -> np.ndarray:
         """``Σ_d k_cd`` per species."""
         return np.array(self._spec.rate_out, dtype=np.float64)
+
+    @property
+    def resets(self) -> dict[tuple[int, int], list[int]]:
+        """``{(c, d): positions of c reset on c → d}`` (empty without masks)."""
+        return {(int(c), int(d)): [int(q) for q in qs] for c, d, qs in self._spec.resets}
 
     def num_h_terms(self, species: int) -> int:
         return self._spec.num_h_terms(int(species))

@@ -179,10 +179,13 @@ impl BlockLindbladSpec {
     /// matrix `exchange[c][d] = k_cd` (`c → d`, diagonal ignored) and the
     /// matchings `(c, d, perm)` with `perm[p]` = position in `d` of the qubit
     /// at position `p` in `c` (a missing reverse is the inverse permutation;
-    /// a missing pair is the identity).
+    /// a missing pair is the identity). `resets` (optional) lists
+    /// `(c, d, positions)`: the qubit positions of species `c` whose state is
+    /// replaced by the unit state on the transition `c → d` (strings with a
+    /// non-identity letter there are not carried; `block.rs` module docs).
     #[new]
     #[pyo3(signature = (n_qubits, n_species, h_terms, h_coeffs, jump_lincombs, jump_rates,
-                        kossakowski_ops, kossakowski_k, exchange, matchings))]
+                        kossakowski_ops, kossakowski_k, exchange, matchings, resets=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         n_qubits: usize,
@@ -195,6 +198,7 @@ impl BlockLindbladSpec {
         kossakowski_k: Vec<Vec<Vec<(f64, f64)>>>,
         exchange: Vec<Vec<f64>>,
         matchings: Vec<(usize, usize, Vec<usize>)>,
+        resets: Option<Vec<(usize, usize, Vec<usize>)>>,
     ) -> PyResult<Self> {
         for (name, len) in [
             ("h_terms", h_terms.len()),
@@ -222,8 +226,16 @@ impl BlockLindbladSpec {
         {
             species.push(build_species(n_qubits, h, c, jl, jr, ko, kk, s)?);
         }
-        let inner = CoreBlock::new(n_qubits, species, &exchange, &matchings).map_err(map_err)?;
+        let resets = resets.unwrap_or_default();
+        let inner = CoreBlock::with_resets(n_qubits, species, &exchange, &matchings, &resets)
+            .map_err(map_err)?;
         Ok(Self { inner })
+    }
+
+    /// The reset masks as given: `[(c, d, positions of c reset on c → d)]`.
+    #[getter]
+    fn resets(&self) -> Vec<(usize, usize, Vec<usize>)> {
+        self.inner.resets().to_vec()
     }
 
     #[getter]

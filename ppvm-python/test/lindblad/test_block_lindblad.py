@@ -372,3 +372,127 @@ def test_construction_errors():
     assert L5.n_digits == 2
     for s in range(5):
         assert L5.action(s, "I") == {}
+
+
+# ---- reset masks (unequal species padded to a common qubit set) ----------------------------
+
+
+def reset_matrix(positions, n):
+    """The Pauli-coefficient matrix of rho -> Tr_R(rho) (x) 1_R / 2^|R| on n qubits: the
+    projector onto strings that are the identity on R (diagonal 0/1)."""
+    strings = all_strings(n)
+    keep = [all(s[q] == "I" for q in positions) for s in strings]
+    return np.diag(np.asarray(keep, dtype=float))
+
+
+def dense_heisenberg_generator_with_resets(n, m, h_terms, jump_terms, kossakowski, exchange,
+                                           matchings, resets):
+    """dense_heisenberg_generator with the inflow c -> d replaced by
+    k_cd Pi_cd [ Tr_R rho_c (x) 1_R / 2^|R| ] for the masked pairs (R in the positions
+    of c), built in the Pauli-coefficient basis: permutation matrix of the string
+    relabelling times the diagonal projector."""
+    strings = all_strings(n)
+    mats = [pauli_matrix(s) for s in strings]
+    d = 1 << n
+    nb = len(strings)
+    species_apply = [schrodinger_species(h_terms[c], (jump_terms or [None] * m)[c],
+                                         (kossakowski or [None] * m)[c], n) for c in range(m)]
+    k = np.asarray(exchange, dtype=float).copy()
+    np.fill_diagonal(k, 0.0)
+    perms = complete_matchings(matchings or {}, n, m)
+    pis = {key: permutation_matrix(perm, n) for key, perm in perms.items()}
+    S = np.zeros((m * nb, m * nb))
+    for dsp in range(m):
+        for j, Q in enumerate(mats):
+            blocks = {dsp: species_apply[dsp](Q) - k[dsp].sum() * Q}
+            for csp in range(m):
+                if csp != dsp and k[dsp, csp] != 0.0:
+                    pi = pis[(dsp, csp)]
+                    R = resets.get((dsp, csp), ())
+                    if R and any(strings[j][q] != "I" for q in R):
+                        continue                       # traced / fresh spin: the string is lost
+                    blocks[csp] = blocks.get(csp, 0) + k[dsp, csp] * (pi @ Q @ pi.T)
+            col = dsp * nb + j
+            for csp, mat in blocks.items():
+                for i, P in enumerate(mats):
+                    v = np.trace(P @ mat) / d
+                    assert abs(v.imag) < 1e-12
+                    S[csp * nb + i, col] = v.real
+    return S.T, strings
+
+
+def test_reset_mask_generator_is_adjoint_of_trace_out_and_unit_arrival():
+    """Species 0 = {F, pad}, species 1 = {F, P} (P coupled to F only in species 1, relaxing
+    there): on 0 -> 1 the pad arrives at the unit state, on 1 -> 0 the P is traced out. The
+    block generator equals the dense direct-sum generator with the reset maps, the total
+    identity is conserved, and the unmasked object is bit-identical to the plain one."""
+    rng = np.random.default_rng(31)
+    n, m = 2, 2
+    h_terms = [[("ZI", 0.8)], [("ZI", 0.8), ("IZ", -0.3), ("ZZ", 0.4), ("XX", 0.4), ("YY", 0.4)]]
+    jump_terms = [[(sigma_minus(0, n), 0.3)], [(sigma_minus(0, n), 0.5), (sigma_minus(1, n), 0.2),
+                                                ([("IX", 0.5), ("IY", 0.5j)], 0.2)]]
+    exchange = [[0.0, 0.7], [1.3, 0.0]]
+    resets = {(0, 1): [1], (1, 0): [1]}
+    L = BlockLindbladian(n, m, h_terms, jump_terms, None, exchange=exchange, resets=resets)
+    assert L.resets == {(0, 1): [1], (1, 0): [1]}
+    G, basis, species = dense_generator_from_block(L, n, m)
+    G_ref, strings = dense_heisenberg_generator_with_resets(n, m, h_terms, jump_terms, None, exchange,
+                                                            {}, resets)
+    assert np.abs(G - G_ref).max() < 1e-12
+    # the masked generator differs from the plain one exactly on the masked inflow
+    G_plain, _ = dense_heisenberg_generator(n, m, h_terms, jump_terms, None, exchange, {})
+    assert np.abs(G - G_plain).max() > 0.1
+    # trace preservation: the Heisenberg generator annihilates the total identity
+    one = np.zeros(m * len(strings))
+    one[[c * len(strings) + strings.index("II") for c in range(m)]] = 1.0
+    assert np.abs(G @ one).max() < 1e-13
+    # the Schrodinger steady state has the P of species 0 (the pad) at the unit state:
+    # exp(t G^T) of any traceless start never populates strings with a letter on the pad
+    v0 = rng.normal(size=m * len(strings))
+    v0[[c * len(strings) + strings.index("II") for c in range(m)]] = 0.0
+    v0[[strings.index(s) for s in strings if s[1] != "I"]] = 0.0          # species 0: nothing on the pad
+    vt = scipy.linalg.expm(2.0 * G.T) @ v0
+    pad_rows = [strings.index(s) for s in strings if s[1] != "I"]
+    assert np.abs(vt[pad_rows]).max() < 1e-12
+    # an uncapped pc_step equals the dense exponential, as without masks
+    coeffs = rng.normal(size=m * len(strings))
+    b, sp, c = L.pc_step_arr(basis, species, coeffs, 0.05, BIG, drop_tol=0.0)
+    ref = scipy.linalg.expm(0.05 * G) @ coeffs
+    got = {(int(s_), tuple(r)): v for r, s_, v in zip(b, sp, c)}
+    for row, s_, v in zip(basis, species, ref):
+        assert abs(got.get((int(s_), tuple(row)), 0.0) - v) < 1e-12
+    # no masks: identical to the plain constructor; empty masks are "no masks"
+    L0 = BlockLindbladian(n, m, h_terms, jump_terms, None, exchange=exchange)
+    L1 = BlockLindbladian(n, m, h_terms, jump_terms, None, exchange=exchange, resets={(0, 1): []})
+    G0, _, _ = dense_generator_from_block(L0, n, m)
+    G1, _, _ = dense_generator_from_block(L1, n, m)
+    assert np.array_equal(G0, G1) and L1.resets == {}
+
+
+def test_reset_mask_with_matching_is_in_the_target_frame():
+    """With a non-identity matching the mask names positions of species c (the frame of the
+    permuted string): row (1, P) feeds (0, P o pi_01) unless that has a letter on a masked
+    position of species 0."""
+    n, m = 3, 2
+    exchange = [[0.0, 2.0], [5.0, 0.0]]
+    matchings = {(0, 1): [1, 2, 0]}                 # qubit 0 of species 0 sits at 1 in species 1, ...
+    L = BlockLindbladian(n, m, [[], []], exchange=exchange, matchings=matchings, resets={(0, 1): [2]})
+    # species 1 string "XZI" -> species 0 string "ZIX" (out[p] = w[perm[p]]): letter X on position 2 -> dropped
+    out = L.action(1, "XZI")
+    assert out == {(1, "XZI"): -5.0}
+    # "XIZ" -> "IZX": also masked; "ZXI" -> "XIZ"? perm: out[0]=w[1]=X, out[1]=w[2]=I, out[2]=w[0]=Z -> masked
+    assert L.action(1, "ZXI") == {(1, "ZXI"): -5.0}
+    # "XIY" -> out = (I, Y, X)? out[0]=w[1]=I, out[1]=w[2]=Y, out[2]=w[0]=X -> masked; "IXY"->(X,Y,I) kept
+    kept = L.action(1, "IXY")
+    assert kept == {(1, "IXY"): -5.0, (0, "XYI"): 2.0}
+    # the reverse transition has no mask
+    assert L.action(0, "XYI") == {(0, "XYI"): -2.0, (1, "IXY"): 5.0}
+    # errors: a pair without a transition, a qubit beyond n
+    with pytest.raises(ValueError):
+        BlockLindbladian(n, m, [[], []], exchange=[[0.0, 2.0], [0.0, 0.0]], resets={(1, 0): [0]})
+    with pytest.raises(ValueError):
+        BlockLindbladian(n, m, [[], []], exchange=exchange, resets={(0, 1): [3]})
+    G, _ = dense_heisenberg_generator_with_resets(n, m, [[], []], None, None, exchange, matchings,
+                                                  {(0, 1): [2]})
+    Gb, _, _ = dense_generator_from_block(L, n, m)
+    assert np.abs(G - Gb).max() < 1e-12
