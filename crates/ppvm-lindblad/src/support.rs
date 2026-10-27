@@ -93,8 +93,9 @@ struct TpEntry {
     d: u8,
     flags: u8,
     pos: u16,
-    a: u16,
-    b: u16,
+    /// Index of the entry's table coefficient (`λ_a* μ_b` or `γ_w`) in the template's flat coefficient table.
+    c: u16,
+    _pad: u16,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -130,6 +131,9 @@ pub struct SupportTables {
     /// `tp_index[template * 256 + pattern]` → the entries of that template on that local input pattern.
     tp_index: Vec<TpList>,
     tp_entries: Vec<TpEntry>,
+    /// Per template, contiguous: the sandwich coefficients `c0` in table order, then the `adag_b` coefficients.
+    tp_coeff: Vec<Complex<f64>>,
+    tp_coeff_off: Vec<u32>,
     pub n_tuples: usize,
     pub n_sets: usize,
     pub n_exclusive: usize,
@@ -321,7 +325,18 @@ impl SupportTables {
         // the (template, local pattern) tables, all 256 patterns of every template, shared read-only
         let mut tp_index: Vec<TpList> = vec![TpList::default(); spec.k_templates.len() * 256];
         let mut tp_entries: Vec<TpEntry> = Vec::new();
+        let mut tp_coeff: Vec<Complex<f64>> = Vec::new();
+        let mut tp_coeff_off: Vec<u32> = Vec::with_capacity(spec.k_templates.len());
         for (ti, t) in spec.k_templates.iter().enumerate() {
+            tp_coeff_off.push(tp_coeff.len() as u32);
+            for (_, rights) in &t.sand {
+                for (_, c0) in rights {
+                    tp_coeff.push(*c0);
+                }
+            }
+            for term in &t.adag_b {
+                tp_coeff.push(term.coeff);
+            }
             let nl = t.n_local as usize;
             if nl > MAX_LOCAL {
                 continue;
@@ -374,7 +389,8 @@ impl SupportTables {
             + reg.size.len() * (1 + MAX_LOCAL + 1 + 64)
             + by_group.iter().map(|v| v.len() * (8 + std::mem::size_of::<PairRec>())).sum::<usize>()
             + tp_index.len() * std::mem::size_of::<TpList>()
-            + tp_entries.len() * std::mem::size_of::<TpEntry>();
+            + tp_entries.len() * std::mem::size_of::<TpEntry>()
+            + tp_coeff.len() * 16;
         let n_exclusive = set_exclusive.iter().filter(|&&e| e).count();
         let n_tuples = tuple_nl.len();
         let n_sets = reg.size.len();
@@ -393,6 +409,8 @@ impl SupportTables {
             by_group_rec,
             tp_index,
             tp_entries,
+            tp_coeff,
+            tp_coeff_off,
             n_tuples,
             n_sets,
             n_exclusive,
@@ -545,23 +563,24 @@ fn build_tp(spec: &LindbladSpec, template: u32, x8: u8, z8: u8, out: &mut Vec<Tp
     let (hit_l, hit_r) = (hits(&t.left_mask), hits(&t.right_mask));
     let start = out.len() as u32;
     let full_flag = |d: u8| if support_of_local8(d) == full { 4u8 } else { 0u8 };
+    let n_sand: usize = t.sand.iter().map(|(_, r)| r.len()).sum();
     if !(hit_l && hit_r) {
         for (ti, term) in t.adag_b.iter().enumerate() {
             let (o, eps) = comm_product_local(&term.word, &p_loc);
             if eps != 0.0 {
                 let d = local8(&o) ^ p8;
                 let eps_flag = if eps > 0.0 { 64u8 } else { 0u8 };
-                out.push(TpEntry { d, flags: full_flag(d) | eps_flag, pos: ti as u16, a: ti as u16, b: 0 });
+                out.push(TpEntry { d, flags: full_flag(d) | eps_flag, pos: ti as u16, c: (n_sand + ti) as u16, _pad: 0 });
             }
         }
     } else {
         let mut pos = 0u16;
-        for (ga, (wa, rights)) in t.sand.iter().enumerate() {
+        for (wa, rights) in t.sand.iter() {
             let (r_ap, phi1) = pauli_mul_local(wa, &p_loc);
-            for (gb, (wb, _)) in rights.iter().enumerate() {
+            for (wb, _) in rights.iter() {
                 let (sw, phi2) = pauli_mul_local(&r_ap, wb);
                 let d = local8(&sw) ^ p8;
-                out.push(TpEntry { d, flags: 1 | full_flag(d) | (((phi1 + phi2) & 3) << 3), pos, a: ga as u16, b: gb as u16 });
+                out.push(TpEntry { d, flags: 1 | full_flag(d) | (((phi1 + phi2) & 3) << 3), pos, c: pos, _pad: 0 });
                 pos += 1;
             }
         }
@@ -570,10 +589,11 @@ fn build_tp(spec: &LindbladSpec, template: u32, x8: u8, z8: u8, out: &mut Vec<Tp
             if phase & 1 == 0 {
                 let sign_flag = if phase == 0 { 32u8 } else { 0u8 };
                 let d = local8(&r) ^ p8;
-                out.push(TpEntry { d, flags: 2 | full_flag(d) | sign_flag, pos: pos + ti as u16, a: ti as u16, b: 0 });
+                out.push(TpEntry { d, flags: 2 | full_flag(d) | sign_flag, pos: pos + ti as u16, c: (n_sand + ti) as u16, _pad: 0 });
             }
         }
     }
+    assert!(n_sand + t.adag_b.len() < u16::MAX as usize, "template coefficient table wider than u16");
     let len = out.len() as u32 - start;
     assert!(len < u16::MAX as u32, "template table wider than u16");
     TpList { start, len: len as u16, hit_r: hit_r as u8, _pad: 0 }
@@ -680,7 +700,7 @@ impl LindbladSpec {
                 let k = (key & 0xffff_ffff) as u32;
                 j += 1;
                 let rec = st.by_group_rec[sc.sup[li as usize] as usize][pi as usize];
-                let t = &self.k_templates[rec.template as usize];
+                let coff = st.tp_coeff_off[rec.template as usize] as usize;
                 let tuple = rec.tuple as usize;
                 let nl = st.tuple_nl[tuple] as usize;
                 let qs = &st.tuple_qubits[tuple][..nl];
@@ -711,10 +731,10 @@ impl LindbladSpec {
                 }
                 for ei in list.start as usize..list.start as usize + list.len as usize {
                     let e = st.tp_entries[ei];
+                    let tc = st.tp_coeff[coff + e.c as usize];
                     let v = match e.flags & 3 {
                         0 => {
-                            let term = &t.adag_b[e.a as usize];
-                            let c = k_nm * term.coeff;
+                            let c = k_nm * tc;
                             let coeff = if off_diag {
                                 if c.im.abs() > 1e-14 { Complex::new(0.0, -2.0 * c.im) } else { continue }
                             } else {
@@ -724,14 +744,11 @@ impl LindbladSpec {
                             coeff * half_i * eps
                         }
                         1 => {
-                            let (_, rights) = &t.sand[e.a as usize];
-                            let (_, c0) = &rights[e.b as usize];
-                            let v = (c0 * k_nm) * phase_factor((e.flags >> 3) & 3);
+                            let v = (tc * k_nm) * phase_factor((e.flags >> 3) & 3);
                             if off_diag { Complex::new(2.0 * v.re, 0.0) } else { v }
                         }
                         _ => {
-                            let term = &t.adag_b[e.a as usize];
-                            let c = k_nm * term.coeff;
+                            let c = k_nm * tc;
                             let coeff = if off_diag {
                                 if c.re.abs() > 1e-14 { Complex::new(2.0 * c.re, 0.0) } else { continue }
                             } else {
