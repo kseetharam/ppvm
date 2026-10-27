@@ -998,8 +998,17 @@ mod tests {
         out
     }
 
-    fn ulps_apart(a: f64, b: f64) -> u64 {
-        (a.to_bits() as i64 - b.to_bits() as i64).unsigned_abs()
+    /// `raw = Σ|c|` of a column summed in two different orders: the forward error of summing `n` positive
+    /// numbers is at most `(n − 1) u` relative in any order, so two orders differ by at most `2 (n − 1) u`.
+    fn raw_within_sum_bound(a: f64, b: f64, n_terms: usize) -> bool {
+        let scale = a.abs().max(b.abs()).max(f64::MIN_POSITIVE);
+        (a - b).abs() / scale <= 2.0 * (n_terms as f64 + 1.0) * f64::EPSILON
+    }
+
+    /// Number of output terms of the full action of `w` (the summands of its `raw`).
+    fn n_terms_of(spec: &LindbladSpec, w: &Word) -> usize {
+        let (mut s1, mut s2, mut lm) = (Vec::new(), Vec::new(), FxHashMap::default());
+        spec.compute_action_terms(w, &mut s1, &mut s2, &mut lm).len()
     }
 
     fn sorted_col(col: &[(u32, f64)]) -> Vec<(u32, u64)> {
@@ -1017,13 +1026,14 @@ mod tests {
         let full = mf_cache_full(&spec, &basis);
         let local = spec.mf_cache_local(&basis, None);
         assert_eq!(full.cols.len(), local.cols.len());
+        let n_terms: Vec<usize> = basis.iter().map(|w| n_terms_of(&spec, w)).collect();
         let mut nnz = 0;
         for c in 0..basis.len() {
             assert_eq!(sorted_col(&full.cols[c]), sorted_col(&local.cols[c]), "column {c}");
             // `raw` = Σ|c| over the action's output list: the grouped action lists the terms in another
             // order than the legacy hash-map drain (which the legacy path does not control across runs
             // either), so the bound agrees to round-off, not bitwise; it feeds the Taylor (m*, s) choice only
-            assert!(ulps_apart(full.per_col[c].0, local.per_col[c].0) <= 8, "raw {c}");
+            assert!(raw_within_sum_bound(full.per_col[c].0, local.per_col[c].0, n_terms[c]), "raw {c}");
             assert_eq!(full.per_col[c].1.to_bits(), local.per_col[c].1.to_bits(), "diag {c}");
             nnz += full.cols[c].len();
         }
@@ -1036,7 +1046,7 @@ mod tests {
         let cold = spec.mf_cache_local(&basis, None);
         for c in 0..basis.len() {
             assert_eq!(sorted_col(&full.cols[c]), sorted_col(&cold.cols[c]));
-            assert!(ulps_apart(full.per_col[c].0, cold.per_col[c].0) <= 8);
+            assert!(raw_within_sum_bound(full.per_col[c].0, cold.per_col[c].0, n_terms[c]));
             assert_eq!(full.per_col[c].1.to_bits(), cold.per_col[c].1.to_bits());
         }
         assert_eq!(spec.locality_stats().5, basis.len());
@@ -1166,7 +1176,7 @@ mod tests {
         let local = spec.mf_cache_local(&basis, None);
         for c in 0..basis.len() {
             assert_eq!(sorted_col(&full.cols[c]), sorted_col(&local.cols[c]));
-            assert!(ulps_apart(full.per_col[c].0, local.per_col[c].0) <= 8);
+            assert!(raw_within_sum_bound(full.per_col[c].0, local.per_col[c].0, n_terms_of(&spec, &basis[c])));
         }
     }
     /// A dipolar-like dissipator: three two-qubit operators per spin pair over all pairs of `n` qubits,
