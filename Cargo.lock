@@ -2230,6 +2230,7 @@ dependencies = [
  "ppvm-tableau",
  "ppvm-tableau-sum",
  "pyo3",
+ "rayon",
 ]
 
 [[package]]

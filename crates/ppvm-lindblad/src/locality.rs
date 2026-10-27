@@ -61,7 +61,7 @@ use crate::{
     CHUNK_BITS, Chunk, JumpKind, LindbladSpec, W_CHUNKS, Word, build_basis_index, comm_product,
     comm_product_local, pauli_mul, pauli_mul_local, phase_factor, word_hash,
 };
-use fxhash::{FxBuildHasher, FxHashMap};
+use fxhash::FxHashMap;
 use num::Complex;
 use ppvm_traits::PauliWordTrait;
 use rayon::prelude::*;
@@ -148,7 +148,9 @@ pub struct TransferIndex {
     h_by_word: FxHashMap<u64, Vec<u32>>,
     /// Largest support of any difference word (the neighbour filter).
     max_delta: u32,
-    /// Heap bytes of the index.
+    /// The support-set tables of the grouped action ([`crate::support`]).
+    pub(crate) support: crate::support::SupportTables,
+    /// Heap bytes of the index (the support tables included).
     pub bytes: usize,
 }
 
@@ -259,12 +261,14 @@ impl TransferIndex {
             max_delta = max_delta.max(weight(&h.word));
             h_by_word.entry(word_hash(&h.word)).or_default().push(i as u32);
         }
+        let support = crate::support::SupportTables::build(spec);
         let bytes = keys.capacity() * 8
             + offsets.capacity() * 4
             + entries.capacity() * 8
             + jk_mask.capacity() * std::mem::size_of::<[Chunk; W_CHUNKS]>()
             + sand_flat.iter().map(|v| v.capacity() * 8).sum::<usize>()
-            + h_by_word.len() * 32;
+            + h_by_word.len() * 32
+            + support.bytes;
         Self {
             keys,
             offsets,
@@ -273,6 +277,7 @@ impl TransferIndex {
             sand_flat,
             h_by_word,
             max_delta,
+            support,
             bytes,
         }
     }
@@ -524,11 +529,9 @@ fn full_column(
     spec: &LindbladSpec,
     p: &Word,
     index: &FxHashMap<Word, u32>,
-    s1: &mut Vec<u32>,
-    s2: &mut Vec<u32>,
-    lm: &mut FxHashMap<Word, Complex<f64>>,
+    sc: &mut crate::support::ActScratch,
 ) -> (Vec<(u32, f64)>, (f64, f64)) {
-    let terms = spec.compute_action_terms(p, s1, s2, lm);
+    let terms = spec.action_terms_locality(p, sc);
     let mut out = Vec::with_capacity(terms.len());
     let mut raw = 0.0;
     let mut diag = 0.0;
@@ -560,6 +563,83 @@ pub(crate) fn raw_diag(p: &Word, terms: &[(Word, f64)]) -> (f64, f64) {
 
 /// Upper bound on the raw / diag cache before it is cleared (≈ 64 B per entry).
 const CACHE_MAX_ENTRIES: usize = 4_000_000;
+
+/// Inner phases of the locality step (`pc_step_timed`): the first leakage
+/// pass split into its action pass (the full action of every retained
+/// string, bucketed by shard), the cache fill, the sharded merge, the room
+/// cap and the final sort, with the output volume; the generator build split
+/// into cached columns (the transfer-index path) and misses (the full action).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LocalityProfile {
+    pub leak_action_us: u64,
+    pub leak_cache_us: u64,
+    pub leak_merge_us: u64,
+    pub leak_cap_us: u64,
+    pub leak_sort_us: u64,
+    /// Off-basis output words bucketed over all strings (before the merge).
+    pub leak_words: u64,
+    /// Distinct merged words before the room cap.
+    pub leak_merged: u64,
+    /// Strings whose action was evaluated in the pass.
+    pub leak_strings: u64,
+    pub build_hits: u64,
+    pub build_misses: u64,
+    pub build_hit_us: u64,
+    pub build_miss_us: u64,
+    /// Microseconds of the basis-index build inside `mf_cache_local`.
+    pub build_index_us: u64,
+}
+
+/// Per-word census of the full action: `[h candidates, dissipator candidates,
+/// one-sided Kossakowski pairs, both-sided Kossakowski pairs, table entries
+/// visited, distinct output words]` — what `compute_action_terms` does for `p`.
+pub fn action_census(spec: &LindbladSpec, p: &Word) -> [u64; 6] {
+    let mut sup = Vec::new();
+    crate::word_support(p, &mut sup);
+    let mut cands = Vec::new();
+    crate::candidate_terms(&sup, &spec.h_support, &mut cands);
+    let h_cands = cands.len() as u64;
+    crate::candidate_terms(&sup, &spec.j_support, &mut cands);
+    let j_cands = cands.len() as u64;
+    let (mut one, mut both, mut entries) = (0u64, 0u64, 0u64);
+    for &k in &cands {
+        match &spec.j_kinds[k as usize] {
+            JumpKind::HermitianPauli { .. } => entries += 1,
+            JumpKind::General { terms, dagger_dagger, .. } => {
+                entries += (terms.len() * terms.len() + dagger_dagger.len()) as u64
+            }
+            JumpKind::KossakowskiPair { template, q_off, .. } => {
+                let t = &spec.k_templates[*template as usize];
+                let nl = t.n_local as usize;
+                let start = *q_off as usize;
+                let qs = &spec.k_pair_qubits[start..start + nl];
+                let mut p_loc = Word::new(nl);
+                for (li, &q) in qs.iter().enumerate() {
+                    let q = q as usize;
+                    let (ci, bi) = (q / CHUNK_BITS, q % CHUNK_BITS);
+                    let (lc, lb) = (li / CHUNK_BITS, li % CHUNK_BITS);
+                    p_loc.xbits.data[lc] |= ((p.xbits.data[ci] >> bi) & 1) << lb;
+                    p_loc.zbits.data[lc] |= ((p.zbits.data[ci] >> bi) & 1) << lb;
+                }
+                let hits = |mask: &[Chunk; W_CHUNKS]| {
+                    (0..W_CHUNKS).any(|i| mask[i] & (p_loc.xbits.data[i] | p_loc.zbits.data[i]) != 0)
+                };
+                if hits(&t.left_mask) && hits(&t.right_mask) {
+                    both += 1;
+                    entries += (t.sand.iter().map(|(_, r)| r.len()).sum::<usize>() + t.adag_b.len()) as u64;
+                } else {
+                    one += 1;
+                    entries += t.adag_b.len() as u64;
+                }
+            }
+        }
+    }
+    let mut s1 = Vec::new();
+    let mut s2 = Vec::new();
+    let mut lm = FxHashMap::default();
+    let outputs = spec.compute_action_terms(p, &mut s1, &mut s2, &mut lm).len() as u64;
+    [h_cands, j_cands, one, both, entries, outputs]
+}
 
 impl LindbladSpec {
     /// The transfer index, built on first use after a pair-set change.
@@ -611,24 +691,15 @@ impl LindbladSpec {
     /// Evaluate the full action of `words` once and cache their raw / diag
     /// (tests and callers that want the locality build to hit on every column).
     pub fn prime_locality_cache(&self, words: &[Word]) {
+        // the index is built outside the parallel region: its own rayon build inside a `OnceLock`
+        // initialisation entered from a worker thread would wait on the other workers (deadlock)
+        let _ = self.transfer_index();
         let items: Vec<(Word, (f64, f64))> = words
             .par_iter()
-            .map_init(
-                || {
-                    (
-                        Vec::<u32>::with_capacity(self.n_qubits),
-                        Vec::<u32>::with_capacity(128),
-                        FxHashMap::<Word, Complex<f64>>::with_capacity_and_hasher(
-                            128,
-                            FxBuildHasher::default(),
-                        ),
-                    )
-                },
-                |(s1, s2, lm), p| {
-                    let terms = self.compute_action_terms(p, s1, s2, lm);
-                    (*p, raw_diag(p, &terms))
-                },
-            )
+            .map_init(crate::support::ActScratch::default, |sc, p| {
+                let terms = self.action_terms_locality(p, sc);
+                (*p, raw_diag(p, &terms))
+            })
             .collect();
         self.cache_store(items);
     }
@@ -636,42 +707,53 @@ impl LindbladSpec {
     /// The generator cache of `basis` from the transfer index (columns of
     /// cached strings) and the full action (the others, which are then
     /// cached). Value-identical to `mf_expm::mf_cache_full`.
-    pub(crate) fn mf_cache_local(&self, basis: &[Word]) -> MfCache {
+    pub(crate) fn mf_cache_local(&self, basis: &[Word], mut prof: Option<&mut LocalityProfile>) -> MfCache {
+        let t0 = std::time::Instant::now();
         let idx = self.transfer_index();
         let index = build_basis_index(basis);
         let cached: Vec<Option<(f64, f64)>> = match self.rd_cache.lock() {
             Ok(c) => basis.iter().map(|w| c.get(w).copied()).collect(),
             Err(_) => vec![None; basis.len()],
         };
-        let results: Vec<(Vec<(u32, f64)>, (f64, f64))> = (0..basis.len())
-            .into_par_iter()
-            .map_init(
-                || {
-                    (
-                        Vec::<u32>::with_capacity(self.n_qubits),
-                        Vec::<u32>::with_capacity(128),
-                        FxHashMap::<Word, Complex<f64>>::with_capacity_and_hasher(
-                            128,
-                            FxBuildHasher::default(),
-                        ),
-                    )
-                },
-                |(s1, s2, lm), c| match cached[c] {
-                    Some((raw, diag)) => local_column(self, idx, basis, c, raw, diag),
-                    None => full_column(self, &basis[c], &index, s1, s2, lm),
-                },
-            )
-            .collect();
-        let misses: Vec<(Word, (f64, f64))> = results
-            .iter()
-            .enumerate()
-            .filter(|(c, _)| cached[*c].is_none())
-            .map(|(c, (_, rd))| (basis[c], *rd))
-            .collect();
-        if !misses.is_empty() {
-            self.cache_store(misses);
+        let (hit_idx, miss_idx): (Vec<usize>, Vec<usize>) = (0..basis.len()).partition(|&c| cached[c].is_some());
+        let mut results: Vec<Option<(Vec<(u32, f64)>, (f64, f64))>> = vec![None; basis.len()];
+        if let Some(p) = prof.as_deref_mut() {
+            p.build_index_us += t0.elapsed().as_micros() as u64;
         }
-        let (cols, per_col): (Vec<Vec<(u32, f64)>>, Vec<(f64, f64)>) = results.into_iter().unzip();
+        // cached strings: the transfer-index columns
+        let t0 = std::time::Instant::now();
+        let hits: Vec<(usize, (Vec<(u32, f64)>, (f64, f64)))> = hit_idx
+            .par_iter()
+            .map(|&c| {
+                let (raw, diag) = cached[c].unwrap();
+                (c, local_column(self, idx, basis, c, raw, diag))
+            })
+            .collect();
+        for (c, r) in hits {
+            results[c] = Some(r);
+        }
+        if let Some(p) = prof.as_deref_mut() {
+            p.build_hit_us += t0.elapsed().as_micros() as u64;
+            p.build_hits += hit_idx.len() as u64;
+        }
+        // the others: the full action, then cached
+        let t0 = std::time::Instant::now();
+        let miss: Vec<(usize, (Vec<(u32, f64)>, (f64, f64)))> = miss_idx
+            .par_iter()
+            .map_init(crate::support::ActScratch::default, |sc, &c| (c, full_column(self, &basis[c], &index, sc)))
+            .collect();
+        if !miss.is_empty() {
+            self.cache_store(miss.iter().map(|(c, (_, rd))| (basis[*c], *rd)));
+        }
+        for (c, r) in miss {
+            results[c] = Some(r);
+        }
+        if let Some(p) = prof.as_deref_mut() {
+            p.build_miss_us += t0.elapsed().as_micros() as u64;
+            p.build_misses += miss_idx.len() as u64;
+        }
+        let (cols, per_col): (Vec<Vec<(u32, f64)>>, Vec<(f64, f64)>) =
+            results.into_iter().map(|r| r.expect("every column built")).unzip();
         MfCache { cols, per_col }
     }
 
@@ -685,12 +767,30 @@ impl LindbladSpec {
         protected: &[Word],
         max_basis: usize,
         tau_add: f64,
+        mut prof: Option<&mut LocalityProfile>,
     ) -> Vec<(Word, f64)> {
         debug_assert_eq!(basis.len(), coeffs.len());
         let room = max_basis.saturating_sub(basis.len());
         if room == 0 || basis.is_empty() {
             return Vec::new();
         }
+        macro_rules! lap {
+            ($field:ident, $t0:expr) => {
+                if let Some(p) = prof.as_deref_mut() {
+                    p.$field += $t0.elapsed().as_micros() as u64;
+                }
+            };
+        }
+        macro_rules! count {
+            ($field:ident, $n:expr) => {
+                if let Some(p) = prof.as_deref_mut() {
+                    p.$field += $n;
+                }
+            };
+        }
+        let t0 = std::time::Instant::now();
+        let _ = self.transfer_index();
+        lap!(build_index_us, t0);
         let in_basis: FxHashMap<u64, ()> = basis.iter().map(|w| (word_hash(w), ())).collect();
         let protected_set: FxHashMap<u64, ()> =
             protected.iter().map(|w| (word_hash(w), ())).collect();
@@ -707,23 +807,13 @@ impl LindbladSpec {
         let mut merged: Vec<FxHashMap<Word, f64>> = (0..shards).map(|_| FxHashMap::default()).collect();
         for chunk_indices in order.chunks(CHUNK_SIZE) {
             // the action of every string of the chunk, its outputs bucketed by shard
+            let t0 = std::time::Instant::now();
             let local: Vec<(Vec<Vec<(Word, f64)>>, (f64, f64))> = chunk_indices
                 .par_iter()
-                .map_init(
-                    || {
-                        (
-                            Vec::<u32>::with_capacity(self.n_qubits),
-                            Vec::<u32>::with_capacity(128),
-                            FxHashMap::<Word, Complex<f64>>::with_capacity_and_hasher(
-                                128,
-                                FxBuildHasher::default(),
-                            ),
-                        )
-                    },
-                    |(s1, s2, lm), &i| {
+                .map_init(crate::support::ActScratch::default, |sc, &i| {
                         let p = &basis[i];
                         let c = coeffs[i];
-                        let terms = self.compute_action_terms(p, s1, s2, lm);
+                        let terms = self.action_terms_locality(p, sc);
                         let rd = raw_diag(p, &terms);
                         let mut buckets: Vec<Vec<(Word, f64)>> = (0..shards).map(|_| Vec::new()).collect();
                         for (w, v) in terms.iter() {
@@ -736,8 +826,14 @@ impl LindbladSpec {
                     },
                 )
                 .collect();
+            lap!(leak_action_us, t0);
+            count!(leak_strings, chunk_indices.len() as u64);
+            count!(leak_words, local.iter().map(|(b, _)| b.iter().map(|v| v.len() as u64).sum::<u64>()).sum::<u64>());
+            let t0 = std::time::Instant::now();
             self.cache_store(chunk_indices.iter().zip(local.iter()).map(|(&i, (_, rd))| (basis[i], *rd)));
+            lap!(leak_cache_us, t0);
             // per shard, merge in chunk (= descending |c|) order: the legacy accumulation order per word
+            let t0 = std::time::Instant::now();
             merged.par_iter_mut().enumerate().for_each(|(s, map)| {
                 let extra: usize = local.iter().map(|(b, _)| b[s].len()).sum();
                 map.reserve(extra);
@@ -747,8 +843,11 @@ impl LindbladSpec {
                     }
                 }
             });
+            lap!(leak_merge_us, t0);
             // room cap: the legacy `k`-th largest cutoff over the whole merged map
+            let t0 = std::time::Instant::now();
             let total: usize = merged.iter().map(|m| m.len()).sum();
+            count!(leak_merged, total as u64);
             if total > room {
                 let mut mags: Vec<f64> = Vec::with_capacity(total);
                 for m in &merged {
@@ -759,12 +858,15 @@ impl LindbladSpec {
                 let cutoff = mags[k];
                 merged.par_iter_mut().for_each(|m| m.retain(|_, &mut v| v.abs() >= cutoff));
             }
+            lap!(leak_cap_us, t0);
         }
+        let t0 = std::time::Instant::now();
         let mut out: Vec<(Word, f64)> = merged
             .into_iter()
             .flat_map(|m| m.into_iter().filter(|(_, c)| c.abs() > tau_add))
             .collect();
         out.sort_unstable_by(|a, b| (a.0.xbits.data, a.0.zbits.data).cmp(&(b.0.xbits.data, b.0.zbits.data)));
+        lap!(leak_sort_us, t0);
         out
     }
 }
@@ -868,6 +970,10 @@ mod tests {
         out
     }
 
+    fn ulps_apart(a: f64, b: f64) -> u64 {
+        (a.to_bits() as i64 - b.to_bits() as i64).unsigned_abs()
+    }
+
     fn sorted_col(col: &[(u32, f64)]) -> Vec<(u32, u64)> {
         let mut v: Vec<(u32, u64)> = col.iter().map(|(r, c)| (*r, c.to_bits())).collect();
         v.sort();
@@ -881,12 +987,15 @@ mod tests {
         let basis = random_basis(6, 70, &mut rng);
         spec.prime_locality_cache(&basis);
         let full = mf_cache_full(&spec, &basis);
-        let local = spec.mf_cache_local(&basis);
+        let local = spec.mf_cache_local(&basis, None);
         assert_eq!(full.cols.len(), local.cols.len());
         let mut nnz = 0;
         for c in 0..basis.len() {
             assert_eq!(sorted_col(&full.cols[c]), sorted_col(&local.cols[c]), "column {c}");
-            assert_eq!(full.per_col[c].0.to_bits(), local.per_col[c].0.to_bits(), "raw {c}");
+            // `raw` = Σ|c| over the action's output list: the grouped action lists the terms in another
+            // order than the legacy hash-map drain (which the legacy path does not control across runs
+            // either), so the bound agrees to round-off, not bitwise; it feeds the Taylor (m*, s) choice only
+            assert!(ulps_apart(full.per_col[c].0, local.per_col[c].0) <= 8, "raw {c}");
             assert_eq!(full.per_col[c].1.to_bits(), local.per_col[c].1.to_bits(), "diag {c}");
             nnz += full.cols[c].len();
         }
@@ -896,10 +1005,11 @@ mod tests {
         assert_eq!(cache_len, basis.len());
         // a cold cache (misses) gives the same bits through the full-action column
         spec.clear_locality_cache_for_test();
-        let cold = spec.mf_cache_local(&basis);
+        let cold = spec.mf_cache_local(&basis, None);
         for c in 0..basis.len() {
             assert_eq!(sorted_col(&full.cols[c]), sorted_col(&cold.cols[c]));
-            assert_eq!(full.per_col[c].0.to_bits(), cold.per_col[c].0.to_bits());
+            assert!(ulps_apart(full.per_col[c].0, cold.per_col[c].0) <= 8);
+            assert_eq!(full.per_col[c].1.to_bits(), cold.per_col[c].1.to_bits());
         }
         assert_eq!(spec.locality_stats().5, basis.len());
         // and the exponential from either cache is the same vector
@@ -933,17 +1043,17 @@ mod tests {
             let legacy = spec
                 .leakage_with_prune(&basis, &coeffs, &protected, max_basis, tau_add)
                 .unwrap();
-            let local = spec.leakage_locality(&basis, &coeffs, &protected, max_basis, tau_add);
+            let local = spec.leakage_locality(&basis, &coeffs, &protected, max_basis, tau_add, None);
             assert_eq!(sorted_leak(legacy), sorted_leak(local), "max_basis {max_basis} tau_add {tau_add}");
             // the locality result is sorted by word
-            let again = spec.leakage_locality(&basis, &coeffs, &protected, max_basis, tau_add);
+            let again = spec.leakage_locality(&basis, &coeffs, &protected, max_basis, tau_add, None);
             assert!(again.windows(2).all(|w| {
                 (w[0].0.xbits.data, w[0].0.zbits.data) < (w[1].0.xbits.data, w[1].0.zbits.data)
             }));
         }
         // room == 0: both empty, the locality one without evaluating anything
         assert!(spec.leakage_with_prune(&basis, &coeffs, &protected, basis.len(), 0.0).unwrap().is_empty());
-        assert!(spec.leakage_locality(&basis, &coeffs, &protected, basis.len(), 0.0).is_empty());
+        assert!(spec.leakage_locality(&basis, &coeffs, &protected, basis.len(), 0.0, None).is_empty());
         // the pass fills the raw / diag cache for every basis word
         assert_eq!(spec.locality_stats().5, basis.len());
     }
@@ -991,7 +1101,7 @@ mod tests {
     fn transfer_index_survives_rescale_and_resets_on_pattern_change() {
         let mut spec = fixture(4);
         let basis = random_basis(6, 20, &mut Rng(2));
-        let _ = spec.mf_cache_local(&basis);
+        let _ = spec.mf_cache_local(&basis, None);
         let (built, bytes, entries, ..) = spec.locality_stats();
         assert!(built);
         // a rescaled K: same pattern, the index stays, the cache is dropped
@@ -1014,7 +1124,7 @@ mod tests {
         spec.set_kossakowski(&k2).unwrap();
         assert!(!spec.locality_stats().0);
         let full = mf_cache_full(&spec, &basis);
-        let local = spec.mf_cache_local(&basis);
+        let local = spec.mf_cache_local(&basis, None);
         for c in 0..basis.len() {
             assert_eq!(sorted_col(&full.cols[c]), sorted_col(&local.cols[c]));
         }
@@ -1025,10 +1135,88 @@ mod tests {
         let s = spec.locality_stats();
         assert!(s.0 && s.5 == 0);
         let full = mf_cache_full(&spec, &basis);
-        let local = spec.mf_cache_local(&basis);
+        let local = spec.mf_cache_local(&basis, None);
         for c in 0..basis.len() {
             assert_eq!(sorted_col(&full.cols[c]), sorted_col(&local.cols[c]));
-            assert_eq!(full.per_col[c].0.to_bits(), local.per_col[c].0.to_bits());
+            assert!(ulps_apart(full.per_col[c].0, local.per_col[c].0) <= 8);
+        }
+    }
+    /// A dipolar-like dissipator: three two-qubit operators per spin pair over all pairs of `n` qubits,
+    /// a dense random PSD `K` (diagonal and folded off-diagonal pairs, 2- / 3- / 4-qubit templates).
+    fn dipolar_fixture(n: usize, seed: u64) -> LindbladSpec {
+        let mut rng = Rng(seed);
+        let mut h: Vec<(String, f64)> = Vec::new();
+        for j in 0..n {
+            h.push((word_str(n, &[(j, 'Z')]), 10.0 + 0.3 * j as f64));
+        }
+        h.push((word_str(n, &[(0, 'Z'), (1, 'Z')]), 0.2));
+        let spec0 = LindbladSpec::new(n, &h, &[]).unwrap();
+        let mut spec = spec0;
+        let mut ops = Vec::new();
+        for i in 0..n {
+            for j in i + 1..n {
+                ops.push(vec![(word_str(n, &[(i, 'Z'), (j, 'Z')]), Complex::new(0.5, 0.0))]);
+                ops.push(vec![
+                    (word_str(n, &[(i, 'X'), (j, 'X')]), Complex::new(0.25, 0.0)),
+                    (word_str(n, &[(i, 'Y'), (j, 'Y')]), Complex::new(0.25, 0.0)),
+                ]);
+                ops.push(vec![
+                    (word_str(n, &[(i, 'X'), (j, 'Z')]), Complex::new(0.25, 0.0)),
+                    (word_str(n, &[(i, 'Y'), (j, 'Z')]), Complex::new(0.0, 0.25)),
+                    (word_str(n, &[(i, 'Z'), (j, 'X')]), Complex::new(0.25, 0.0)),
+                ]);
+            }
+        }
+        let k = psd(ops.len(), &mut rng);
+        spec.add_kossakowski(&ops, &k).unwrap();
+        spec
+    }
+
+    fn sorted_terms(mut v: Vec<(Word, f64)>) -> Vec<([Chunk; W_CHUNKS], [Chunk; W_CHUNKS], u64)> {
+        v.sort_unstable_by(|a, b| (a.0.xbits.data, a.0.zbits.data).cmp(&(b.0.xbits.data, b.0.zbits.data)));
+        v.into_iter().map(|(w, c)| (w.xbits.data, w.zbits.data, c.to_bits())).collect()
+    }
+
+    #[test]
+    fn support_action_matches_legacy_bitwise() {
+        for (spec, n, seed) in [(fixture(7), 6usize, 11u64), (dipolar_fixture(8, 3), 8, 12), (dipolar_fixture(7, 5), 7, 13)] {
+            let mut rng = Rng(seed);
+            let words = random_basis(n, 160, &mut rng);
+            let mut sc = crate::support::ActScratch::default();
+            let (mut s1, mut s2, mut lm) = (Vec::new(), Vec::new(), FxHashMap::default());
+            let mut n_terms = 0;
+            for p in &words {
+                let legacy = sorted_terms(spec.compute_action_terms(p, &mut s1, &mut s2, &mut lm));
+                let grouped = sorted_terms(spec.action_terms_locality(p, &mut sc));
+                assert_eq!(legacy.len(), grouped.len(), "word count differs for {p:?}");
+                assert!(legacy == grouped, "action differs for {p:?}");
+                n_terms += legacy.len();
+            }
+            assert!(n_terms > 0);
+            let (tuples, sets, exclusive, bytes) = spec.support_stats();
+            assert!(tuples > 0 && sets > 0 && bytes > 0);
+            if n == 8 {
+                // the dipolar fixture exercises the dense path: every 3- and 4-qubit set is exclusive
+                assert!(exclusive > 0, "no exclusive set on the dipolar fixture");
+            }
+        }
+    }
+
+    #[test]
+    fn leakage_locality_multichunk_cap_matches_legacy() {
+        // more than one 4096-string chunk: the per-chunk room cap of both paths, values bit-identical
+        let n = 8;
+        let spec = dipolar_fixture(n, 21);
+        let mut rng = Rng(22);
+        let basis = random_basis(n, 5000, &mut rng);
+        let coeffs: Vec<f64> = (0..basis.len()).map(|_| rng.next() - 0.5).collect();
+        let protected = vec![basis[0]];
+        for room in [37usize, 400, 6000] {
+            let max_basis = basis.len() + room;
+            let legacy = spec.leakage_with_prune(&basis, &coeffs, &protected, max_basis, 0.0).unwrap();
+            let local = spec.leakage_locality(&basis, &coeffs, &protected, max_basis, 0.0, None);
+            assert_eq!(legacy.len(), local.len(), "room {room}: count differs");
+            assert!(sorted_leak(legacy) == sorted_leak(local), "room {room}: values differ");
         }
     }
 }

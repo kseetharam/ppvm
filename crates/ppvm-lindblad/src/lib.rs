@@ -56,6 +56,7 @@ pub mod orbit_rep;
 /// transfer index of the compiled dissipator, the basis-local generator
 /// build, the raw / diag cache and the sharded leakage merge. See module docs.
 pub mod locality;
+pub mod support;
 
 /// Pauli-word storage chunk: `u64` on 64-bit targets, `u32` elsewhere
 /// (`bitvec` implements `BitStore` for `u64` only on 64-bit targets, so
@@ -99,6 +100,10 @@ pub struct PcStepTimings {
     /// or the locality build; the remainder is the Taylor matvecs).
     pub build1_us: u64,
     pub build2_us: u64,
+    /// `prune_basis` + `cap_basis` at the end of the step.
+    pub prune_cap_us: u64,
+    /// The locality step's inner phases (zero on the legacy path).
+    pub locality: locality::LocalityProfile,
 }
 
 impl PcStepTimings {
@@ -186,7 +191,7 @@ pub fn parse_pauli_string(s: &str, n_qubits: usize) -> Result<(Word, Vec<u32>), 
 }
 
 /// Compute the support (non-identity qubits) of `w`.
-fn word_support(w: &Word, out: &mut Vec<u32>) {
+pub(crate) fn word_support(w: &Word, out: &mut Vec<u32>) {
     out.clear();
     for q in 0..w.n_qubits() {
         if w.xbits[q] || w.zbits[q] {
@@ -203,7 +208,7 @@ fn word_support(w: &Word, out: &mut Vec<u32>) {
 // `ppvm-runtime`.
 
 #[inline(always)]
-fn phase_factor(phase: u8) -> Complex<f64> {
+pub(crate) fn phase_factor(phase: u8) -> Complex<f64> {
     match phase & 3 {
         0 => Complex::new(1.0, 0.0),
         1 => Complex::new(0.0, 1.0),
@@ -217,7 +222,7 @@ fn phase_factor(phase: u8) -> Complex<f64> {
 /// Two Pauli strings anti-commute iff
 /// `popcount(a.x & b.z) + popcount(a.z & b.x)` is odd.
 #[inline(always)]
-fn anti_commutes(a: &Word, b: &Word) -> bool {
+pub(crate) fn anti_commutes(a: &Word, b: &Word) -> bool {
     let mut bits: u32 = 0;
     for i in 0..W_CHUNKS {
         bits += (a.xbits.data[i] & b.zbits.data[i]).count_ones();
@@ -232,7 +237,7 @@ fn anti_commutes(a: &Word, b: &Word) -> bool {
 /// - `eps = -2.0` if `h·p` has phase `+i` (so `i·[h,p] = -2·out`),
 /// - `eps = +2.0` if `h·p` has phase `-i` (so `i·[h,p] = +2·out`).
 #[inline(always)]
-fn comm_product(h: &Word, p: &Word) -> (Word, f64) {
+pub(crate) fn comm_product(h: &Word, p: &Word) -> (Word, f64) {
     let (out, phase) = pauli_mul(h, p);
     let eps = match phase {
         1 => -2.0,
@@ -245,7 +250,7 @@ fn comm_product(h: &Word, p: &Word) -> (Word, f64) {
 /// Full Pauli product `p · q`: returns `(out, phase)` where the product
 /// is `ω · out` with `ω = i^phase`.
 #[inline(always)]
-fn pauli_mul(p: &Word, q: &Word) -> (Word, u8) {
+pub(crate) fn pauli_mul(p: &Word, q: &Word) -> (Word, u8) {
     let mut out = Word::new(p.n_qubits());
     let mut sign_count: u32 = 0;
     let mut imag_count: u32 = 0;
@@ -274,7 +279,7 @@ const CHUNK_BITS: usize = 8 * std::mem::size_of::<Chunk>();
 /// bits and phase, without the hash (the result is embedded into the
 /// register and hashed there).
 #[inline(always)]
-fn pauli_mul_local(p: &Word, q: &Word) -> (Word, u8) {
+pub(crate) fn pauli_mul_local(p: &Word, q: &Word) -> (Word, u8) {
     let mut out = Word::new(p.n_qubits());
     let mut sign_count: u32 = 0;
     let mut imag_count: u32 = 0;
@@ -295,7 +300,7 @@ fn pauli_mul_local(p: &Word, q: &Word) -> (Word, u8) {
 
 /// [`comm_product`] on local-frame words ([`pauli_mul_local`]).
 #[inline(always)]
-fn comm_product_local(h: &Word, p: &Word) -> (Word, f64) {
+pub(crate) fn comm_product_local(h: &Word, p: &Word) -> (Word, f64) {
     let (out, phase) = pauli_mul_local(h, p);
     let eps = match phase {
         1 => -2.0,
@@ -1739,8 +1744,10 @@ impl LindbladSpec {
         drop(cache);
         t.expm2_us = t0.elapsed().as_micros() as u64;
 
+        let t0 = Instant::now();
         prune_basis(basis, coeffs, drop_tol, protected);
         cap_basis(basis, coeffs, max_basis, protected);
+        t.prune_cap_us = t0.elapsed().as_micros() as u64;
 
         Ok(t)
     }
@@ -1814,37 +1821,44 @@ impl LindbladSpec {
         drop_tol: f64,
         mut timings: Option<&mut PcStepTimings>,
     ) {
+        let mut prof = locality::LocalityProfile::default();
+        let want = timings.is_some();
         let mut lap = |slot: fn(&mut PcStepTimings) -> &mut u64, t0: Instant| {
             if let Some(t) = timings.as_deref_mut() {
                 *slot(t) = t0.elapsed().as_micros() as u64;
             }
         };
         let t0 = Instant::now();
-        let leak = self.leakage_locality(basis, coeffs, protected, admit, tau_add);
+        let leak = self.leakage_locality(basis, coeffs, protected, admit, tau_add, if want { Some(&mut prof) } else { None });
         lap(|t| &mut t.leakage1_us, t0);
         let t0 = Instant::now();
         add_leakage_capped(basis, coeffs, leak, admit);
         lap(|t| &mut t.expand1_us, t0);
         let t0 = Instant::now();
-        let cache = self.mf_cache_local(basis);
+        let cache = self.mf_cache_local(basis, if want { Some(&mut prof) } else { None });
         lap(|t| &mut t.build1_us, t0);
         let coeffs_predict = mf_expm::apply_cache(&cache, dt, coeffs, drop_tol);
         lap(|t| &mut t.expm1_us, t0);
         let t0 = Instant::now();
         let n1 = basis.len();
-        let leak2 = self.leakage_locality(basis, &coeffs_predict, protected, admit, tau_add);
+        let leak2 = self.leakage_locality(basis, &coeffs_predict, protected, admit, tau_add, None);
         drop(coeffs_predict);
         lap(|t| &mut t.leakage2_us, t0);
         let t0 = Instant::now();
         add_leakage_capped(basis, coeffs, leak2, admit);
         lap(|t| &mut t.expand2_us, t0);
         let t0 = Instant::now();
-        let cache = if basis.len() == n1 { cache } else { self.mf_cache_local(basis) };
+        let cache = if basis.len() == n1 { cache } else { self.mf_cache_local(basis, None) };
         lap(|t| &mut t.build2_us, t0);
         *coeffs = mf_expm::apply_cache(&cache, dt, coeffs, drop_tol);
         lap(|t| &mut t.expm2_us, t0);
+        let t0 = Instant::now();
         prune_basis(basis, coeffs, drop_tol, protected);
         cap_basis(basis, coeffs, max_basis, protected);
+        lap(|t| &mut t.prune_cap_us, t0);
+        if let Some(t) = timings.as_deref_mut() {
+            t.locality = prof;
+        }
     }
 
     /// Compute `exp(dt · M) · b` for the in-basis-restricted generator
@@ -2217,7 +2231,7 @@ pub fn build_basis_index(basis: &[Word]) -> FxHashMap<Word, u32> {
 
 /// Union of `index[q]` for each `q ∈ p_support`, deduped.
 #[inline]
-fn candidate_terms(p_support: &[u32], index: &[Vec<u32>], scratch: &mut Vec<u32>) {
+pub(crate) fn candidate_terms(p_support: &[u32], index: &[Vec<u32>], scratch: &mut Vec<u32>) {
     scratch.clear();
     for &q in p_support {
         scratch.extend_from_slice(&index[q as usize]);

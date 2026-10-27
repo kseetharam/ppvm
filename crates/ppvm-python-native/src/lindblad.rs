@@ -502,6 +502,63 @@ impl LindbladSpec {
         self.inner.transfer_index().bytes
     }
 
+    /// Per-word census of the full action over the rows of `basis`:
+    /// `(h candidates, dissipator candidates, one-sided pairs, both-sided
+    /// pairs, table entries visited, distinct output words)`.
+    fn action_census<'py>(
+        &self,
+        basis: PyReadonlyArray2<'py, u8>,
+    ) -> PyResult<Vec<(u64, u64, u64, u64, u64, u64)>> {
+        let n_q = self.inner.n_qubits();
+        let words = decode_basis(&basis.as_array(), n_q)?;
+        use rayon::prelude::*;
+        Ok(words
+            .par_iter()
+            .map(|w| {
+                let c = ppvm_lindblad::locality::action_census(&self.inner, w);
+                (c[0], c[1], c[2], c[3], c[4], c[5])
+            })
+            .collect())
+    }
+
+    /// Apply `L*` to a single Pauli string `p` through the support-grouped
+    /// action of the locality step (value-identical to `action`).
+    fn action_locality<'py>(
+        &self,
+        py: Python<'py>,
+        p: PyReadonlyArray1<'py, u8>,
+    ) -> PyResult<PyPauliMap<'py>> {
+        let p_slice = p.as_slice()?;
+        let p_word = word_from_codes(p_slice).map_err(map_err)?;
+        let mut sc = ppvm_lindblad::support::ActScratch::default();
+        let pairs = self.inner.action_terms_locality_pub(&p_word, &mut sc);
+        pack_pauli_map(py, pairs, self.inner.n_qubits())
+    }
+
+    /// Per-row counters of the grouped action (`ActScratch::stats`): dense groups, pairs in groups, dense
+    /// emissions, deferred emissions from groups, generic candidates, generic emissions, Hamiltonian emissions,
+    /// distinct deferred words.
+    fn action_locality_stats<'py>(
+        &self,
+        basis: PyReadonlyArray2<'py, u8>,
+    ) -> PyResult<Vec<Vec<u64>>> {
+        let n_q = self.inner.n_qubits();
+        let words = decode_basis(&basis.as_array(), n_q)?;
+        let mut sc = ppvm_lindblad::support::ActScratch::default();
+        Ok(words
+            .iter()
+            .map(|w| {
+                let _ = self.inner.action_terms_locality_pub(w, &mut sc);
+                sc.stats.to_vec()
+            })
+            .collect())
+    }
+
+    /// `(tuples, sets, exclusive sets, bytes)` of the support tables (builds the index).
+    fn support_stats(&self) -> (usize, usize, usize, usize) {
+        self.inner.support_stats()
+    }
+
     /// Apply `L*` to a single Pauli string `p`.
     fn action<'py>(
         &self,
@@ -698,6 +755,21 @@ impl LindbladSpec {
         d.set_item("expm2_us", timings.expm2_us)?;
         d.set_item("build1_us", timings.build1_us)?;
         d.set_item("build2_us", timings.build2_us)?;
+        d.set_item("prune_cap_us", timings.prune_cap_us)?;
+        let l = &timings.locality;
+        d.set_item("leak_action_us", l.leak_action_us)?;
+        d.set_item("leak_cache_us", l.leak_cache_us)?;
+        d.set_item("leak_merge_us", l.leak_merge_us)?;
+        d.set_item("leak_cap_us", l.leak_cap_us)?;
+        d.set_item("leak_sort_us", l.leak_sort_us)?;
+        d.set_item("build_index_us", l.build_index_us)?;
+        d.set_item("build_hit_us", l.build_hit_us)?;
+        d.set_item("build_miss_us", l.build_miss_us)?;
+        d.set_item("leak_words_n", l.leak_words)?;
+        d.set_item("leak_merged_n", l.leak_merged)?;
+        d.set_item("leak_strings_n", l.leak_strings)?;
+        d.set_item("build_hits_n", l.build_hits)?;
+        d.set_item("build_misses_n", l.build_misses)?;
         Ok((map, d))
     }
 
