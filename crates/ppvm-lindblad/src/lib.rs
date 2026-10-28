@@ -43,6 +43,7 @@ use std::time::Instant;
 pub mod block;
 pub mod config;
 pub mod error;
+pub mod factor;
 pub(crate) mod expm;
 
 /// Matrix-free / quspin-expm-backed `exp(dt·L*)·b` engine. See module docs.
@@ -79,6 +80,7 @@ pub type Word = PauliWord<[Chunk; W_CHUNKS], FxBuildHasher, true>;
 pub use block::BlockLindbladSpec;
 pub use config::PcStepConfig;
 pub use error::Error;
+pub use factor::{Csr, CsrC, FactorBlockInput};
 
 /// Per-phase timing breakdown (microseconds) returned by
 /// [`LindbladSpec::pc_step_timed`].
@@ -442,6 +444,14 @@ pub struct LindbladSpec {
     /// [`Self::new`], in construction order. `j_kinds[..j_rates.len()]`
     /// are those jumps; every later entry is a `KossakowskiPair`.
     j_rates: Vec<f64>,
+    /// Factor-form Kossakowski dissipator (`factor.rs`): its own operator
+    /// table, per-qubit support index, operator -> block map, the compiled
+    /// blocks and the absolute compile floor. All empty / 0 without one.
+    kf_ops: Vec<Vec<PauliTerm>>,
+    kf_support: Vec<Vec<u32>>,
+    kf_block_of: Vec<u32>,
+    kf_blocks: Vec<factor::FactorBlock>,
+    kf_floor: f64,
 }
 
 /// User-facing description of one jump operator: a complex Pauli linear
@@ -543,6 +553,11 @@ impl LindbladSpec {
             k_pairs: Vec::new(),
             k_mat: Vec::new(),
             j_rates,
+            kf_ops: Vec::new(),
+            kf_support: Vec::new(),
+            kf_block_of: Vec::new(),
+            kf_blocks: Vec::new(),
+            kf_floor: 0.0,
         })
     }
 
@@ -1408,6 +1423,11 @@ impl LindbladSpec {
                     }
                 }
             }
+        }
+
+        // ── factor-form dissipator (factor.rs; no-op without one) ─────
+        if !self.kf_blocks.is_empty() {
+            self.factor_action(p, scratch_support, scratch_cands, local);
         }
 
         // L* preserves Hermiticity; imaginary parts must cancel to FP noise.
