@@ -32,32 +32,32 @@ use rayon::prelude::*;
 /// [`LindbladSpec`] itself and the block (chemical-exchange) spec of
 /// [`crate::block`]. The expm engine below is generic over it; everything it
 /// needs is the per-word `(output, coefficient)` list.
-pub(crate) trait ActionTerms: Sync {
+pub(crate) trait ActionTerms<const W: usize>: Sync {
     /// Capacity hint for the support scratch vector (the physical qubit count).
     fn scratch_qubits(&self) -> usize;
     /// `L*(p)` as deduplicated `(word, coefficient)` pairs, without the input
     /// coefficient; the scratch buffers are reused across calls on a thread.
     fn action_terms(
         &self,
-        p: &Word,
+        p: &Word<W>,
         s1: &mut Vec<u32>,
         s2: &mut Vec<u32>,
-        lm: &mut FxHashMap<Word, Complex<f64>>,
-    ) -> Vec<(Word, f64)>;
+        lm: &mut FxHashMap<Word<W>, Complex<f64>>,
+    ) -> Vec<(Word<W>, f64)>;
 }
 
-impl ActionTerms for LindbladSpec {
+impl<const W: usize> ActionTerms<W> for LindbladSpec<W> {
     fn scratch_qubits(&self) -> usize {
         self.n_qubits()
     }
 
     fn action_terms(
         &self,
-        p: &Word,
+        p: &Word<W>,
         s1: &mut Vec<u32>,
         s2: &mut Vec<u32>,
-        lm: &mut FxHashMap<Word, Complex<f64>>,
-    ) -> Vec<(Word, f64)> {
+        lm: &mut FxHashMap<Word<W>, Complex<f64>>,
+    ) -> Vec<(Word<W>, f64)> {
         self.compute_action_terms(p, s1, s2, lm)
     }
 }
@@ -77,10 +77,10 @@ type MfCols = Vec<Vec<(u32, f64)>>;
 /// Per-column `(raw, diag)` for the `μ`/1-norm selection.
 type MfPerCol = Vec<(f64, f64)>;
 
-fn build_mf_cols<S: ActionTerms + ?Sized>(
+fn build_mf_cols<const W: usize, S: ActionTerms<W> + ?Sized>(
     spec: &S,
-    basis: &[Word],
-    index: &FxHashMap<Word, u32>,
+    basis: &[Word<W>],
+    index: &FxHashMap<Word<W>, u32>,
 ) -> (MfCols, MfPerCol) {
     basis
         .par_iter()
@@ -89,7 +89,7 @@ fn build_mf_cols<S: ActionTerms + ?Sized>(
                 (
                     Vec::<u32>::with_capacity(spec.scratch_qubits()),
                     Vec::<u32>::with_capacity(128),
-                    FxHashMap::<Word, Complex<f64>>::with_capacity_and_hasher(
+                    FxHashMap::<Word<W>, Complex<f64>>::with_capacity_and_hasher(
                         128,
                         FxBuildHasher::default(),
                     ),
@@ -259,9 +259,9 @@ where
 /// exact column 1-norm of `M − μ·I`; from `‖dt·(M−μI)‖₁` we pick the Taylor
 /// partition `(m*, s)` and hand everything to
 /// [`quspin_expm::ExpmOp::from_parts`].
-pub(crate) fn expm_apply_mf<S: ActionTerms + ?Sized>(
+pub(crate) fn expm_apply_mf<const W: usize, S: ActionTerms<W> + ?Sized>(
     spec: &S,
-    basis: &[Word],
+    basis: &[Word<W>],
     dt: f64,
     coeffs: &[f64],
     drop_tol: f64,
@@ -320,9 +320,9 @@ pub(crate) fn expm_apply_mf<S: ActionTerms + ?Sized>(
 /// matrix-free applies, and recombine. Used by the test-only full-space
 /// complex reference step.
 #[cfg(test)]
-pub(crate) fn expm_apply_mf_cxvec(
-    spec: &LindbladSpec,
-    basis: &[Word],
+pub(crate) fn expm_apply_mf_cxvec<const W: usize>(
+    spec: &LindbladSpec<W>,
+    basis: &[Word<W>],
     dt: f64,
     b: &[Complex<f64>],
     drop_tol: f64,

@@ -54,27 +54,43 @@ pub mod orbit_rep;
 
 /// Pauli-word storage chunk: `u64` on 64-bit targets, `u32` elsewhere
 /// (`bitvec` implements `BitStore` for `u64` only on 64-bit targets, so
-/// e.g. wasm32 builds use four 32-bit chunks instead of two 64-bit ones).
+/// e.g. wasm32 builds use 32-bit chunks).
 #[cfg(target_pointer_width = "64")]
-type Chunk = u64;
+pub type Chunk = u64;
 #[cfg(not(target_pointer_width = "64"))]
-type Chunk = u32;
+pub type Chunk = u32;
 
-/// Chunks per word; words pack up to 128 qubits on every target.
+/// Bits (= qubits) per storage chunk: 64 on 64-bit targets, 32 elsewhere.
+pub const CHUNK_BITS: usize = 8 * std::mem::size_of::<Chunk>();
+
+/// Chunks per word of the DEFAULT width (`W = W_CHUNKS`): 128 qubits on
+/// every target. Every type of this crate is generic over the chunk count
+/// `W`; `W_CHUNKS` is the default that keeps the historical 128-qubit word
+/// (and its code path, bit for bit).
 #[cfg(target_pointer_width = "64")]
-const W_CHUNKS: usize = 2;
+pub const W_CHUNKS: usize = 2;
 #[cfg(not(target_pointer_width = "64"))]
-const W_CHUNKS: usize = 4;
+pub const W_CHUNKS: usize = 4;
 
-/// Maximum number of qubits supported by [`Word`].
-pub const MAX_QUBITS: usize = 128;
+/// Maximum number of qubits of the default-width [`Word`] (128).
+pub const MAX_QUBITS: usize = W_CHUNKS * CHUNK_BITS;
 
-/// The Pauli-word storage type used throughout this crate.
-///
-/// `[Chunk; W_CHUNKS]` covers up to 128 qubits; the `FxBuildHasher`
-/// matches the hash used by the `FxHashMap` keys we wrap with;
-/// `REHASH=true` means `set()` keeps the cached hash in sync.
-pub type Word = PauliWord<[Chunk; W_CHUNKS], FxBuildHasher, true>;
+/// Maximum number of qubits a word of `w_chunks` chunks holds
+/// (`w_chunks · CHUNK_BITS`): 128 / 256 / 512 / 1024 / 1088 for
+/// `W = 2 / 4 / 8 / 16 / 17` on a 64-bit target.
+pub const fn max_qubits_for(w_chunks: usize) -> usize {
+    w_chunks * CHUNK_BITS
+}
+
+/// The Pauli-word storage type used throughout this crate, generic over the
+/// chunk count `W` (the "word width"): `[Chunk; W]` covers up to
+/// `W · CHUNK_BITS` qubits; the `FxBuildHasher` matches the hash used by the
+/// `FxHashMap` keys we wrap with; `REHASH=true` means `set()` keeps the
+/// cached hash in sync. `Word` without a parameter is the default width
+/// `W_CHUNKS` (128 qubits). A word costs `16·W + 16` bytes (x bits, z bits,
+/// the qubit count and the cached hash); the bit-ops of the action loop over
+/// the `W` chunks, so their cost is linear in `W`.
+pub type Word<const W: usize = W_CHUNKS> = PauliWord<[Chunk; W], FxBuildHasher, true>;
 
 pub use block::BlockLindbladSpec;
 pub use config::PcStepConfig;
@@ -107,12 +123,12 @@ impl PcStepTimings {
 
 /// Build a [`Word`] from a length-`n_qubits` slice of Pauli codes
 /// (`0=I, 1=X, 2=Z, 3=Y`). Sets all bits and rehashes once.
-pub fn word_from_codes(codes: &[u8]) -> Result<Word, Error> {
+pub fn word_from_codes<const W: usize>(codes: &[u8]) -> Result<Word<W>, Error> {
     let n_qubits = codes.len();
-    if n_qubits > MAX_QUBITS {
-        return Err(Error::TooManyQubits { got: n_qubits });
+    if n_qubits > max_qubits_for(W) {
+        return Err(Error::TooManyQubits { got: n_qubits, max: max_qubits_for(W) });
     }
-    let mut w = Word::new(n_qubits);
+    let mut w = Word::<W>::new(n_qubits);
     for (q, &b) in codes.iter().enumerate() {
         if b > 3 {
             return Err(Error::InvalidPauliCode { code: b });
@@ -129,7 +145,7 @@ pub fn word_from_codes(codes: &[u8]) -> Result<Word, Error> {
 }
 
 /// Inverse of [`word_from_codes`]: write `n_qubits` Pauli codes into `out`.
-pub fn codes_from_word(w: &Word, out: &mut [u8]) {
+pub fn codes_from_word<const W: usize>(w: &Word<W>, out: &mut [u8]) {
     debug_assert_eq!(out.len(), w.n_qubits());
     for (q, slot) in out.iter_mut().enumerate() {
         let xb = w.xbits[q] as u8;
@@ -140,9 +156,12 @@ pub fn codes_from_word(w: &Word, out: &mut [u8]) {
 
 /// Parse a `"IXYZ..."` string into a [`Word`] together with the list of
 /// qubits where the Pauli is non-identity (the term's support).
-pub fn parse_pauli_string(s: &str, n_qubits: usize) -> Result<(Word, Vec<u32>), Error> {
-    if n_qubits > MAX_QUBITS {
-        return Err(Error::TooManyQubits { got: n_qubits });
+pub fn parse_pauli_string<const W: usize>(
+    s: &str,
+    n_qubits: usize,
+) -> Result<(Word<W>, Vec<u32>), Error> {
+    if n_qubits > max_qubits_for(W) {
+        return Err(Error::TooManyQubits { got: n_qubits, max: max_qubits_for(W) });
     }
     let chars: Vec<char> = s.chars().filter(|c| *c != '_').collect();
     if chars.len() != n_qubits {
@@ -151,7 +170,7 @@ pub fn parse_pauli_string(s: &str, n_qubits: usize) -> Result<(Word, Vec<u32>), 
             got: chars.len(),
         });
     }
-    let mut w = Word::new(n_qubits);
+    let mut w = Word::<W>::new(n_qubits);
     let mut support = Vec::new();
     for (q, c) in chars.into_iter().enumerate() {
         match c {
@@ -177,7 +196,7 @@ pub fn parse_pauli_string(s: &str, n_qubits: usize) -> Result<(Word, Vec<u32>), 
 }
 
 /// Compute the support (non-identity qubits) of `w`.
-fn word_support(w: &Word, out: &mut Vec<u32>) {
+fn word_support<const W: usize>(w: &Word<W>, out: &mut Vec<u32>) {
     out.clear();
     for q in 0..w.n_qubits() {
         if w.xbits[q] || w.zbits[q] {
@@ -208,9 +227,9 @@ fn phase_factor(phase: u8) -> Complex<f64> {
 /// Two Pauli strings anti-commute iff
 /// `popcount(a.x & b.z) + popcount(a.z & b.x)` is odd.
 #[inline(always)]
-fn anti_commutes(a: &Word, b: &Word) -> bool {
+fn anti_commutes<const W: usize>(a: &Word<W>, b: &Word<W>) -> bool {
     let mut bits: u32 = 0;
-    for i in 0..W_CHUNKS {
+    for i in 0..W {
         bits += (a.xbits.data[i] & b.zbits.data[i]).count_ones();
         bits += (a.zbits.data[i] & b.xbits.data[i]).count_ones();
     }
@@ -223,7 +242,7 @@ fn anti_commutes(a: &Word, b: &Word) -> bool {
 /// - `eps = -2.0` if `h·p` has phase `+i` (so `i·[h,p] = -2·out`),
 /// - `eps = +2.0` if `h·p` has phase `-i` (so `i·[h,p] = +2·out`).
 #[inline(always)]
-fn comm_product(h: &Word, p: &Word) -> (Word, f64) {
+fn comm_product<const W: usize>(h: &Word<W>, p: &Word<W>) -> (Word<W>, f64) {
     let (out, phase) = pauli_mul(h, p);
     let eps = match phase {
         1 => -2.0,
@@ -236,11 +255,11 @@ fn comm_product(h: &Word, p: &Word) -> (Word, f64) {
 /// Full Pauli product `p · q`: returns `(out, phase)` where the product
 /// is `ω · out` with `ω = i^phase`.
 #[inline(always)]
-fn pauli_mul(p: &Word, q: &Word) -> (Word, u8) {
-    let mut out = Word::new(p.n_qubits());
+fn pauli_mul<const W: usize>(p: &Word<W>, q: &Word<W>) -> (Word<W>, u8) {
+    let mut out = Word::<W>::new(p.n_qubits());
     let mut sign_count: u32 = 0;
     let mut imag_count: u32 = 0;
-    for i in 0..W_CHUNKS {
+    for i in 0..W {
         let a = p.xbits.data[i];
         let b = p.zbits.data[i];
         let c = q.xbits.data[i];
@@ -260,23 +279,23 @@ fn pauli_mul(p: &Word, q: &Word) -> (Word, u8) {
 
 /// Parsed Hamiltonian term.
 #[derive(Clone)]
-struct HTerm {
-    word: Word,
+struct HTerm<const W: usize> {
+    word: Word<W>,
     coeff: f64,
 }
 
 /// One Pauli term in a complex linear combination (a single summand of
 /// `L = Σ_a λ_a P_a` or of the precomputed `L†L`).
 #[derive(Clone)]
-struct PauliTerm {
-    word: Word,
+struct PauliTerm<const W: usize> {
+    word: Word<W>,
     coeff: Complex<f64>,
 }
 
 /// Sandwich table of a Kossakowski pair, grouped by the left word: one
 /// `(P_a, [(P_b, coeff), …])` group per distinct `P_a`, so `P_a · p` is
 /// computed once per group and reused across its `P_b` partners.
-type SandwichGroups = Vec<(Word, Vec<(Word, Complex<f64>)>)>;
+type SandwichGroups<const W: usize> = Vec<(Word<W>, Vec<(Word<W>, Complex<f64>)>)>;
 
 /// The `K`-independent part of one Kossakowski pair `(n ≤ m)`, computed
 /// once per operator pair by [`LindbladSpec::add_kossakowski`] and reused
@@ -286,15 +305,15 @@ type SandwichGroups = Vec<(Word, Vec<(Word, Complex<f64>)>)>;
 /// it into a `JumpKind::KossakowskiPair` is one complex multiply per
 /// stored coefficient.
 #[derive(Clone)]
-struct PairTemplate {
+struct PairTemplate<const W: usize> {
     n: usize,
     m: usize,
     /// `A_n†A_m = Σ_w γ_w W` (FP-noise zeros dropped).
-    adag_b: Vec<PauliTerm>,
+    adag_b: Vec<PauliTerm<W>>,
     /// `(P_a, [(P_b, λ_a*·μ_b), …])` grouped by the left word.
-    sand: SandwichGroups,
-    left_mask: [Chunk; W_CHUNKS],
-    right_mask: [Chunk; W_CHUNKS],
+    sand: SandwichGroups<W>,
+    left_mask: [Chunk; W],
+    right_mask: [Chunk; W],
     /// Sorted union of the supports of `A_n` and `A_m`.
     support: Vec<u32>,
 }
@@ -302,9 +321,9 @@ struct PairTemplate {
 /// One jump operator `L_k` with rate `γ_k`. The `HermitianPauli` variant
 /// is a fast path; `General` handles arbitrary complex Pauli sums.
 #[derive(Clone)]
-enum JumpKind {
+enum JumpKind<const W: usize> {
     HermitianPauli {
-        word: Word,
+        word: Word<W>,
         /// Effective rate `γ_k · c²` for `L_k = c · P` (what the action reads).
         rate: f64,
         /// The real coefficient `c`, kept so [`LindbladSpec::set_jump_rates`]
@@ -312,8 +331,8 @@ enum JumpKind {
         coeff_re: f64,
     },
     General {
-        terms: Vec<PauliTerm>,         // L = Σ_a λ_a P_a
-        dagger_dagger: Vec<PauliTerm>, // L†L = Σ_c μ_c P_c  (μ_c ∈ ℝ)
+        terms: Vec<PauliTerm<W>>,         // L = Σ_a λ_a P_a
+        dagger_dagger: Vec<PauliTerm<W>>, // L†L = Σ_c μ_c P_c  (μ_c ∈ ℝ)
         rate: f64,
     },
     /// One `(n, m)` pair of a Kossakowski-form dissipator
@@ -327,17 +346,17 @@ enum JumpKind {
     /// are complex — not Hermitian per pair; Hermiticity of the total action
     /// is restored by the conjugate `(m, n)` pair.
     KossakowskiPair {
-        sand: SandwichGroups,
+        sand: SandwichGroups<W>,
         /// Diagonal pair (`n == m`): `K_nn · A_n†A_n`.
         /// Off-diagonal pair (`n < m`, folds in the conjugate `(m,n)`):
         /// the Hermitian sum `2·Re(K_nm·A_n†A_m)` (real coefficients), for
         /// the both-sided anticommutator.
-        dd: Vec<PauliTerm>,
+        dd: Vec<PauliTerm<W>>,
         /// Off-diagonal only: the anti-Hermitian difference
         /// `−2i·Im(K_nm·A_n†A_m)` (pure-imaginary coefficients), for the
         /// one-sided commutator of the folded conjugate pair. Empty on the
         /// diagonal.
-        dd_anti: Vec<PauliTerm>,
+        dd_anti: Vec<PauliTerm<W>>,
         /// `true` for a folded off-diagonal pair (`n < m`): the both-sided
         /// sandwich doubles and takes the real part, and the one-sided path
         /// uses `dd_anti`. `false` on the diagonal (original single-pair
@@ -345,8 +364,8 @@ enum JumpKind {
         off_diag: bool,
         /// Support bit masks (`xbits | zbits` union) of `A_n` and `A_m`,
         /// for the one-sided fast path in the action.
-        left_mask: [Chunk; W_CHUNKS],
-        right_mask: [Chunk; W_CHUNKS],
+        left_mask: [Chunk; W],
+        right_mask: [Chunk; W],
     },
 }
 
@@ -354,9 +373,12 @@ enum JumpKind {
 /// as a Pauli linear combination, dropping FP-noise zeros. For `A = B`
 /// (the jump-operator `L†L`) the coefficients are real; in general they
 /// are complex.
-fn precompute_adag_b(a_terms: &[PauliTerm], b_terms: &[PauliTerm]) -> Vec<PauliTerm> {
+fn precompute_adag_b<const W: usize>(
+    a_terms: &[PauliTerm<W>],
+    b_terms: &[PauliTerm<W>],
+) -> Vec<PauliTerm<W>> {
     let zero = Complex::new(0.0, 0.0);
-    let mut acc: FxHashMap<Word, Complex<f64>> = FxHashMap::default();
+    let mut acc: FxHashMap<Word<W>, Complex<f64>> = FxHashMap::default();
     for a in a_terms {
         for b in b_terms {
             let (word, phase) = pauli_mul(&a.word, &b.word);
@@ -416,10 +438,10 @@ fn check_k_matrix(
 /// call rather than cached: for sparse-local Hamiltonians a per-word cache
 /// costs more than the recompute (hash lookup ≳ recompute) and its several
 /// KB per cached word dominate memory at large basis sizes.
-pub struct LindbladSpec {
+pub struct LindbladSpec<const W: usize = W_CHUNKS> {
     n_qubits: usize,
-    h_terms: Vec<HTerm>,
-    j_kinds: Vec<JumpKind>,
+    h_terms: Vec<HTerm<W>>,
+    j_kinds: Vec<JumpKind<W>>,
     /// `h_support[q]` = indices of Hamiltonian terms acting on qubit `q`.
     h_support: Vec<Vec<u32>>,
     /// `j_support[q]` = indices of `j_kinds` entries whose support
@@ -428,12 +450,12 @@ pub struct LindbladSpec {
     /// Kossakowski operator table: `k_ops[i]` holds the Pauli linear
     /// combination of operator `A_i`, shared by every pair that
     /// references it.
-    k_ops: Vec<Vec<PauliTerm>>,
+    k_ops: Vec<Vec<PauliTerm<W>>>,
     /// Per-qubit support of each `k_ops` entry (sorted qubit indices).
     k_op_support: Vec<Vec<u32>>,
     /// `K`-independent precompilation of every pair `n ≤ m` of `k_ops`, in
     /// the `(n, m)` lexicographic order the constructor compiles them in.
-    k_pairs: Vec<PairTemplate>,
+    k_pairs: Vec<PairTemplate<W>>,
     /// Current Kossakowski matrix over the whole `k_ops` table, row-major
     /// (`k_mat[n][m] = K_nm`); block-diagonal when several blocks were
     /// added. Source of truth for [`Self::rebuild_kossakowski_pairs`].
@@ -454,7 +476,7 @@ pub struct JumpInput {
     pub rate: f64,
 }
 
-impl LindbladSpec {
+impl<const W: usize> LindbladSpec<W> {
     /// Construct a Lindbladian spec from Hamiltonian terms and jump operators.
     ///
     /// `h_terms` are `(pauli_string, coefficient)` pairs forming the Hermitian
@@ -466,11 +488,11 @@ impl LindbladSpec {
         h_terms: &[(String, f64)],
         jumps: &[JumpInput],
     ) -> Result<Self, Error> {
-        if n_qubits > MAX_QUBITS {
-            return Err(Error::TooManyQubits { got: n_qubits });
+        if n_qubits > max_qubits_for(W) {
+            return Err(Error::TooManyQubits { got: n_qubits, max: max_qubits_for(W) });
         }
 
-        let mut h_parsed: Vec<HTerm> = Vec::with_capacity(h_terms.len());
+        let mut h_parsed: Vec<HTerm<W>> = Vec::with_capacity(h_terms.len());
         let mut h_support_idx: Vec<Vec<u32>> = vec![Vec::new(); n_qubits];
         for (i, (s, c)) in h_terms.iter().enumerate() {
             let (word, support) = parse_pauli_string(s, n_qubits)?;
@@ -480,7 +502,7 @@ impl LindbladSpec {
             h_parsed.push(HTerm { word, coeff: *c });
         }
 
-        let mut j_kinds: Vec<JumpKind> = Vec::with_capacity(jumps.len());
+        let mut j_kinds: Vec<JumpKind<W>> = Vec::with_capacity(jumps.len());
         let mut j_support_idx: Vec<Vec<u32>> = vec![Vec::new(); n_qubits];
         let mut j_rates: Vec<f64> = Vec::with_capacity(jumps.len());
         for (k, jump) in jumps.iter().enumerate() {
@@ -511,7 +533,7 @@ impl LindbladSpec {
             }
 
             // General path: parse all terms, precompute L†L, record union support.
-            let mut terms: Vec<PauliTerm> = Vec::with_capacity(jump.lincomb.len());
+            let mut terms: Vec<PauliTerm<W>> = Vec::with_capacity(jump.lincomb.len());
             let mut union_support: std::collections::BTreeSet<u32> =
                 std::collections::BTreeSet::new();
             for (s, c) in &jump.lincomb {
@@ -575,7 +597,7 @@ impl LindbladSpec {
             if op.is_empty() {
                 return Err(Error::EmptyLincomb { index: i });
             }
-            let mut terms: Vec<PauliTerm> = Vec::with_capacity(op.len());
+            let mut terms: Vec<PauliTerm<W>> = Vec::with_capacity(op.len());
             let mut union_support: std::collections::BTreeSet<u32> =
                 std::collections::BTreeSet::new();
             for (s, c) in op {
@@ -606,8 +628,8 @@ impl LindbladSpec {
         // K-independent part of every pair `n ≤ m` over the whole table
         // (templates of earlier blocks are recomputed; the result is the
         // same, and Python only ever adds one block).
-        let support_mask = |terms: &[PauliTerm]| {
-            let mut mask = [0 as Chunk; W_CHUNKS];
+        let support_mask = |terms: &[PauliTerm<W>]| {
+            let mut mask = [0 as Chunk; W];
             for t in terms {
                 for (i, slot) in mask.iter_mut().enumerate() {
                     *slot |= t.word.xbits.data[i] | t.word.zbits.data[i];
@@ -723,7 +745,7 @@ impl LindbladSpec {
             }
             let off_diag = t.n != t.m;
             // A_n†A_m as `Σ γ_w W`, scaled by `K_nm`.
-            let (dd, dd_anti): (Vec<PauliTerm>, Vec<PauliTerm>) = if off_diag {
+            let (dd, dd_anti): (Vec<PauliTerm<W>>, Vec<PauliTerm<W>>) = if off_diag {
                 // dd = 2·Re(K_nm γ_w) (Hermitian sum, both-sided anticomm);
                 // dd_anti = −2i·Im(K_nm γ_w) (anti-Herm diff, one-sided).
                 let mut dd = Vec::with_capacity(t.adag_b.len());
@@ -755,7 +777,7 @@ impl LindbladSpec {
                     .collect();
                 (dd, Vec::new())
             };
-            let sand: SandwichGroups = t
+            let sand: SandwichGroups<W> = t
                 .sand
                 .iter()
                 .map(|(wa, rights)| {
@@ -876,8 +898,8 @@ impl LindbladSpec {
 
     /// Apply `L*` to a single Pauli string `p`. Returns the output Pauli
     /// strings and their real coefficients (zero entries omitted).
-    pub fn action(&self, p: &Word) -> Vec<(Word, f64)> {
-        let mut out: FxHashMap<Word, f64> = FxHashMap::default();
+    pub fn action(&self, p: &Word<W>) -> Vec<(Word<W>, f64)> {
+        let mut out: FxHashMap<Word<W>, f64> = FxHashMap::default();
         let mut s1 = Vec::new();
         let mut s2 = Vec::new();
         self.accumulate_action(p, 1.0, &mut out, &mut s1, &mut s2);
@@ -888,10 +910,10 @@ impl LindbladSpec {
     /// strings that lie in `basis` or in `protected` are dropped.
     pub fn leakage(
         &self,
-        basis: &[Word],
+        basis: &[Word<W>],
         coeffs: &[f64],
-        protected: &[Word],
-    ) -> Result<Vec<(Word, f64)>, Error> {
+        protected: &[Word<W>],
+    ) -> Result<Vec<(Word<W>, f64)>, Error> {
         self.leakage_with_prune(basis, coeffs, protected, usize::MAX, 0.0)
     }
 
@@ -907,12 +929,12 @@ impl LindbladSpec {
     /// `room ≥ all candidates`, nothing is dropped — the near-exact case.
     pub fn leakage_with_prune(
         &self,
-        basis: &[Word],
+        basis: &[Word<W>],
         coeffs: &[f64],
-        protected: &[Word],
+        protected: &[Word<W>],
         max_basis: usize,
         tau_add: f64,
-    ) -> Result<Vec<(Word, f64)>, Error> {
+    ) -> Result<Vec<(Word<W>, f64)>, Error> {
         if basis.len() != coeffs.len() {
             return Err(Error::LengthMismatch {
                 what: "basis and coeffs",
@@ -940,16 +962,16 @@ impl LindbladSpec {
 
         const CHUNK_SIZE: usize = 4096;
         let room = max_basis.saturating_sub(basis.len());
-        let mut merged: FxHashMap<Word, f64> = FxHashMap::default();
+        let mut merged: FxHashMap<Word<W>, f64> = FxHashMap::default();
         for chunk_indices in order.chunks(CHUNK_SIZE) {
-            let local: Vec<Vec<(Word, f64)>> = chunk_indices
+            let local: Vec<Vec<(Word<W>, f64)>> = chunk_indices
                 .par_iter()
                 .map_init(
                     || {
                         (
                             Vec::<u32>::with_capacity(self.n_qubits),
                             Vec::<u32>::with_capacity(128),
-                            FxHashMap::<Word, Complex<f64>>::with_capacity_and_hasher(
+                            FxHashMap::<Word<W>, Complex<f64>>::with_capacity_and_hasher(
                                 128,
                                 FxBuildHasher::default(),
                             ),
@@ -1006,7 +1028,7 @@ impl LindbladSpec {
     ///
     /// Precondition: `basis` must not contain duplicate Pauli words
     /// (asserted in debug builds).
-    pub fn generator(&self, basis: &[Word]) -> Vec<(usize, usize, f64)> {
+    pub fn generator(&self, basis: &[Word<W>]) -> Vec<(usize, usize, f64)> {
         let index = build_basis_index(basis);
 
         // `compute_action_terms` returns a deduplicated `Vec<(Word, f64)>`,
@@ -1019,7 +1041,7 @@ impl LindbladSpec {
                     (
                         Vec::<u32>::with_capacity(self.n_qubits),
                         Vec::<u32>::with_capacity(128),
-                        FxHashMap::<Word, Complex<f64>>::with_capacity_and_hasher(
+                        FxHashMap::<Word<W>, Complex<f64>>::with_capacity_and_hasher(
                             128,
                             FxBuildHasher::default(),
                         ),
@@ -1051,10 +1073,10 @@ impl LindbladSpec {
     /// component of `L*( Σ_j coeffs[j] · basis[j] )` with complex `coeffs`.
     pub fn leakage_complex(
         &self,
-        basis: &[Word],
+        basis: &[Word<W>],
         coeffs: &[Complex<f64>],
-        protected: &[Word],
-    ) -> Result<Vec<(Word, Complex<f64>)>, Error> {
+        protected: &[Word<W>],
+    ) -> Result<Vec<(Word<W>, Complex<f64>)>, Error> {
         if basis.len() != coeffs.len() {
             return Err(Error::LengthMismatch {
                 what: "basis and coeffs",
@@ -1067,12 +1089,12 @@ impl LindbladSpec {
             protected.iter().map(|w| (word_hash(w), ())).collect();
 
         const CHUNK_SIZE: usize = 4096;
-        let mut merged: FxHashMap<Word, Complex<f64>> = FxHashMap::default();
+        let mut merged: FxHashMap<Word<W>, Complex<f64>> = FxHashMap::default();
         for chunk_start in (0..basis.len()).step_by(CHUNK_SIZE) {
             let chunk_end = (chunk_start + CHUNK_SIZE).min(basis.len());
             let chunk_basis = &basis[chunk_start..chunk_end];
             let chunk_coeffs = &coeffs[chunk_start..chunk_end];
-            let local: Vec<Vec<(Word, Complex<f64>)>> = chunk_basis
+            let local: Vec<Vec<(Word<W>, Complex<f64>)>> = chunk_basis
                 .par_iter()
                 .zip(chunk_coeffs.par_iter())
                 .map_init(
@@ -1080,7 +1102,7 @@ impl LindbladSpec {
                         (
                             Vec::<u32>::with_capacity(self.n_qubits),
                             Vec::<u32>::with_capacity(128),
-                            FxHashMap::<Word, Complex<f64>>::with_capacity_and_hasher(
+                            FxHashMap::<Word<W>, Complex<f64>>::with_capacity_and_hasher(
                                 128,
                                 FxBuildHasher::default(),
                             ),
@@ -1118,10 +1140,10 @@ impl LindbladSpec {
     /// `protected` words are never dropped. All tuning knobs live in `cfg`.
     pub fn pc_step(
         &self,
-        basis: &mut Vec<Word>,
+        basis: &mut Vec<Word<W>>,
         coeffs: &mut Vec<f64>,
         dt: f64,
-        protected: &[Word],
+        protected: &[Word<W>],
         cfg: &PcStepConfig,
     ) -> Result<(), Error> {
         if let Some(n) = cfg.num_threads {
@@ -1140,10 +1162,10 @@ impl LindbladSpec {
     /// spots.
     pub fn pc_step_timed(
         &self,
-        basis: &mut Vec<Word>,
+        basis: &mut Vec<Word<W>>,
         coeffs: &mut Vec<f64>,
         dt: f64,
-        protected: &[Word],
+        protected: &[Word<W>],
         cfg: &PcStepConfig,
     ) -> Result<PcStepTimings, Error> {
         if let Some(n) = cfg.num_threads {
@@ -1159,10 +1181,10 @@ impl LindbladSpec {
 
     fn pc_step_inner_timed(
         &self,
-        basis: &mut Vec<Word>,
+        basis: &mut Vec<Word<W>>,
         coeffs: &mut Vec<f64>,
         dt: f64,
-        protected: &[Word],
+        protected: &[Word<W>],
         cfg: &PcStepConfig,
     ) -> Result<PcStepTimings, Error> {
         let PcStepConfig {
@@ -1211,10 +1233,10 @@ impl LindbladSpec {
 
     fn pc_step_inner(
         &self,
-        basis: &mut Vec<Word>,
+        basis: &mut Vec<Word<W>>,
         coeffs: &mut Vec<f64>,
         dt: f64,
-        protected: &[Word],
+        protected: &[Word<W>],
         cfg: &PcStepConfig,
     ) -> Result<(), Error> {
         let PcStepConfig {
@@ -1258,7 +1280,7 @@ impl LindbladSpec {
 
     /// Compute `exp(dt · M) · b` for the in-basis-restricted generator
     /// `M`, matrix-free, via `quspin-expm` (see [`mf_expm`]).
-    fn expm_step(&self, basis: &[Word], dt: f64, b: &[f64], drop_tol: f64) -> Vec<f64> {
+    fn expm_step(&self, basis: &[Word<W>], dt: f64, b: &[f64], drop_tol: f64) -> Vec<f64> {
         mf_expm::expm_apply_mf(self, basis, dt, b, drop_tol)
     }
 
@@ -1266,11 +1288,11 @@ impl LindbladSpec {
     /// `L*(p)` contributes (without the input coefficient).
     pub(crate) fn compute_action_terms(
         &self,
-        p: &Word,
+        p: &Word<W>,
         scratch_support: &mut Vec<u32>,
         scratch_cands: &mut Vec<u32>,
-        scratch_local: &mut FxHashMap<Word, Complex<f64>>,
-    ) -> Vec<(Word, f64)> {
+        scratch_local: &mut FxHashMap<Word<W>, Complex<f64>>,
+    ) -> Vec<(Word<W>, f64)> {
         word_support(p, scratch_support);
         let zero = Complex::new(0.0, 0.0);
         scratch_local.clear();
@@ -1344,12 +1366,12 @@ impl LindbladSpec {
                     //   p hits A_n only (left):  C = −½ [F, p]
                     // With `[P_c, p] = −i·eps·out` from `comm_product`, the
                     // term coefficient is `∓ t_c · (i/2) · eps`.
-                    let mut p_bits = [0 as Chunk; W_CHUNKS];
+                    let mut p_bits = [0 as Chunk; W];
                     for (i, slot) in p_bits.iter_mut().enumerate() {
                         *slot = p.xbits.data[i] | p.zbits.data[i];
                     }
                     let hits =
-                        |mask: &[Chunk; W_CHUNKS]| (0..W_CHUNKS).any(|i| mask[i] & p_bits[i] != 0);
+                        |mask: &[Chunk; W]| (0..W).any(|i| mask[i] & p_bits[i] != 0);
                     let (hit_l, hit_r) = (hits(left_mask), hits(right_mask));
                     if !(hit_l && hit_r) {
                         // exactly one side hit (pair is a candidate, so at
@@ -1428,9 +1450,9 @@ impl LindbladSpec {
     /// Accumulate `scale · L*(p)` into `out`.
     fn accumulate_action(
         &self,
-        p: &Word,
+        p: &Word<W>,
         scale: f64,
-        out: &mut FxHashMap<Word, f64>,
+        out: &mut FxHashMap<Word<W>, f64>,
         scratch_support: &mut Vec<u32>,
         scratch_cands: &mut Vec<u32>,
     ) {
@@ -1449,7 +1471,7 @@ impl LindbladSpec {
 /// cached hash once through `FxHasher` and never touches the 32-byte
 /// payload.
 #[inline(always)]
-pub(crate) fn word_hash(w: &Word) -> u64 {
+pub(crate) fn word_hash<const W: usize>(w: &Word<W>) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = fxhash::FxHasher::default();
     w.hash(&mut h);
@@ -1459,12 +1481,17 @@ pub(crate) fn word_hash(w: &Word) -> u64 {
 /// Compact `basis` / `coeffs` in place: drop entries whose absolute
 /// coefficient is below `drop_tol` unless the word appears in `protected`.
 /// No-op when `drop_tol ≤ 0`.
-pub(crate) fn prune_basis(basis: &mut Vec<Word>, coeffs: &mut Vec<f64>, drop_tol: f64, protected: &[Word]) {
+pub(crate) fn prune_basis<const W: usize>(
+    basis: &mut Vec<Word<W>>,
+    coeffs: &mut Vec<f64>,
+    drop_tol: f64,
+    protected: &[Word<W>],
+) {
     if drop_tol <= 0.0 {
         return;
     }
     debug_assert_eq!(basis.len(), coeffs.len());
-    let protected_set: FxHashSet<&Word> = protected.iter().collect();
+    let protected_set: FxHashSet<&Word<W>> = protected.iter().collect();
     let mut write = 0;
     for read in 0..basis.len() {
         if coeffs[read].abs() >= drop_tol || protected_set.contains(&basis[read]) {
@@ -1483,11 +1510,16 @@ pub(crate) fn prune_basis(basis: &mut Vec<Word>, coeffs: &mut Vec<f64>, drop_tol
 /// `max_basis` largest-|coeff| terms (protected strings always kept),
 /// dropping the rest. Rank-based total-basis bound; dual of `drop_tol`.
 /// A `max_basis` large enough to cover the whole basis is a no-op.
-pub(crate) fn cap_basis(basis: &mut Vec<Word>, coeffs: &mut Vec<f64>, max_basis: usize, protected: &[Word]) {
+pub(crate) fn cap_basis<const W: usize>(
+    basis: &mut Vec<Word<W>>,
+    coeffs: &mut Vec<f64>,
+    max_basis: usize,
+    protected: &[Word<W>],
+) {
     if basis.len() <= max_basis {
         return;
     }
-    let protected_set: FxHashSet<&Word> = protected.iter().collect();
+    let protected_set: FxHashSet<&Word<W>> = protected.iter().collect();
     let n_prot = basis.iter().filter(|w| protected_set.contains(w)).count();
     let slots = max_basis.saturating_sub(n_prot);
     let mut mags: Vec<f64> = basis
@@ -1526,10 +1558,10 @@ pub(crate) fn cap_basis(basis: &mut Vec<Word>, coeffs: &mut Vec<f64>, max_basis:
 /// expm/leakage peak memory) never exceeds `max_basis`. New strings get
 /// coefficient 0; the surrounding expm fills them. No magnitude filter: the
 /// top-`room` by `|leakage|` are added (a large `max_basis` adds them all).
-pub(crate) fn add_leakage_capped(
-    basis: &mut Vec<Word>,
+pub(crate) fn add_leakage_capped<const W: usize>(
+    basis: &mut Vec<Word<W>>,
     coeffs: &mut Vec<f64>,
-    mut leak: Vec<(Word, f64)>,
+    mut leak: Vec<(Word<W>, f64)>,
     max_basis: usize,
 ) {
     let room = max_basis.saturating_sub(basis.len());
@@ -1551,8 +1583,8 @@ pub(crate) fn add_leakage_capped(
 
 /// Build a `word → row` map for a basis assumed to contain unique Pauli
 /// words; debug-asserts the uniqueness invariant.
-pub fn build_basis_index(basis: &[Word]) -> FxHashMap<Word, u32> {
-    let mut index: FxHashMap<Word, u32> = FxHashMap::default();
+pub fn build_basis_index<const W: usize>(basis: &[Word<W>]) -> FxHashMap<Word<W>, u32> {
+    let mut index: FxHashMap<Word<W>, u32> = FxHashMap::default();
     for (i, w) in basis.iter().enumerate() {
         let prev = index.insert(*w, i as u32);
         debug_assert!(
@@ -1585,7 +1617,7 @@ mod tests {
     /// in-basis exponential to the complex coefficient vector. Reference
     /// bridge between the real `pc_step` and the orbit-rep path.
     fn pc_step_complex_full(
-        spec: &LindbladSpec,
+        spec: &LindbladSpec<W_CHUNKS>,
         basis: &mut Vec<Word>,
         coeffs: &mut Vec<Complex<f64>>,
         dt: f64,
@@ -1622,7 +1654,7 @@ mod tests {
     }
 
     /// Collect `spec.action` into a map for comparison.
-    fn action_map(spec: &LindbladSpec, p: &Word) -> FxHashMap<Word, f64> {
+    fn action_map(spec: &LindbladSpec<W_CHUNKS>, p: &Word) -> FxHashMap<Word, f64> {
         spec.action(p).into_iter().collect()
     }
 
@@ -1652,8 +1684,8 @@ mod tests {
             lincomb: sigma_minus_lincomb(0, n),
             rate: gamma,
         };
-        let spec_jump = LindbladSpec::new(n, &[], &[jump]).unwrap();
-        let mut spec_k = LindbladSpec::new(n, &[], &[]).unwrap();
+        let spec_jump = LindbladSpec::<W_CHUNKS>::new(n, &[], &[jump]).unwrap();
+        let mut spec_k = LindbladSpec::<W_CHUNKS>::new(n, &[], &[]).unwrap();
         spec_k
             .add_kossakowski(
                 &[sigma_minus_lincomb(0, n)],
@@ -1661,7 +1693,7 @@ mod tests {
             )
             .unwrap();
         for s in ["ZI", "XI", "YI", "ZZ", "XY"] {
-            let (p, _) = parse_pauli_string(s, n).unwrap();
+            let (p, _): (Word, _) = parse_pauli_string(s, n).unwrap();
             assert_actions_match(&action_map(&spec_jump, &p), &action_map(&spec_k, &p), 1e-12);
         }
     }
@@ -1684,8 +1716,8 @@ mod tests {
             JumpInput { lincomb: lin, rate }
         };
         let spec_jump =
-            LindbladSpec::new(n, &[], &[mk_jump(1.0, g_plus), mk_jump(-1.0, g_minus)]).unwrap();
-        let mut spec_k = LindbladSpec::new(n, &[], &[]).unwrap();
+            LindbladSpec::<W_CHUNKS>::new(n, &[], &[mk_jump(1.0, g_plus), mk_jump(-1.0, g_minus)]).unwrap();
+        let mut spec_k = LindbladSpec::<W_CHUNKS>::new(n, &[], &[]).unwrap();
         let k = vec![
             vec![Complex::new(1.0, 0.0), Complex::new(0.6, 0.0)],
             vec![Complex::new(0.6, 0.0), Complex::new(1.0, 0.0)],
@@ -1694,7 +1726,7 @@ mod tests {
             .add_kossakowski(&[sigma_minus_lincomb(0, n), sigma_minus_lincomb(1, n)], &k)
             .unwrap();
         for s in ["ZI", "IZ", "XX", "YY", "XY", "ZZ", "XI"] {
-            let (p, _) = parse_pauli_string(s, n).unwrap();
+            let (p, _): (Word, _) = parse_pauli_string(s, n).unwrap();
             assert_actions_match(&action_map(&spec_jump, &p), &action_map(&spec_k, &p), 1e-12);
         }
     }
@@ -1703,7 +1735,7 @@ mod tests {
     #[test]
     fn kossakowski_rejects_non_hermitian_k() {
         let n = 2;
-        let mut spec = LindbladSpec::new(n, &[], &[]).unwrap();
+        let mut spec = LindbladSpec::<W_CHUNKS>::new(n, &[], &[]).unwrap();
         let k = vec![
             vec![Complex::new(1.0, 0.0), Complex::new(0.6, 0.1)],
             vec![Complex::new(0.6, 0.1), Complex::new(1.0, 0.0)], // should be conj
@@ -1747,7 +1779,7 @@ mod tests {
         n: usize,
         rates: &[f64],
         k: &[Vec<Complex<f64>>],
-    ) -> LindbladSpec {
+    ) -> LindbladSpec<W_CHUNKS> {
         let h: Vec<(String, f64)> = (0..n)
             .map(|q| {
                 let mut s = vec!['Z'; n];
@@ -1767,7 +1799,7 @@ mod tests {
             },
             jump_hpauli(&format!("{}Z", "I".repeat(n - 1)), rates[2]),
         ];
-        let mut spec = LindbladSpec::new(n, &h, &jumps).unwrap();
+        let mut spec = LindbladSpec::<W_CHUNKS>::new(n, &h, &jumps).unwrap();
         let ops: Vec<_> = (0..n).map(|q| sigma_minus_lincomb(q, n)).collect();
         spec.add_kossakowski(&ops, k).unwrap();
         spec
@@ -1797,7 +1829,7 @@ mod tests {
         let fresh = setter_fixture(n, &rates0, &k1);
         assert_eq!(spec.num_jump_terms(), fresh.num_jump_terms());
         for s in ["ZII", "IZI", "IIZ", "XII", "IYI", "XXI", "ZYZ", "XYZ", "IXX"] {
-            let (p, _) = parse_pauli_string(s, n).unwrap();
+            let (p, _): (Word, _) = parse_pauli_string(s, n).unwrap();
             assert_actions_identical(&action_map(&spec, &p), &action_map(&fresh, &p));
         }
 
@@ -1805,7 +1837,7 @@ mod tests {
         assert_eq!(spec.jump_rates(), rates1.to_vec());
         let fresh = setter_fixture(n, &rates1, &k1);
         for s in ["ZII", "IZI", "IIZ", "XII", "IYI", "XXI", "ZYZ", "XYZ", "IXX"] {
-            let (p, _) = parse_pauli_string(s, n).unwrap();
+            let (p, _): (Word, _) = parse_pauli_string(s, n).unwrap();
             assert_actions_identical(&action_map(&spec, &p), &action_map(&fresh, &p));
         }
 
@@ -1813,7 +1845,7 @@ mod tests {
         spec.set_kossakowski(&k0).unwrap();
         let fresh = setter_fixture(n, &rates1, &k0);
         for s in ["ZII", "XXI", "ZYZ"] {
-            let (p, _) = parse_pauli_string(s, n).unwrap();
+            let (p, _): (Word, _) = parse_pauli_string(s, n).unwrap();
             assert_actions_identical(&action_map(&spec, &p), &action_map(&fresh, &p));
         }
     }
@@ -1845,9 +1877,9 @@ mod tests {
         assert_eq!(spec.kossakowski(), k0);
         assert_eq!(spec.jump_rates(), vec![0.1, 0.2, 0.3]);
         // Specs without the corresponding block.
-        let mut plain = LindbladSpec::new(n, &[], &[jump_hpauli("ZI", 0.1)]).unwrap();
+        let mut plain = LindbladSpec::<W_CHUNKS>::new(n, &[], &[jump_hpauli("ZI", 0.1)]).unwrap();
         assert!(matches!(plain.set_kossakowski(&k0), Err(Error::NoKossakowski)));
-        let mut none = LindbladSpec::new(n, &[("XX".to_string(), 1.0)], &[]).unwrap();
+        let mut none = LindbladSpec::<W_CHUNKS>::new(n, &[("XX".to_string(), 1.0)], &[]).unwrap();
         assert!(matches!(none.set_jump_rates(&[]), Err(Error::NoJumpOps)));
         assert_eq!(none.jump_rates(), Vec::<f64>::new());
         assert!(none.kossakowski().is_empty());
@@ -1863,13 +1895,13 @@ mod tests {
     #[test]
     fn z_dephasing_action_on_x() {
         // L = Z on a single qubit; L*(X) = γ(ZXZ - X) = γ(-X - X) = -2γ X.
-        let spec = LindbladSpec::new(
+        let spec = LindbladSpec::<W_CHUNKS>::new(
             1,
             &[("X".to_string(), 0.0)], // no Hamiltonian
             &[jump_hpauli("Z", 0.5)],
         )
         .unwrap();
-        let (x, _) = parse_pauli_string("X", 1).unwrap();
+        let (x, _): (Word, _) = parse_pauli_string("X", 1).unwrap();
         let terms = spec.action(&x);
         assert_eq!(terms.len(), 1);
         assert!((terms[0].1 - (-1.0)).abs() < 1e-12); // -2·0.5 = -1
@@ -1886,10 +1918,10 @@ mod tests {
             ],
             rate: 1.0,
         };
-        let spec = LindbladSpec::new(1, &[], &[sigma_minus]).unwrap();
-        let (z, _) = parse_pauli_string("Z", 1).unwrap();
+        let spec = LindbladSpec::<W_CHUNKS>::new(1, &[], &[sigma_minus]).unwrap();
+        let (z, _): (Word, _) = parse_pauli_string("Z", 1).unwrap();
         let terms = spec.action(&z);
-        let (i_word, _) = parse_pauli_string("I", 1).unwrap();
+        let (i_word, _): (Word, _) = parse_pauli_string("I", 1).unwrap();
         let mut i_coeff = 0.0;
         let mut z_coeff = 0.0;
         for (w, c) in &terms {
@@ -1906,7 +1938,7 @@ mod tests {
     #[test]
     fn word_codec_roundtrip() {
         let codes = [0u8, 1, 2, 3, 1, 0, 3, 2];
-        let w = word_from_codes(&codes).unwrap();
+        let w: Word = word_from_codes(&codes).unwrap();
         let mut out = vec![0u8; codes.len()];
         codes_from_word(&w, &mut out);
         assert_eq!(out.as_slice(), &codes);
@@ -1933,7 +1965,7 @@ mod tests {
                 h_terms.push((s.into_iter().collect(), 1.0));
             }
         }
-        let spec = LindbladSpec::new(n, &h_terms, &[]).unwrap();
+        let spec = LindbladSpec::<W_CHUNKS>::new(n, &h_terms, &[]).unwrap();
         let group = ppvm_pauli_sum::symmetry::TranslationGroup::chain_1d(n);
         let k_mode: i32 = 1;
         let k = vec![k_mode];
@@ -1943,7 +1975,7 @@ mod tests {
             .map(|j| {
                 let mut s = vec!['I'; n];
                 s[j] = 'Z';
-                let (w, _) = parse_pauli_string(&s.into_iter().collect::<String>(), n).unwrap();
+                let (w, _): (Word, _) = parse_pauli_string(&s.into_iter().collect::<String>(), n).unwrap();
                 w
             })
             .collect();
@@ -2032,14 +2064,14 @@ mod tests {
                 h_terms.push((s.into_iter().collect(), 1.0));
             }
         }
-        let spec = LindbladSpec::new(n, &h_terms, &[]).unwrap();
+        let spec = LindbladSpec::<W_CHUNKS>::new(n, &h_terms, &[]).unwrap();
 
         let mut basis_r: Vec<Word> = (0..n)
             .map(|j| {
                 let mut s = vec!['I'; n];
                 s[j] = 'Z';
                 let st: String = s.into_iter().collect();
-                let (w, _) = parse_pauli_string(&st, n).unwrap();
+                let (w, _): (Word, _) = parse_pauli_string(&st, n).unwrap();
                 w
             })
             .collect();
@@ -2125,7 +2157,7 @@ mod tests {
             }
         }
         // No dissipation.
-        let spec = LindbladSpec::new(n, &h_terms, &[]).unwrap();
+        let spec = LindbladSpec::<W_CHUNKS>::new(n, &h_terms, &[]).unwrap();
         let group = TranslationGroup::chain_1d(n);
 
         // Initial: O(0) = Σ_j Z_j (translation-invariant).
@@ -2134,7 +2166,7 @@ mod tests {
                 let mut s = vec!['I'; n];
                 s[j] = 'Z';
                 let st: String = s.into_iter().collect();
-                let (w, _) = parse_pauli_string(&st, n).unwrap();
+                let (w, _): (Word, _) = parse_pauli_string(&st, n).unwrap();
                 w
             })
             .collect();

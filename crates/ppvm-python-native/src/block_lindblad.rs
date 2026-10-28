@@ -7,14 +7,19 @@
 //! Rows cross the boundary as a `(B, n_qubits)` uint8 code array plus a
 //! length-`B` uint8 species array; the Rust side packs them into row words
 //! (species digits appended) and splits them again on output. All physics
-//! lives in `ppvm_lindblad::block`.
+//! lives in `ppvm_lindblad::block`. The Pauli-word width is dispatched on
+//! the row length `n_qubits + ceil(log4 n_species)` exactly as `lindblad.rs`
+//! dispatches `LindbladSpec` on `n_qubits` (`word_width=` forces one).
 
 use std::collections::HashMap;
 
-use num::Complex;
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
-use ppvm_lindblad::{BlockLindbladSpec as CoreBlock, JumpInput, LindbladSpec as CoreSpec, Word};
+use ppvm_lindblad::{
+    BlockLindbladSpec as CoreBlock, LindbladSpec as CoreSpec, Word, max_qubits_for,
+};
 use pyo3::{exceptions::PyValueError, prelude::*};
+
+use crate::lindblad::{SpecInputs, f64_vec, map_err, pick_width, with_width};
 
 /// `(basis codes (B, n_qubits), species (B,), coeffs (B,))`.
 type PyBlockMap<'py> = (
@@ -28,70 +33,77 @@ type PyCoo<'py> = (
     Bound<'py, PyArray1<f64>>,
 );
 
-fn map_err(e: ppvm_lindblad::Error) -> PyErr {
-    PyValueError::new_err(e.to_string())
+/// A `BlockLindbladSpec` at one of the compiled widths.
+pub(crate) enum AnyBlock {
+    W2(CoreBlock<2>),
+    W4(CoreBlock<4>),
+    W8(CoreBlock<8>),
+    W16(CoreBlock<16>),
+    W17(CoreBlock<17>),
 }
 
-/// One species' `LindbladSpec` from the same triple-encoded inputs as
-/// `LindbladSpec.__init__` (`lindblad.rs`).
-#[allow(clippy::too_many_arguments)]
-fn build_species(
+macro_rules! impl_from_block {
+    ($($v:ident = $w:literal),*) => {
+        $(impl From<CoreBlock<$w>> for AnyBlock {
+            fn from(s: CoreBlock<$w>) -> Self {
+                AnyBlock::$v(s)
+            }
+        })*
+    };
+}
+impl_from_block!(W2 = 2, W4 = 4, W8 = 8, W16 = 16, W17 = 17);
+
+macro_rules! dispatch {
+    ($e:expr, $s:ident => $body:expr) => {
+        match $e {
+            AnyBlock::W2($s) => $body,
+            AnyBlock::W4($s) => $body,
+            AnyBlock::W8($s) => $body,
+            AnyBlock::W16($s) => $body,
+            AnyBlock::W17($s) => $body,
+        }
+    };
+}
+
+fn word_width_of<const W: usize>(_: &CoreBlock<W>) -> usize {
+    W
+}
+
+fn word_bytes_of<const W: usize>(_: &CoreBlock<W>) -> usize {
+    std::mem::size_of::<Word<W>>()
+}
+
+/// Species digits a block of `n_species` appends to every row (`⌈log₄ M⌉`),
+/// the same rule as `BlockLindbladSpec::with_resets`.
+fn species_digits(n_species: usize) -> usize {
+    let mut n_digits = 0usize;
+    while (1usize << (2 * n_digits)) < n_species.max(1) {
+        n_digits += 1;
+    }
+    n_digits
+}
+
+/// Build the block at width `W` from the per-species inputs.
+fn build_block<const W: usize>(
     n_qubits: usize,
-    h_terms: Vec<String>,
-    h_coeffs: Vec<f64>,
-    jump_lincombs: Vec<Vec<(String, f64, f64)>>,
-    jump_rates: Vec<f64>,
-    kossakowski_ops: Vec<Vec<(String, f64, f64)>>,
-    kossakowski_k: Vec<Vec<(f64, f64)>>,
-    species: usize,
-) -> PyResult<CoreSpec> {
-    if h_terms.len() != h_coeffs.len() {
-        return Err(PyValueError::new_err(format!(
-            "species {species}: h_terms and h_coeffs must have the same length"
-        )));
+    inputs: &[SpecInputs],
+    exchange: &[Vec<f64>],
+    matchings: &[(usize, usize, Vec<usize>)],
+    resets: &[(usize, usize, Vec<usize>)],
+) -> PyResult<CoreBlock<W>> {
+    let mut species: Vec<CoreSpec<W>> = Vec::with_capacity(inputs.len());
+    for inp in inputs {
+        species.push(inp.build::<W>(n_qubits)?);
     }
-    if jump_lincombs.len() != jump_rates.len() {
-        return Err(PyValueError::new_err(format!(
-            "species {species}: jump_lincombs and jump_rates must have the same length"
-        )));
-    }
-    let h: Vec<(String, f64)> = h_terms.into_iter().zip(h_coeffs).collect();
-    let jumps: Vec<JumpInput> = jump_lincombs
-        .into_iter()
-        .zip(jump_rates)
-        .map(|(lincomb, rate)| JumpInput {
-            lincomb: lincomb
-                .into_iter()
-                .map(|(s, re, im)| (s, Complex::new(re, im)))
-                .collect(),
-            rate,
-        })
-        .collect();
-    let mut spec = CoreSpec::new(n_qubits, &h, &jumps).map_err(map_err)?;
-    if !kossakowski_ops.is_empty() || !kossakowski_k.is_empty() {
-        let ops: Vec<Vec<(String, Complex<f64>)>> = kossakowski_ops
-            .into_iter()
-            .map(|op| {
-                op.into_iter()
-                    .map(|(s, re, im)| (s, Complex::new(re, im)))
-                    .collect()
-            })
-            .collect();
-        let k: Vec<Vec<Complex<f64>>> = kossakowski_k
-            .into_iter()
-            .map(|row| row.into_iter().map(|(re, im)| Complex::new(re, im)).collect())
-            .collect();
-        spec.add_kossakowski(&ops, &k).map_err(map_err)?;
-    }
-    Ok(spec)
+    CoreBlock::<W>::with_resets(n_qubits, species, exchange, matchings, resets).map_err(map_err)
 }
 
 /// Decode `(B, n_qubits)` codes plus `B` species indices into row words.
-fn decode_rows(
-    spec: &CoreBlock,
+fn decode_rows<const W: usize>(
+    spec: &CoreBlock<W>,
     basis: &numpy::ndarray::ArrayView2<u8>,
     species: &[u8],
-) -> PyResult<Vec<Word>> {
+) -> PyResult<Vec<Word<W>>> {
     let n_q = spec.n_qubits();
     let n_rows = basis.shape()[0];
     if basis.shape()[1] != n_q {
@@ -118,8 +130,8 @@ fn decode_rows(
     Ok(out)
 }
 
-fn assert_rows_unique(rows: &[Word]) -> PyResult<()> {
-    let mut seen: HashMap<&Word, usize> = HashMap::with_capacity(rows.len());
+fn assert_rows_unique<const W: usize>(rows: &[Word<W>]) -> PyResult<()> {
+    let mut seen: HashMap<&Word<W>, usize> = HashMap::with_capacity(rows.len());
     for (i, w) in rows.iter().enumerate() {
         if let Some(prev) = seen.insert(w, i) {
             return Err(PyValueError::new_err(format!(
@@ -130,10 +142,10 @@ fn assert_rows_unique(rows: &[Word]) -> PyResult<()> {
     Ok(())
 }
 
-fn pack_rows<'py>(
+fn pack_rows<'py, const W: usize>(
     py: Python<'py>,
-    spec: &CoreBlock,
-    pairs: Vec<(Word, f64)>,
+    spec: &CoreBlock<W>,
+    pairs: Vec<(Word<W>, f64)>,
 ) -> PyResult<PyBlockMap<'py>> {
     let n_q = spec.n_qubits();
     let m = pairs.len();
@@ -151,11 +163,11 @@ fn pack_rows<'py>(
     Ok((basis_arr, species.into_pyarray(py), coeffs.into_pyarray(py)))
 }
 
-fn protected_rows(
-    spec: &CoreBlock,
+fn protected_rows<const W: usize>(
+    spec: &CoreBlock<W>,
     basis: Option<&PyReadonlyArray2<'_, u8>>,
     species: Option<&PyReadonlyArray1<'_, u8>>,
-) -> PyResult<Vec<Word>> {
+) -> PyResult<Vec<Word<W>>> {
     match (basis, species) {
         (None, None) => Ok(Vec::new()),
         (Some(b), Some(s)) => decode_rows(spec, &b.as_array(), s.as_slice()?),
@@ -165,10 +177,97 @@ fn protected_rows(
     }
 }
 
+// ────────────────── width-generic method bodies ──────────────────
+
+fn action_impl<'py, const W: usize>(
+    spec: &CoreBlock<W>,
+    py: Python<'py>,
+    species: usize,
+    p: PyReadonlyArray1<'py, u8>,
+) -> PyResult<PyBlockMap<'py>> {
+    let row = spec.encode_row(p.as_slice()?, species).map_err(map_err)?;
+    pack_rows(py, spec, spec.action(&row))
+}
+
+fn leakage_impl<'py, const W: usize>(
+    spec: &CoreBlock<W>,
+    py: Python<'py>,
+    basis: PyReadonlyArray2<'py, u8>,
+    species: PyReadonlyArray1<'py, u8>,
+    coeffs: PyReadonlyArray1<'py, f64>,
+    protected_basis: Option<PyReadonlyArray2<'py, u8>>,
+    protected_species: Option<PyReadonlyArray1<'py, u8>>,
+) -> PyResult<PyBlockMap<'py>> {
+    let rows = decode_rows(spec, &basis.as_array(), species.as_slice()?)?;
+    let coeffs_slice = coeffs.as_slice()?;
+    if coeffs_slice.len() != rows.len() {
+        return Err(PyValueError::new_err(format!(
+            "coeffs has length {} but basis has {} rows",
+            coeffs_slice.len(),
+            rows.len()
+        )));
+    }
+    let protected = protected_rows(spec, protected_basis.as_ref(), protected_species.as_ref())?;
+    let pairs = spec
+        .leakage(&rows, coeffs_slice, &protected)
+        .map_err(map_err)?;
+    pack_rows(py, spec, pairs)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pc_step_impl<'py, const W: usize>(
+    spec: &CoreBlock<W>,
+    py: Python<'py>,
+    basis: PyReadonlyArray2<'py, u8>,
+    species: PyReadonlyArray1<'py, u8>,
+    coeffs: PyReadonlyArray1<'py, f64>,
+    dt: f64,
+    cfg: ppvm_lindblad::PcStepConfig,
+    protected_basis: Option<PyReadonlyArray2<'py, u8>>,
+    protected_species: Option<PyReadonlyArray1<'py, u8>>,
+) -> PyResult<PyBlockMap<'py>> {
+    let mut rows = decode_rows(spec, &basis.as_array(), species.as_slice()?)?;
+    assert_rows_unique(&rows)?;
+    let mut coeffs_vec = coeffs.as_slice()?.to_vec();
+    if coeffs_vec.len() != rows.len() {
+        return Err(PyValueError::new_err(format!(
+            "coeffs has length {} but basis has {} rows",
+            coeffs_vec.len(),
+            rows.len()
+        )));
+    }
+    let protected = protected_rows(spec, protected_basis.as_ref(), protected_species.as_ref())?;
+    spec.pc_step(&mut rows, &mut coeffs_vec, dt, &protected, &cfg)
+        .map_err(map_err)?;
+    let pairs: Vec<(Word<W>, f64)> = rows.into_iter().zip(coeffs_vec).collect();
+    pack_rows(py, spec, pairs)
+}
+
+fn generator_impl<'py, const W: usize>(
+    spec: &CoreBlock<W>,
+    py: Python<'py>,
+    basis: PyReadonlyArray2<'py, u8>,
+    species: PyReadonlyArray1<'py, u8>,
+) -> PyResult<PyCoo<'py>> {
+    let rows = decode_rows(spec, &basis.as_array(), species.as_slice()?)?;
+    assert_rows_unique(&rows)?;
+    let triplets = spec.generator(&rows);
+    let total = triplets.len();
+    let mut r = Vec::with_capacity(total);
+    let mut c = Vec::with_capacity(total);
+    let mut v = Vec::with_capacity(total);
+    for (row, col, val) in triplets {
+        r.push(row as u64);
+        c.push(col as u64);
+        v.push(val);
+    }
+    Ok((r.into_pyarray(py), c.into_pyarray(py), v.into_pyarray(py)))
+}
+
 /// PyO3 facade exposing [`ppvm_lindblad::BlockLindbladSpec`] to Python.
 #[pyclass]
 pub struct BlockLindbladSpec {
-    inner: CoreBlock,
+    inner: AnyBlock,
 }
 
 #[pymethods]
@@ -183,9 +282,12 @@ impl BlockLindbladSpec {
     /// `(c, d, positions)`: the qubit positions of species `c` whose state is
     /// replaced by the unit state on the transition `c → d` (strings with a
     /// non-identity letter there are not carried; `block.rs` module docs).
+    /// `word_width` forces a compiled Pauli-word width (the row length
+    /// `n_qubits + ceil(log4 n_species)` must fit); `None` dispatches.
     #[new]
     #[pyo3(signature = (n_qubits, n_species, h_terms, h_coeffs, jump_lincombs, jump_rates,
-                        kossakowski_ops, kossakowski_k, exchange, matchings, resets=None))]
+                        kossakowski_ops, kossakowski_k, exchange, matchings, resets=None,
+                        word_width=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         n_qubits: usize,
@@ -199,6 +301,7 @@ impl BlockLindbladSpec {
         exchange: Vec<Vec<f64>>,
         matchings: Vec<(usize, usize, Vec<usize>)>,
         resets: Option<Vec<(usize, usize, Vec<usize>)>>,
+        word_width: Option<usize>,
     ) -> PyResult<Self> {
         for (name, len) in [
             ("h_terms", h_terms.len()),
@@ -214,7 +317,9 @@ impl BlockLindbladSpec {
                 )));
             }
         }
-        let mut species = Vec::with_capacity(n_species);
+        let row_len = n_qubits + species_digits(n_species);
+        let width = pick_width(row_len, word_width, "BlockLindbladSpec (n_qubits + species digits)")?;
+        let mut inputs = Vec::with_capacity(n_species);
         for (s, (((((h, c), jl), jr), ko), kk)) in h_terms
             .into_iter()
             .zip(h_coeffs)
@@ -224,90 +329,97 @@ impl BlockLindbladSpec {
             .zip(kossakowski_k)
             .enumerate()
         {
-            species.push(build_species(n_qubits, h, c, jl, jr, ko, kk, s)?);
+            inputs.push(SpecInputs::new(h, c, jl, jr, ko, kk, &format!("species {s}: "))?);
         }
         let resets = resets.unwrap_or_default();
-        let inner = CoreBlock::with_resets(n_qubits, species, &exchange, &matchings, &resets)
-            .map_err(map_err)?;
+        let inner = with_width!(width, W => {
+            AnyBlock::from(build_block::<W>(n_qubits, &inputs, &exchange, &matchings, &resets)?)
+        });
         Ok(Self { inner })
+    }
+
+    /// The Pauli-word width this block was instantiated with (chunks).
+    #[getter]
+    fn word_width(&self) -> usize {
+        dispatch!(&self.inner, s => word_width_of(s))
+    }
+
+    /// The largest row length (`n_qubits + n_digits`) this width holds.
+    #[getter]
+    fn max_qubits(&self) -> usize {
+        max_qubits_for(self.word_width())
+    }
+
+    /// Bytes of one packed row word at this width.
+    #[getter]
+    fn word_bytes(&self) -> usize {
+        dispatch!(&self.inner, s => word_bytes_of(s))
     }
 
     /// The reset masks as given: `[(c, d, positions of c reset on c → d)]`.
     #[getter]
     fn resets(&self) -> Vec<(usize, usize, Vec<usize>)> {
-        self.inner.resets().to_vec()
+        dispatch!(&self.inner, s => s.resets().to_vec())
     }
 
     #[getter]
     fn n_qubits(&self) -> usize {
-        self.inner.n_qubits()
+        dispatch!(&self.inner, s => s.n_qubits())
     }
 
     #[getter]
     fn n_species(&self) -> usize {
-        self.inner.n_species()
+        dispatch!(&self.inner, s => s.n_species())
     }
 
     /// Species digits appended to each row word internally.
     #[getter]
     fn n_digits(&self) -> usize {
-        self.inner.n_digits()
+        dispatch!(&self.inner, s => s.n_digits())
     }
 
     /// `exchange[c][d] = k_cd` as a nested list (diagonal zero).
     #[getter]
     fn exchange(&self) -> Vec<Vec<f64>> {
-        self.inner.exchange().to_vec()
+        dispatch!(&self.inner, s => s.exchange().to_vec())
     }
 
     /// `Σ_d k_cd` per species.
     #[getter]
     fn rate_out(&self) -> Vec<f64> {
-        self.inner.rate_out().to_vec()
+        dispatch!(&self.inner, s => s.rate_out().to_vec())
     }
 
     /// Number of Hamiltonian terms of one species.
     fn num_h_terms(&self, species: usize) -> PyResult<usize> {
-        Ok(self.inner.species(species).map_err(map_err)?.num_h_terms())
+        dispatch!(&self.inner, s => Ok(s.species(species).map_err(map_err)?.num_h_terms()))
     }
 
     /// Number of jump entries (jumps + Kossakowski pairs) of one species.
     fn num_jump_terms(&self, species: usize) -> PyResult<usize> {
-        Ok(self.inner.species(species).map_err(map_err)?.num_jump_terms())
+        dispatch!(&self.inner, s => Ok(s.species(species).map_err(map_err)?.num_jump_terms()))
     }
 
     /// Current Hamiltonian coefficients of one species (a copy).
     fn h_coeffs<'py>(&self, py: Python<'py>, species: usize) -> PyResult<Bound<'py, PyArray1<f64>>> {
-        Ok(self
-            .inner
+        dispatch!(&self.inner, s => Ok(s
             .species(species)
             .map_err(map_err)?
             .h_coeffs()
-            .into_pyarray(py))
+            .into_pyarray(py)))
     }
 
     /// Overwrite the Hamiltonian coefficients of one species in place
     /// (`O(num_h_terms)`); `coeffs` is a 1-D float64 array of that length.
     fn set_h_coeffs(&mut self, species: usize, coeffs: &Bound<'_, PyAny>) -> PyResult<()> {
-        let n = self.inner.species(species).map_err(map_err)?.num_h_terms();
-        let coeffs: PyReadonlyArray1<'_, f64> = coeffs.extract().map_err(|_| {
+        let n = self.num_h_terms(species)?;
+        let v = f64_vec(coeffs, n, "set_h_coeffs").map_err(|_| {
             PyValueError::new_err(format!(
-                "set_h_coeffs: expected a 1-D float64 ndarray of shape ({n},)"
+                "set_h_coeffs: species {species} has {n} Hamiltonian terms; expected a 1-D \
+                 float64 ndarray of shape ({n},)"
             ))
         })?;
-        let got = coeffs.len()?;
-        if got != n {
-            return Err(PyValueError::new_err(format!(
-                "set_h_coeffs: species {species} has {n} Hamiltonian terms, got {got} coefficients"
-            )));
-        }
-        match coeffs.as_slice() {
-            Ok(sl) => self.inner.set_h_coeffs(species, sl).map_err(map_err),
-            Err(_) => {
-                let v: Vec<f64> = coeffs.as_array().iter().copied().collect();
-                self.inner.set_h_coeffs(species, &v).map_err(map_err)
-            }
-        }
+        dispatch!(&mut self.inner, s => s.set_h_coeffs(species, &v).map_err(map_err))
     }
 
     /// `L*_block` on the single row `(species, p)`.
@@ -317,11 +429,7 @@ impl BlockLindbladSpec {
         species: usize,
         p: PyReadonlyArray1<'py, u8>,
     ) -> PyResult<PyBlockMap<'py>> {
-        let row = self
-            .inner
-            .encode_row(p.as_slice()?, species)
-            .map_err(map_err)?;
-        pack_rows(py, &self.inner, self.inner.action(&row))
+        dispatch!(&self.inner, s => action_impl(s, py, species, p))
     }
 
     /// Off-basis component of `L*_block( Σ_j coeffs[j] · (species[j], basis[j]) )`.
@@ -335,21 +443,8 @@ impl BlockLindbladSpec {
         protected_basis: Option<PyReadonlyArray2<'py, u8>>,
         protected_species: Option<PyReadonlyArray1<'py, u8>>,
     ) -> PyResult<PyBlockMap<'py>> {
-        let rows = decode_rows(&self.inner, &basis.as_array(), species.as_slice()?)?;
-        let coeffs_slice = coeffs.as_slice()?;
-        if coeffs_slice.len() != rows.len() {
-            return Err(PyValueError::new_err(format!(
-                "coeffs has length {} but basis has {} rows",
-                coeffs_slice.len(),
-                rows.len()
-            )));
-        }
-        let protected = protected_rows(&self.inner, protected_basis.as_ref(), protected_species.as_ref())?;
-        let pairs = self
-            .inner
-            .leakage(&rows, coeffs_slice, &protected)
-            .map_err(map_err)?;
-        pack_rows(py, &self.inner, pairs)
+        dispatch!(&self.inner, s => leakage_impl(
+            s, py, basis, species, coeffs, protected_basis, protected_species))
     }
 
     /// One predictor-corrector step on block rows; truncation knobs as
@@ -380,34 +475,15 @@ impl BlockLindbladSpec {
         admit_basis: Option<usize>,
         tau_add: Option<f64>,
     ) -> PyResult<PyBlockMap<'py>> {
-        let mut rows = decode_rows(&self.inner, &basis.as_array(), species.as_slice()?)?;
-        assert_rows_unique(&rows)?;
-        let mut coeffs_vec = coeffs.as_slice()?.to_vec();
-        if coeffs_vec.len() != rows.len() {
-            return Err(PyValueError::new_err(format!(
-                "coeffs has length {} but basis has {} rows",
-                coeffs_vec.len(),
-                rows.len()
-            )));
-        }
-        let protected = protected_rows(&self.inner, protected_basis.as_ref(), protected_species.as_ref())?;
-        self.inner
-            .pc_step(
-                &mut rows,
-                &mut coeffs_vec,
-                dt,
-                &protected,
-                &ppvm_lindblad::PcStepConfig {
-                    max_basis,
-                    admit_basis,
-                    drop_tol,
-                    tau_add,
-                    num_threads,
-                },
-            )
-            .map_err(map_err)?;
-        let pairs: Vec<(Word, f64)> = rows.into_iter().zip(coeffs_vec).collect();
-        pack_rows(py, &self.inner, pairs)
+        let cfg = ppvm_lindblad::PcStepConfig {
+            max_basis,
+            admit_basis,
+            drop_tol,
+            tau_add,
+            num_threads,
+        };
+        dispatch!(&self.inner, s => pc_step_impl(
+            s, py, basis, species, coeffs, dt, cfg, protected_basis, protected_species))
     }
 
     /// Sparse generator on the given rows in COO form `(rows, cols, vals)`.
@@ -417,18 +493,6 @@ impl BlockLindbladSpec {
         basis: PyReadonlyArray2<'py, u8>,
         species: PyReadonlyArray1<'py, u8>,
     ) -> PyResult<PyCoo<'py>> {
-        let rows = decode_rows(&self.inner, &basis.as_array(), species.as_slice()?)?;
-        assert_rows_unique(&rows)?;
-        let triplets = self.inner.generator(&rows);
-        let total = triplets.len();
-        let mut r = Vec::with_capacity(total);
-        let mut c = Vec::with_capacity(total);
-        let mut v = Vec::with_capacity(total);
-        for (row, col, val) in triplets {
-            r.push(row as u64);
-            c.push(col as u64);
-            v.push(val);
-        }
-        Ok((r.into_pyarray(py), c.into_pyarray(py), v.into_pyarray(py)))
+        dispatch!(&self.inner, s => generator_impl(s, py, basis, species))
     }
 }

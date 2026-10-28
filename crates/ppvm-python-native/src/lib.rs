@@ -307,11 +307,19 @@ pub mod _core {
     #[pymodule_export]
     pub use crate::stim_program::PyStimProgram;
 
-    // Lindbladian time evolution
+    // Lindbladian time evolution (Pauli-word width dispatched on n_qubits)
     #[pymodule_export]
     pub use crate::lindblad::LindbladSpec;
     #[pymodule_export]
     pub use crate::block_lindblad::BlockLindbladSpec;
+    #[pymodule_export]
+    pub use crate::lindblad::lindblad_max_qubits;
+    #[pymodule_export]
+    pub use crate::lindblad::lindblad_word_widths;
+    #[pymodule_export]
+    pub use crate::lindblad::lindblad_chunk_bits;
+    #[pymodule_export]
+    pub use crate::lindblad::lindblad_word_width_for;
 
     // Symmetry merging
     #[pymodule_export]

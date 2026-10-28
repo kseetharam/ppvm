@@ -3,14 +3,17 @@
 
 //! Error type for [`crate::LindbladSpec`] construction and stepping.
 
-use crate::MAX_QUBITS;
+use crate::CHUNK_BITS;
 use std::fmt;
 
 /// Errors raised when constructing a [`crate::LindbladSpec`].
 #[derive(Debug, Clone)]
 pub enum Error {
+    /// `n_qubits` above the capacity of the word width `W` the spec was
+    /// instantiated with (`max = W · CHUNK_BITS`).
     TooManyQubits {
         got: usize,
+        max: usize,
     },
     LengthMismatch {
         what: &'static str,
@@ -64,10 +67,15 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::TooManyQubits { got } => {
+            Error::TooManyQubits { got, max } => {
                 write!(
                     f,
-                    "LindbladSpec supports n_qubits ≤ {MAX_QUBITS}; got {got}"
+                    "LindbladSpec supports n_qubits ≤ {max} at this Pauli-word width \
+                     (W = {} chunks of {CHUNK_BITS} bits); got {got}. The width is a \
+                     compile-time instantiation (ppvm_lindblad::Word<W>); the Python \
+                     boundary dispatches on n_qubits up to its largest compiled width \
+                     (ppvm.lindblad.max_qubits())",
+                    max / CHUNK_BITS
                 )
             }
             Error::LengthMismatch { what, a, b } => {

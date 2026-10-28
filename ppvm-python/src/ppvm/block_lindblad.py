@@ -51,7 +51,7 @@ from collections.abc import Iterable, Sequence
 import numpy as np
 
 from ._core import BlockLindbladSpec as _BlockLindbladSpec
-from .lindblad import PauliLincomb, _codes_to_basis, _normalize_jump, _string_to_codes
+from .lindblad import MAX_QUBITS, PauliLincomb, _check_n_qubits, _codes_to_basis, _normalize_jump, _string_to_codes
 
 
 def _per_species(value, n_species, name):
@@ -90,6 +90,11 @@ class BlockLindbladian:
         ``{(c, d): perm}`` with ``perm[p]`` the position in species ``d`` of
         the qubit at position ``p`` of species ``c``; a missing reverse pair
         uses the inverse permutation, a missing pair the identity.
+    word_width:
+        Optional Pauli-word width in chunks (one of `ppvm.lindblad.WORD_WIDTHS`)
+        to force; ``None`` dispatches on the row length ``n_qubits +
+        ceil(log4 n_species)`` (the species digits share the word), which must
+        not exceed `ppvm.lindblad.MAX_QUBITS`.
     resets:
         ``None`` or ``{(c, d): positions}``: the qubit positions **of species
         c** whose state is replaced by the unit state on the transition
@@ -118,11 +123,16 @@ class BlockLindbladian:
         exchange=None,
         matchings: dict[tuple[int, int], Sequence[int]] | None = None,
         resets: dict[tuple[int, int], Iterable[int]] | None = None,
+        word_width: int | None = None,
     ):
         self.n_qubits = int(n_qubits)
         self.n_species = int(n_species)
         if self.n_species < 1:
             raise ValueError("n_species must be at least 1")
+        n_digits = 0
+        while (1 << (2 * n_digits)) < self.n_species:
+            n_digits += 1
+        _check_n_qubits(self.n_qubits + n_digits, "BlockLindbladian (n_qubits + species digits)")
         h_terms = _per_species(h_terms, self.n_species, "h_terms")
         jump_terms = _per_species(jump_terms, self.n_species, "jump_terms")
         kossakowski = _per_species(kossakowski, self.n_species, "kossakowski")
@@ -181,7 +191,23 @@ class BlockLindbladian:
         self._spec = _BlockLindbladSpec(
             self.n_qubits, self.n_species, h_strs, h_coeffs, j_lincombs, j_rates, k_ops, k_mats,
             ex.tolist(), match_list, reset_list or None,
+            None if word_width is None else int(word_width),
         )
+
+    @property
+    def word_width(self) -> int:
+        """The Pauli-word width (chunks) the rows are packed in."""
+        return self._spec.word_width
+
+    @property
+    def max_qubits(self) -> int:
+        """The largest row length (``n_qubits + n_digits``) this width holds."""
+        return self._spec.max_qubits
+
+    @property
+    def word_bytes(self) -> int:
+        """Bytes of one packed row word at this width."""
+        return self._spec.word_bytes
 
     # ── bookkeeping ──
 

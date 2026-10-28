@@ -55,41 +55,41 @@ use rayon::prelude::*;
 
 use crate::mf_expm::{self, ActionTerms};
 use crate::{
-    Error, LindbladSpec, MAX_QUBITS, PcStepConfig, Word, add_leakage_capped, build_basis_index,
-    cap_basis, prune_basis, word_hash,
+    Error, LindbladSpec, PcStepConfig, W_CHUNKS, Word, add_leakage_capped, build_basis_index,
+    cap_basis, max_qubits_for, prune_basis, word_hash,
 };
 
 /// Heisenberg-picture inflow into one species from the rows of another:
 /// `(target species c, rate k_cd, matching π_cd)`.
-struct Inflow {
+struct Inflow<const W: usize> {
     target: usize,
     rate: f64,
     perm: Vec<u8>,
     /// Reset mask of the transition `target → d` as an `n_qubits` word with
     /// the x bit set on every masked position of `target`; `None` = no mask.
-    reset: Option<Word>,
+    reset: Option<Word<W>>,
 }
 
 /// `M` per-species Lindbladians coupled by first-order exchange; see the
 /// module docs for the equation of motion and the row encoding.
-pub struct BlockLindbladSpec {
+pub struct BlockLindbladSpec<const W: usize = W_CHUNKS> {
     n_qubits: usize,
     n_species: usize,
     /// Species digits appended to every word (`⌈log₄ M⌉`, 0 for `M = 1`).
     n_digits: usize,
-    species: Vec<LindbladSpec>,
+    species: Vec<LindbladSpec<W>>,
     /// `exchange[c][d] = k_cd`, the rate `c → d` (diagonal zero).
     exchange: Vec<Vec<f64>>,
     /// `rate_out[d] = Σ_c k_dc`: the Heisenberg diagonal of species `d`.
     rate_out: Vec<f64>,
     /// `inflow[d]`: the species `c` whose observables receive weight from
     /// the rows of species `d` (`k_cd > 0`), with the matching `π_cd`.
-    inflow: Vec<Vec<Inflow>>,
+    inflow: Vec<Vec<Inflow<W>>>,
     /// Reset masks as given: `(c, d, positions of c reset on c → d)`.
     resets: Vec<(usize, usize, Vec<usize>)>,
 }
 
-impl BlockLindbladSpec {
+impl<const W: usize> BlockLindbladSpec<W> {
     /// Couple `species` (one `LindbladSpec` per species, all on `n_qubits`)
     /// by the rate matrix `exchange` (`exchange[c][d] = k_cd ≥ 0`, diagonal
     /// ignored) and the `matchings` `(c, d, perm)` with `perm[p]` = position
@@ -98,7 +98,7 @@ impl BlockLindbladSpec {
     /// the identity.
     pub fn new(
         n_qubits: usize,
-        species: Vec<LindbladSpec>,
+        species: Vec<LindbladSpec<W>>,
         exchange: &[Vec<f64>],
         matchings: &[(usize, usize, Vec<usize>)],
     ) -> Result<Self, Error> {
@@ -113,7 +113,7 @@ impl BlockLindbladSpec {
     /// [`Self::new`] exactly.
     pub fn with_resets(
         n_qubits: usize,
-        species: Vec<LindbladSpec>,
+        species: Vec<LindbladSpec<W>>,
         exchange: &[Vec<f64>],
         matchings: &[(usize, usize, Vec<usize>)],
         resets: &[(usize, usize, Vec<usize>)],
@@ -136,8 +136,11 @@ impl BlockLindbladSpec {
         while (1usize << (2 * n_digits)) < m {
             n_digits += 1;
         }
-        if n_qubits + n_digits > MAX_QUBITS {
-            return Err(Error::TooManyQubits { got: n_qubits + n_digits });
+        if n_qubits + n_digits > max_qubits_for(W) {
+            return Err(Error::TooManyQubits {
+                got: n_qubits + n_digits,
+                max: max_qubits_for(W),
+            });
         }
         if exchange.len() != m || exchange.iter().any(|row| row.len() != m) {
             return Err(Error::LengthMismatch {
@@ -190,12 +193,12 @@ impl BlockLindbladSpec {
             }
         }
         // Reset masks: one word per (c, d) with the x bit set on the masked positions of c.
-        let mut masks: FxHashMap<(usize, usize), Word> = FxHashMap::default();
+        let mut masks: FxHashMap<(usize, usize), Word<W>> = FxHashMap::default();
         for (c, d, positions) in resets {
             if *c >= m || *d >= m || c == d || k[*c][*d] == 0.0 || masks.contains_key(&(*c, *d)) {
                 return Err(Error::InvalidReset { c: *c, d: *d });
             }
-            let mut w = Word::new(n_qubits);
+            let mut w = Word::<W>::new(n_qubits);
             for &q in positions {
                 if q >= n_qubits {
                     return Err(Error::InvalidReset { c: *c, d: *d });
@@ -208,7 +211,7 @@ impl BlockLindbladSpec {
             }
         }
         let mut rate_out = vec![0.0; m];
-        let mut inflow: Vec<Vec<Inflow>> = (0..m).map(|_| Vec::new()).collect();
+        let mut inflow: Vec<Vec<Inflow<W>>> = (0..m).map(|_| Vec::new()).collect();
         for c in 0..m {
             for d in 0..m {
                 if c == d || k[c][d] == 0.0 {
@@ -243,7 +246,7 @@ impl BlockLindbladSpec {
     /// Whether `w` (an `n_qubits` word) has a non-identity letter on a
     /// position of `mask` (x bits).
     #[inline]
-    fn hits_mask(w: &Word, mask: &Word) -> bool {
+    fn hits_mask(w: &Word<W>, mask: &Word<W>) -> bool {
         w.xbits
             .data
             .iter()
@@ -281,7 +284,7 @@ impl BlockLindbladSpec {
     }
 
     /// The Lindbladian of one species.
-    pub fn species(&self, s: usize) -> Result<&LindbladSpec, Error> {
+    pub fn species(&self, s: usize) -> Result<&LindbladSpec<W>, Error> {
         self.species.get(s).ok_or(Error::SpeciesOutOfRange {
             got: s,
             n_species: self.n_species,
@@ -301,7 +304,7 @@ impl BlockLindbladSpec {
     // ────────────────── row encoding ──────────────────
 
     /// Block row from `n_qubits` Pauli codes and a species index.
-    pub fn encode_row(&self, codes: &[u8], species: usize) -> Result<Word, Error> {
+    pub fn encode_row(&self, codes: &[u8], species: usize) -> Result<Word<W>, Error> {
         if codes.len() != self.n_qubits {
             return Err(Error::WrongLength {
                 expected: self.n_qubits,
@@ -314,7 +317,7 @@ impl BlockLindbladSpec {
                 n_species: self.n_species,
             });
         }
-        let mut w = Word::new(self.row_len());
+        let mut w = Word::<W>::new(self.row_len());
         for (q, &b) in codes.iter().enumerate() {
             if b > 3 {
                 return Err(Error::InvalidPauliCode { code: b });
@@ -333,7 +336,7 @@ impl BlockLindbladSpec {
 
     /// Inverse of [`Self::encode_row`]: the physical codes into `codes`
     /// (length `n_qubits`) and the species index returned.
-    pub fn decode_row(&self, w: &Word, codes: &mut [u8]) -> usize {
+    pub fn decode_row(&self, w: &Word<W>, codes: &mut [u8]) -> usize {
         debug_assert_eq!(codes.len(), self.n_qubits);
         for (q, slot) in codes.iter_mut().enumerate() {
             *slot = (w.xbits[q] as u8) | ((w.zbits[q] as u8) << 1);
@@ -342,12 +345,12 @@ impl BlockLindbladSpec {
     }
 
     /// Species index of a row word.
-    pub fn species_of(&self, w: &Word) -> usize {
+    pub fn species_of(&self, w: &Word<W>) -> usize {
         self.read_digits(w)
     }
 
     #[inline]
-    fn write_digits(&self, w: &mut Word, species: usize) {
+    fn write_digits(&self, w: &mut Word<W>, species: usize) {
         for j in 0..self.n_digits {
             let code = (species >> (2 * j)) & 3;
             let q = self.n_qubits + j;
@@ -357,7 +360,7 @@ impl BlockLindbladSpec {
     }
 
     #[inline]
-    fn read_digits(&self, w: &Word) -> usize {
+    fn read_digits(&self, w: &Word<W>) -> usize {
         let mut s = 0usize;
         for j in 0..self.n_digits {
             let q = self.n_qubits + j;
@@ -371,9 +374,9 @@ impl BlockLindbladSpec {
     /// length set to `n_qubits`, so the species spec's support loops see a
     /// plain `N`-qubit string.
     #[inline]
-    fn detach(&self, p: &Word) -> (usize, Word) {
+    fn detach(&self, p: &Word<W>) -> (usize, Word<W>) {
         let s = self.read_digits(p);
-        let mut phys = Word::new(self.n_qubits);
+        let mut phys = Word::<W>::new(self.n_qubits);
         phys.xbits.data = p.xbits.data;
         phys.zbits.data = p.zbits.data;
         for j in 0..self.n_digits {
@@ -387,8 +390,8 @@ impl BlockLindbladSpec {
 
     /// Physical `N`-qubit word → row word of species `s`.
     #[inline]
-    fn attach(&self, w: &Word, s: usize) -> Word {
-        let mut row = Word::new(self.row_len());
+    fn attach(&self, w: &Word<W>, s: usize) -> Word<W> {
+        let mut row = Word::<W>::new(self.row_len());
         row.xbits.data = w.xbits.data;
         row.zbits.data = w.zbits.data;
         self.write_digits(&mut row, s);
@@ -398,8 +401,8 @@ impl BlockLindbladSpec {
 
     /// `Π† P Π` for the matching `perm`: `out[p] = w[perm[p]]` (no phase).
     #[inline]
-    fn permute(&self, w: &Word, perm: &[u8]) -> Word {
-        let mut out = Word::new(self.n_qubits);
+    fn permute(&self, w: &Word<W>, perm: &[u8]) -> Word<W> {
+        let mut out = Word::<W>::new(self.n_qubits);
         for (p, &q) in perm.iter().enumerate() {
             let q = q as usize;
             if w.xbits[q] {
@@ -419,11 +422,11 @@ impl BlockLindbladSpec {
     /// without the input coefficient; deduplicated.
     pub(crate) fn compute_action_terms(
         &self,
-        p: &Word,
+        p: &Word<W>,
         scratch_support: &mut Vec<u32>,
         scratch_cands: &mut Vec<u32>,
-        scratch_local: &mut FxHashMap<Word, Complex<f64>>,
-    ) -> Vec<(Word, f64)> {
+        scratch_local: &mut FxHashMap<Word<W>, Complex<f64>>,
+    ) -> Vec<(Word<W>, f64)> {
         let (d, phys) = self.detach(p);
         let terms =
             self.species[d].compute_action_terms(&phys, scratch_support, scratch_cands, scratch_local);
@@ -456,7 +459,7 @@ impl BlockLindbladSpec {
         out
     }
 
-    fn scratch(&self) -> (Vec<u32>, Vec<u32>, FxHashMap<Word, Complex<f64>>) {
+    fn scratch(&self) -> (Vec<u32>, Vec<u32>, FxHashMap<Word<W>, Complex<f64>>) {
         (
             Vec::with_capacity(self.n_qubits),
             Vec::with_capacity(128),
@@ -465,7 +468,7 @@ impl BlockLindbladSpec {
     }
 
     /// Apply `L*_block` to a single row word.
-    pub fn action(&self, p: &Word) -> Vec<(Word, f64)> {
+    pub fn action(&self, p: &Word<W>) -> Vec<(Word<W>, f64)> {
         let (mut s1, mut s2, mut lm) = self.scratch();
         self.compute_action_terms(p, &mut s1, &mut s2, &mut lm)
     }
@@ -475,12 +478,12 @@ impl BlockLindbladSpec {
     /// exactly as [`LindbladSpec::leakage_with_prune`].
     pub fn leakage_with_prune(
         &self,
-        basis: &[Word],
+        basis: &[Word<W>],
         coeffs: &[f64],
-        protected: &[Word],
+        protected: &[Word<W>],
         max_basis: usize,
         tau_add: f64,
-    ) -> Result<Vec<(Word, f64)>, Error> {
+    ) -> Result<Vec<(Word<W>, f64)>, Error> {
         if basis.len() != coeffs.len() {
             return Err(Error::LengthMismatch {
                 what: "basis and coeffs",
@@ -500,9 +503,9 @@ impl BlockLindbladSpec {
         });
         const CHUNK_SIZE: usize = 4096;
         let room = max_basis.saturating_sub(basis.len());
-        let mut merged: FxHashMap<Word, f64> = FxHashMap::default();
+        let mut merged: FxHashMap<Word<W>, f64> = FxHashMap::default();
         for chunk_indices in order.chunks(CHUNK_SIZE) {
-            let local: Vec<Vec<(Word, f64)>> = chunk_indices
+            let local: Vec<Vec<(Word<W>, f64)>> = chunk_indices
                 .par_iter()
                 .map_init(
                     || self.scratch(),
@@ -548,16 +551,16 @@ impl BlockLindbladSpec {
     /// Uncapped leakage ([`Self::leakage_with_prune`] with no room limit).
     pub fn leakage(
         &self,
-        basis: &[Word],
+        basis: &[Word<W>],
         coeffs: &[f64],
-        protected: &[Word],
-    ) -> Result<Vec<(Word, f64)>, Error> {
+        protected: &[Word<W>],
+    ) -> Result<Vec<(Word<W>, f64)>, Error> {
         self.leakage_with_prune(basis, coeffs, protected, usize::MAX, 0.0)
     }
 
     /// Sparse generator in COO form `(row, col, val)` on `basis` (rows that
     /// leave the basis are dropped), as [`LindbladSpec::generator`].
-    pub fn generator(&self, basis: &[Word]) -> Vec<(usize, usize, f64)> {
+    pub fn generator(&self, basis: &[Word<W>]) -> Vec<(usize, usize, f64)> {
         let index = build_basis_index(basis);
         let local: Vec<Vec<(usize, usize, f64)>> = basis
             .par_iter()
@@ -589,10 +592,10 @@ impl BlockLindbladSpec {
     /// (`max_basis` counts rows over all species).
     pub fn pc_step(
         &self,
-        basis: &mut Vec<Word>,
+        basis: &mut Vec<Word<W>>,
         coeffs: &mut Vec<f64>,
         dt: f64,
-        protected: &[Word],
+        protected: &[Word<W>],
         cfg: &PcStepConfig,
     ) -> Result<(), Error> {
         if let Some(n) = cfg.num_threads {
@@ -608,10 +611,10 @@ impl BlockLindbladSpec {
 
     fn pc_step_inner(
         &self,
-        basis: &mut Vec<Word>,
+        basis: &mut Vec<Word<W>>,
         coeffs: &mut Vec<f64>,
         dt: f64,
-        protected: &[Word],
+        protected: &[Word<W>],
         cfg: &PcStepConfig,
     ) -> Result<(), Error> {
         let PcStepConfig {
@@ -636,18 +639,18 @@ impl BlockLindbladSpec {
     }
 }
 
-impl ActionTerms for BlockLindbladSpec {
+impl<const W: usize> ActionTerms<W> for BlockLindbladSpec<W> {
     fn scratch_qubits(&self) -> usize {
         self.n_qubits
     }
 
     fn action_terms(
         &self,
-        p: &Word,
+        p: &Word<W>,
         s1: &mut Vec<u32>,
         s2: &mut Vec<u32>,
-        lm: &mut FxHashMap<Word, Complex<f64>>,
-    ) -> Vec<(Word, f64)> {
+        lm: &mut FxHashMap<Word<W>, Complex<f64>>,
+    ) -> Vec<(Word<W>, f64)> {
         self.compute_action_terms(p, s1, s2, lm)
     }
 }
@@ -657,19 +660,19 @@ mod tests {
     use super::*;
     use crate::parse_pauli_string;
 
-    fn spec(n: usize, h: &[(&str, f64)]) -> LindbladSpec {
+    fn spec(n: usize, h: &[(&str, f64)]) -> LindbladSpec<W_CHUNKS> {
         let terms: Vec<(String, f64)> = h.iter().map(|(s, c)| (s.to_string(), *c)).collect();
-        LindbladSpec::new(n, &terms, &[]).unwrap()
+        LindbladSpec::<W_CHUNKS>::new(n, &terms, &[]).unwrap()
     }
 
-    fn row(block: &BlockLindbladSpec, s: &str, species: usize) -> Word {
-        let (w, _) = parse_pauli_string(s, block.n_qubits()).unwrap();
+    fn row(block: &BlockLindbladSpec<W_CHUNKS>, s: &str, species: usize) -> Word {
+        let (w, _): (Word, _) = parse_pauli_string(s, block.n_qubits()).unwrap();
         let mut codes = vec![0u8; block.n_qubits()];
         crate::codes_from_word(&w, &mut codes);
         block.encode_row(&codes, species).unwrap()
     }
 
-    fn as_map(block: &BlockLindbladSpec, terms: Vec<(Word, f64)>) -> FxHashMap<(usize, String), f64> {
+    fn as_map(block: &BlockLindbladSpec<W_CHUNKS>, terms: Vec<(Word, f64)>) -> FxHashMap<(usize, String), f64> {
         let mut out = FxHashMap::default();
         for (w, c) in terms {
             let mut codes = vec![0u8; block.n_qubits()];
@@ -686,9 +689,9 @@ mod tests {
     /// Rows round-trip through the digit encoding for every species.
     #[test]
     fn row_codec_roundtrip() {
-        let specs: Vec<LindbladSpec> = (0..5).map(|_| spec(3, &[("ZII", 1.0)])).collect();
+        let specs: Vec<LindbladSpec<W_CHUNKS>> = (0..5).map(|_| spec(3, &[("ZII", 1.0)])).collect();
         let k = vec![vec![0.0; 5]; 5];
-        let block = BlockLindbladSpec::new(3, specs, &k, &[]).unwrap();
+        let block = BlockLindbladSpec::<W_CHUNKS>::new(3, specs, &k, &[]).unwrap();
         assert_eq!(block.n_digits(), 2);
         for s in 0..5 {
             let codes = [1u8, 3, 2];
@@ -707,7 +710,7 @@ mod tests {
         let (a, b, k01, k10) = (0.4, 1.1, 0.3, 0.7);
         let specs = vec![spec(1, &[("Z", a)]), spec(1, &[("X", b)])];
         let k = vec![vec![0.0, k01], vec![k10, 0.0]];
-        let block = BlockLindbladSpec::new(1, specs, &k, &[]).unwrap();
+        let block = BlockLindbladSpec::<W_CHUNKS>::new(1, specs, &k, &[]).unwrap();
         // Row (1, Y): L_1*(Y) = i b [X, Y] = -2 b Z; inflow to species 0 at
         // k_01 (reaction 0 -> 1 moves the observable from 1 to 0); diagonal
         // -k_10 (species 1 leaves at k_10).
@@ -729,9 +732,9 @@ mod tests {
     /// trace preservation).
     #[test]
     fn total_identity_is_conserved() {
-        let specs: Vec<LindbladSpec> = (0..3).map(|_| spec(2, &[("ZZ", 0.5)])).collect();
+        let specs: Vec<LindbladSpec<W_CHUNKS>> = (0..3).map(|_| spec(2, &[("ZZ", 0.5)])).collect();
         let k = vec![vec![0.0, 1.0, 2.0], vec![0.5, 0.0, 0.0], vec![3.0, 4.0, 0.0]];
-        let block = BlockLindbladSpec::new(2, specs, &k, &[]).unwrap();
+        let block = BlockLindbladSpec::<W_CHUNKS>::new(2, specs, &k, &[]).unwrap();
         let basis: Vec<Word> = (0..3).map(|s| row(&block, "II", s)).collect();
         let coo = block.generator(&basis);
         let mut rowsum = [0.0; 3];
@@ -753,10 +756,10 @@ mod tests {
     /// inverse is filled in for the reverse transition.
     #[test]
     fn matching_permutes_letters_and_inverse_is_completed() {
-        let specs: Vec<LindbladSpec> = (0..2).map(|_| spec(3, &[])).collect();
+        let specs: Vec<LindbladSpec<W_CHUNKS>> = (0..2).map(|_| spec(3, &[])).collect();
         let k = vec![vec![0.0, 2.0], vec![5.0, 0.0]];
         let perm = vec![1usize, 2, 0]; // qubit 0 of c sits at 1 in d, 1 at 2, 2 at 0
-        let block = BlockLindbladSpec::new(3, specs, &k, &[(0, 1, perm)]).unwrap();
+        let block = BlockLindbladSpec::<W_CHUNKS>::new(3, specs, &k, &[(0, 1, perm)]).unwrap();
         // row of species 1: "XZI"; into species 0 at k_01 = 2 with out[p] = P[perm[p]] -> "ZIX"
         let out = as_map(&block, block.action(&row(&block, "XZI", 1)));
         assert!((out[&(0, "ZIX".into())] - 2.0).abs() < 1e-14);
@@ -765,7 +768,7 @@ mod tests {
         let out = as_map(&block, block.action(&row(&block, "ZIX", 0)));
         assert!((out[&(1, "XZI".into())] - 5.0).abs() < 1e-14);
         assert!((out[&(0, "ZIX".into())] + 2.0).abs() < 1e-14);
-        assert!(BlockLindbladSpec::new(3, vec![spec(3, &[]), spec(3, &[])], &k, &[(0, 1, vec![0, 0, 1])]).is_err());
+        assert!(BlockLindbladSpec::<W_CHUNKS>::new(3, vec![spec(3, &[]), spec(3, &[])], &k, &[(0, 1, vec![0, 0, 1])]).is_err());
     }
 
     /// A reset mask drops the inflow of strings with a non-identity letter on
@@ -774,12 +777,12 @@ mod tests {
     /// identity stays conserved (trace preservation).
     #[test]
     fn reset_mask_drops_masked_inflow_only() {
-        let specs: Vec<LindbladSpec> = (0..2).map(|_| spec(2, &[])).collect();
+        let specs: Vec<LindbladSpec<W_CHUNKS>> = (0..2).map(|_| spec(2, &[])).collect();
         let k = vec![vec![0.0, 2.0], vec![5.0, 0.0]];
         // species 0 = {F, pad}, species 1 = {F, P}: on 0 -> 1 the pad (position 1 of 0) is
         // replaced by the unit state, on 1 -> 0 the P (position 1 of 1) is traced out.
         let resets = vec![(0usize, 1usize, vec![1usize]), (1, 0, vec![1])];
-        let block = BlockLindbladSpec::with_resets(2, specs, &k, &[], &resets).unwrap();
+        let block = BlockLindbladSpec::<W_CHUNKS>::with_resets(2, specs, &k, &[], &resets).unwrap();
         assert_eq!(block.resets().len(), 2);
         // row (1, "ZI"): identity on the masked position -> feeds (0, "ZI") at k_01 = 2
         let out = as_map(&block, block.action(&row(&block, "ZI", 1)));
@@ -804,12 +807,12 @@ mod tests {
         // errors: no transition, bad qubit, duplicate pair
         let mk = || (0..2).map(|_| spec(2, &[])).collect::<Vec<_>>();
         let k0 = vec![vec![0.0, 2.0], vec![0.0, 0.0]];
-        assert!(BlockLindbladSpec::with_resets(2, mk(), &k0, &[], &[(1, 0, vec![1])]).is_err());
-        assert!(BlockLindbladSpec::with_resets(2, mk(), &k, &[], &[(0, 1, vec![2])]).is_err());
-        assert!(BlockLindbladSpec::with_resets(2, mk(), &k, &[], &[(0, 1, vec![0]), (0, 1, vec![1])]).is_err());
+        assert!(BlockLindbladSpec::<W_CHUNKS>::with_resets(2, mk(), &k0, &[], &[(1, 0, vec![1])]).is_err());
+        assert!(BlockLindbladSpec::<W_CHUNKS>::with_resets(2, mk(), &k, &[], &[(0, 1, vec![2])]).is_err());
+        assert!(BlockLindbladSpec::<W_CHUNKS>::with_resets(2, mk(), &k, &[], &[(0, 1, vec![0]), (0, 1, vec![1])]).is_err());
         // no masks: bit-identical to `new`
-        let a = BlockLindbladSpec::with_resets(2, mk(), &k, &[], &[]).unwrap();
-        let b = BlockLindbladSpec::new(2, mk(), &k, &[]).unwrap();
+        let a = BlockLindbladSpec::<W_CHUNKS>::with_resets(2, mk(), &k, &[], &[]).unwrap();
+        let b = BlockLindbladSpec::<W_CHUNKS>::new(2, mk(), &k, &[]).unwrap();
         let ra = as_map(&a, a.action(&row(&a, "XZ", 1)));
         let rb = as_map(&b, b.action(&row(&b, "XZ", 1)));
         assert_eq!(ra, rb);
@@ -821,7 +824,7 @@ mod tests {
     fn pc_step_matches_generator_exponential() {
         let specs = vec![spec(1, &[("Z", 0.9)]), spec(1, &[("X", 0.3), ("Z", 0.2)])];
         let k = vec![vec![0.0, 0.8], vec![0.5, 0.0]];
-        let block = BlockLindbladSpec::new(1, specs, &k, &[]).unwrap();
+        let block = BlockLindbladSpec::<W_CHUNKS>::new(1, specs, &k, &[]).unwrap();
         // full basis: 2 species x 4 strings
         let basis: Vec<Word> = (0..2)
             .flat_map(|s| ["I", "X", "Z", "Y"].into_iter().map(move |p| (s, p)))

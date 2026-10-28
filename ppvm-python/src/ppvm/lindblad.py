@@ -44,6 +44,62 @@ from typing import Union
 import numpy as np
 
 from ._core import LindbladSpec as _LindbladSpec
+from ._core import lindblad_chunk_bits as _chunk_bits
+from ._core import lindblad_max_qubits as _max_qubits
+from ._core import lindblad_word_width_for as _word_width_for
+from ._core import lindblad_word_widths as _word_widths
+
+#: Bits (= qubits) per chunk of the packed Pauli word: 64 on 64-bit targets.
+CHUNK_BITS: int = int(_chunk_bits())
+#: The Pauli-word widths (chunks) compiled into the extension, ascending; the
+#: Rust crate is generic over the width and the Python boundary dispatches on
+#: ``n_qubits`` to the smallest one that holds it (``W = 2`` is the historical
+#: 128-qubit word and its code path, bit for bit).
+WORD_WIDTHS: tuple[int, ...] = tuple(int(w) for w, _ in _word_widths())
+#: ``{width: max qubits}`` for every compiled width (``W * CHUNK_BITS``).
+WORD_WIDTH_MAX_QUBITS: dict[int, int] = {int(w): int(m) for w, m in _word_widths()}
+#: The largest ``n_qubits`` any compiled width holds (1088 for the widths
+#: ``(2, 4, 8, 16, 17)`` on a 64-bit target).
+MAX_QUBITS: int = int(_max_qubits())
+
+
+def max_qubits() -> int:
+    """The largest ``n_qubits`` a `Lindbladian` / `BlockLindbladian` of this
+    build accepts (the top compiled Pauli-word width times `CHUNK_BITS`)."""
+    return MAX_QUBITS
+
+
+def word_widths() -> tuple[int, ...]:
+    """The compiled Pauli-word widths in chunks, ascending (`WORD_WIDTHS`)."""
+    return WORD_WIDTHS
+
+
+def word_width(n_qubits: int) -> int:
+    """The width (chunks) a `Lindbladian` of ``n_qubits`` dispatches to.
+
+    Raises ``ValueError`` (the constructor's message, naming the limit and the
+    knob) when ``n_qubits`` exceeds `MAX_QUBITS`.
+    """
+    w, _ = _word_width_for(int(n_qubits))
+    return int(w)
+
+
+def word_bytes(width: int) -> int:
+    """Bytes of one packed Pauli word at ``width`` chunks: ``2 * width *
+    CHUNK_BITS // 8 + 16`` (x bits, z bits, qubit count, cached hash); a basis
+    string costs this plus its 8-byte coefficient."""
+    return 2 * int(width) * CHUNK_BITS // 8 + 16
+
+
+def _check_n_qubits(n_qubits: int, what: str) -> None:
+    if n_qubits > MAX_QUBITS:
+        raise ValueError(
+            f"{what} supports n_qubits ≤ {MAX_QUBITS}; got {n_qubits}. The limit is the largest "
+            f"Pauli-word width compiled into this ppvm build (W = {WORD_WIDTHS[-1]} chunks of "
+            f"{CHUNK_BITS} bits; compiled widths {WORD_WIDTHS}); a larger system needs a build with "
+            f"a wider entry in WORD_WIDTHS (crates/ppvm-python-native/src/lindblad.rs). "
+            f"The installed maximum is ppvm.lindblad.max_qubits()"
+        )
 
 _PAULI_CODE = {"I": 0, "X": 1, "Z": 2, "Y": 3}
 # Lookup table mapping code -> ASCII byte for vectorised string output.
@@ -154,6 +210,12 @@ class Lindbladian:
         Pauli linear combination such as `sigma_plus` or
         `sigma_minus`. ``rate`` is the non-negative GKSL rate
         ``γ_k``.
+    word_width:
+        Optional Pauli-word width in chunks (one of `WORD_WIDTHS`) to force a
+        wider instantiation than ``n_qubits`` needs (tests, benchmarks of the
+        width cost). ``None`` (default) dispatches to the smallest compiled
+        width that holds ``n_qubits``; ``n_qubits`` above `MAX_QUBITS`
+        raises ``ValueError`` before anything is built.
     kossakowski:
         Optional ``(ops, K)`` pair adding a Kossakowski-form dissipator
         ``D*(O) = Σ_nm K_nm (A_n† O A_m − ½{A_n†A_m, O})``. ``ops`` is a
@@ -197,8 +259,10 @@ class Lindbladian:
         h_terms: Iterable[tuple[str, float]],
         jump_terms: Iterable[tuple[str | PauliLincomb, float]] = (),
         kossakowski: tuple[Sequence[str | PauliLincomb], object] | None = None,
+        word_width: int | None = None,
     ):
         self.n_qubits = int(n_qubits)
+        _check_n_qubits(self.n_qubits, "Lindbladian")
         h_strs: list[str] = []
         h_coeffs: list[float] = []
         for s, c in h_terms:
@@ -217,8 +281,26 @@ class Lindbladian:
             K = self._validate_k(K, len(k_ops), check_psd=True, what="kossakowski K")
             k_mat = [[(float(v.real), float(v.imag)) for v in row] for row in K]
         self._spec = _LindbladSpec(
-            self.n_qubits, h_strs, h_coeffs, j_lincombs, j_rates, k_ops, k_mat
+            self.n_qubits, h_strs, h_coeffs, j_lincombs, j_rates, k_ops, k_mat,
+            None if word_width is None else int(word_width),
         )
+
+    @property
+    def word_width(self) -> int:
+        """The Pauli-word width (chunks of `CHUNK_BITS` bits) this object was
+        instantiated with; ``2`` is the historical 128-qubit word."""
+        return self._spec.word_width
+
+    @property
+    def max_qubits(self) -> int:
+        """The largest ``n_qubits`` this object's word width holds."""
+        return self._spec.max_qubits
+
+    @property
+    def word_bytes(self) -> int:
+        """Bytes of one packed Pauli word at this width (``16 * W + 16`` on
+        64-bit targets); a basis string costs this plus its 8-byte coefficient."""
+        return self._spec.word_bytes
 
     @classmethod
     def _validate_k(cls, K, m: int, *, check_psd: bool, what: str) -> np.ndarray:
