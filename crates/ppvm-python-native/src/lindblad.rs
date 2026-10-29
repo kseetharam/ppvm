@@ -32,8 +32,8 @@ use numpy::{
     Complex64, IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
 };
 use ppvm_lindblad::{
-    CHUNK_BITS, JumpInput, LindbladSpec as CoreSpec, Word, codes_from_word, max_qubits_for,
-    word_from_codes,
+    CHUNK_BITS, Csr, CsrC, FactorBlockInput, JumpInput, LindbladSpec as CoreSpec, Word,
+    codes_from_word, max_qubits_for, word_from_codes,
 };
 use pyo3::{exceptions::PyValueError, prelude::*};
 
@@ -425,6 +425,149 @@ pub fn lindblad_chunk_bits() -> usize {
 pub fn lindblad_word_width_for(n_qubits: usize) -> PyResult<(usize, usize)> {
     let w = pick_width(n_qubits, None, "LindbladSpec")?;
     Ok((w, max_qubits_for(w)))
+}
+
+type PyMaskFlat<'py> = (
+    PyReadonlyArray1<'py, i64>,
+    PyReadonlyArray1<'py, i64>,
+    PyReadonlyArray1<'py, f64>,
+    PyReadonlyArray1<'py, i64>,
+);
+type PyPrivateFlat<'py> = (
+    PyReadonlyArray1<'py, i64>,
+    PyReadonlyArray1<'py, i64>,
+    PyReadonlyArray1<'py, Complex64>,
+    PyReadonlyArray1<'py, i64>,
+);
+
+/// One block's slice of a concatenated block-local CSR (`indptr` slices by
+/// `offsets`, `indices` / `data` by the running nnz).
+fn csr_block<'a, T: Copy>(
+    what: &str,
+    b: usize,
+    s: usize,
+    indptr: &[i64],
+    indices: &[i64],
+    data: &'a [T],
+    offsets: &[i64],
+    nnz_off: &mut usize,
+) -> PyResult<(Vec<usize>, Vec<usize>, Vec<T>)> {
+    let (lo, hi) = (offsets[b] as usize, offsets[b + 1] as usize);
+    if hi > indptr.len() || hi < lo || hi - lo != s + 1 {
+        return Err(PyValueError::new_err(format!(
+            "kossakowski factor: block {b}: {what} indptr slice [{lo}, {hi}) does not hold size + 1 = {} entries",
+            s + 1
+        )));
+    }
+    let ptr: Vec<usize> = indptr[lo..hi].iter().map(|&v| v as usize).collect();
+    let nnz = ptr[s];
+    if *nnz_off + nnz > indices.len() || indices.len() != data.len() {
+        return Err(PyValueError::new_err(format!(
+            "kossakowski factor: block {b}: {what} indices / data too short for {nnz} entries at offset {}",
+            *nnz_off
+        )));
+    }
+    let idx: Vec<usize> = indices[*nnz_off..*nnz_off + nnz].iter().map(|&v| v as usize).collect();
+    let dat: Vec<T> = data[*nnz_off..*nnz_off + nnz].to_vec();
+    *nnz_off += nnz;
+    Ok((ptr, idx, dat))
+}
+
+/// Decode the flat `nmr-csim-kfactor/1` layout (`sizes`, `ranks`, `G_values`
+/// block after block row-major, `D_values` block after block, optional masks /
+/// private parts as concatenated block-local CSR with `*_offsets` into
+/// `indptr`, optional `G_neg` as `G`) into per-block inputs.
+#[allow(clippy::too_many_arguments)]
+fn factor_blocks_from_flat(
+    sizes: &[usize],
+    ranks: &[usize],
+    g_values: &[Complex64],
+    d_values: &[f64],
+    mask: Option<&PyMaskFlat<'_>>,
+    neg_ranks: Option<&[usize]>,
+    g_neg_values: Option<&[Complex64]>,
+    private: Option<&PyPrivateFlat<'_>>,
+) -> PyResult<Vec<FactorBlockInput>> {
+    let nb = sizes.len();
+    if ranks.len() != nb {
+        return Err(PyValueError::new_err(format!("kossakowski factor: {nb} block sizes but {} ranks", ranks.len())));
+    }
+    let g_total: usize = sizes.iter().zip(ranks).map(|(s, r)| s * r).sum();
+    let d_total: usize = sizes.iter().sum();
+    if g_values.len() != g_total {
+        return Err(PyValueError::new_err(format!(
+            "kossakowski factor: G_values has {} entries, the blocks need sum(size x rank) = {g_total}",
+            g_values.len()
+        )));
+    }
+    if d_values.len() != d_total {
+        return Err(PyValueError::new_err(format!(
+            "kossakowski factor: D_values has {} entries, the blocks need sum(size) = {d_total}",
+            d_values.len()
+        )));
+    }
+    let neg_ranks: Vec<usize> = match neg_ranks {
+        None => vec![0; nb],
+        Some(r) if r.len() == nb => r.to_vec(),
+        Some(r) => {
+            return Err(PyValueError::new_err(format!("kossakowski factor: {nb} blocks but {} G_neg ranks", r.len())));
+        }
+    };
+    let gneg_total: usize = sizes.iter().zip(&neg_ranks).map(|(s, r)| s * r).sum();
+    let g_neg_values = g_neg_values.unwrap_or(&[]);
+    if g_neg_values.len() != gneg_total {
+        return Err(PyValueError::new_err(format!(
+            "kossakowski factor: G_neg_values has {} entries, the blocks need sum(size x rank_neg) = {gneg_total}",
+            g_neg_values.len()
+        )));
+    }
+    let mask_sl = match mask {
+        None => None,
+        Some((a, b, c, d)) => Some((a.as_slice()?, b.as_slice()?, c.as_slice()?, d.as_slice()?)),
+    };
+    let priv_sl = match private {
+        None => None,
+        Some((a, b, c, d)) => Some((a.as_slice()?, b.as_slice()?, c.as_slice()?, d.as_slice()?)),
+    };
+    for (name, off) in [("mask", mask_sl.map(|t| t.3)), ("private", priv_sl.map(|t| t.3))] {
+        if let Some(off) = off {
+            if off.len() != nb + 1 {
+                return Err(PyValueError::new_err(format!(
+                    "kossakowski factor: {name}_offsets has {} entries, expected n_blocks + 1 = {}",
+                    off.len(),
+                    nb + 1
+                )));
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(nb);
+    let (mut g_off, mut gn_off, mut d_off, mut m_nnz, mut p_nnz) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    for (b, (&s, &r)) in sizes.iter().zip(ranks).enumerate() {
+        let rn = neg_ranks[b];
+        let g: Vec<Complex<f64>> = g_values[g_off..g_off + s * r].iter().map(|c| Complex::new(c.re, c.im)).collect();
+        let g_neg: Vec<Complex<f64>> =
+            g_neg_values[gn_off..gn_off + s * rn].iter().map(|c| Complex::new(c.re, c.im)).collect();
+        let d: Vec<f64> = d_values[d_off..d_off + s].to_vec();
+        let mask = match mask_sl {
+            Some((ip, ix, dt, off)) => {
+                let (indptr, indices, data) = csr_block("mask", b, s, ip, ix, dt, off, &mut m_nnz)?;
+                Some(Csr { indptr, indices, data })
+            }
+            None => None,
+        };
+        let private = match priv_sl {
+            Some((ip, ix, dt, off)) => {
+                let (indptr, indices, data) = csr_block("private", b, s, ip, ix, dt, off, &mut p_nnz)?;
+                Some(CsrC { indptr, indices, data: data.into_iter().map(|c| Complex::new(c.re, c.im)).collect() })
+            }
+            None => None,
+        };
+        out.push(FactorBlockInput { size: s, rank: r, g, d, mask, rank_neg: rn, g_neg, private });
+        g_off += s * r;
+        gn_off += s * rn;
+        d_off += s;
+    }
+    Ok(out)
 }
 
 /// PyO3 facade exposing [`ppvm_lindblad::LindbladSpec`] to Python.
@@ -1076,6 +1219,105 @@ impl LindbladSpec {
     /// `(tuples, sets, exclusive sets, bytes)` of the support tables (builds the index).
     fn support_stats(&self) -> (usize, usize, usize, usize) {
         dispatch!(&self.inner, s => s.support_stats())
+    }
+
+    // ── factor-form Kossakowski dissipator (ppvm_lindblad::factor) ──
+
+    /// Add a factor-form Kossakowski dissipator `K_b = (G_b G_b†) ∘ W_b + diag(D_b)`
+    /// per block (the `nmr-csim-kfactor/1` flat layout): `ops` the operator
+    /// lincombs in block order, `sizes` / `ranks` per block, `g_values` the
+    /// row-major `G_b` concatenated (complex128), `d_values` the `D_b`
+    /// concatenated (float64), `mask` = `(indptr, indices, data, offsets)` the
+    /// block-local CSR masks concatenated (int64, int64, float64, int64) or
+    /// `None`. PSD is the caller's responsibility, as for `kossakowski_k`.
+    #[pyo3(signature = (ops, sizes, ranks, g_values, d_values, mask = None, neg_ranks = None, g_neg_values = None, private = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn add_kossakowski_factor(
+        &mut self,
+        ops: Vec<Vec<(String, f64, f64)>>,
+        sizes: Vec<usize>,
+        ranks: Vec<usize>,
+        g_values: PyReadonlyArray1<'_, Complex64>,
+        d_values: PyReadonlyArray1<'_, f64>,
+        mask: Option<PyMaskFlat<'_>>,
+        neg_ranks: Option<Vec<usize>>,
+        g_neg_values: Option<PyReadonlyArray1<'_, Complex64>>,
+        private: Option<PyPrivateFlat<'_>>,
+    ) -> PyResult<()> {
+        let ops = lincombs_from_triples(ops);
+        let gneg = match &g_neg_values {
+            Some(a) => Some(a.as_slice()?),
+            None => None,
+        };
+        let blocks = factor_blocks_from_flat(
+            &sizes, &ranks, g_values.as_slice()?, d_values.as_slice()?, mask.as_ref(), neg_ranks.as_deref(), gneg, private.as_ref(),
+        )?;
+        dispatch!(&mut self.inner, s => s.add_kossakowski_factor(&ops, &blocks).map_err(map_err))
+    }
+
+    /// Replace `G` / `D` / masks of the factor dissipator in place (same
+    /// operator table and block sizes); arguments as `add_kossakowski_factor`
+    /// without `ops`.
+    #[pyo3(signature = (sizes, ranks, g_values, d_values, mask = None, neg_ranks = None, g_neg_values = None, private = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn set_kossakowski_factor(
+        &mut self,
+        sizes: Vec<usize>,
+        ranks: Vec<usize>,
+        g_values: PyReadonlyArray1<'_, Complex64>,
+        d_values: PyReadonlyArray1<'_, f64>,
+        mask: Option<PyMaskFlat<'_>>,
+        neg_ranks: Option<Vec<usize>>,
+        g_neg_values: Option<PyReadonlyArray1<'_, Complex64>>,
+        private: Option<PyPrivateFlat<'_>>,
+    ) -> PyResult<()> {
+        let gneg = match &g_neg_values {
+            Some(a) => Some(a.as_slice()?),
+            None => None,
+        };
+        let blocks = factor_blocks_from_flat(
+            &sizes, &ranks, g_values.as_slice()?, d_values.as_slice()?, mask.as_ref(), neg_ranks.as_deref(), gneg, private.as_ref(),
+        )?;
+        dispatch!(&mut self.inner, s => s.set_kossakowski_factor(&blocks).map_err(map_err))
+    }
+
+    /// Number of operators of the factor dissipator (0 without one).
+    #[getter]
+    fn num_kossakowski_factor_ops(&self) -> usize {
+        dispatch!(&self.inner, s => s.num_kossakowski_factor_ops())
+    }
+
+    /// Number of factor blocks (0 without one).
+    #[getter]
+    fn num_kossakowski_factor_blocks(&self) -> usize {
+        dispatch!(&self.inner, s => s.num_kossakowski_factor_blocks())
+    }
+
+    /// `(factor_bytes, ops_bytes)` held by the factor dissipator.
+    #[getter]
+    fn kossakowski_factor_memory_bytes(&self) -> (usize, usize) {
+        dispatch!(&self.inner, s => s.kossakowski_factor_memory_bytes())
+    }
+
+    /// The absolute compile floor of the factor dissipator (`1e-14 · max_n K_nn`).
+    #[getter]
+    fn kossakowski_factor_floor(&self) -> f64 {
+        dispatch!(&self.inner, s => s.kossakowski_factor_floor())
+    }
+
+    /// Block `b` of the factor dissipator as a dense `(s_b, s_b)` complex128
+    /// array `K_b = (G G†) ∘ W + diag(D)` (inspection).
+    fn kossakowski_factor_dense_block<'py>(
+        &self,
+        py: Python<'py>,
+        b: usize,
+    ) -> PyResult<Bound<'py, PyArray2<Complex64>>> {
+        let k = dispatch!(&self.inner, s => s.kossakowski_factor_dense_block(b)).map_err(map_err)?;
+        let s = k.len();
+        let flat: Vec<Complex64> = k.into_iter().flatten().map(|c| Complex64::new(c.re, c.im)).collect();
+        flat.into_pyarray(py)
+            .reshape([s, s])
+            .map_err(|e| PyValueError::new_err(format!("reshape failed: {e}")))
     }
 
     /// Apply `L*` to a single Pauli string `p`.

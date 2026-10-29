@@ -43,6 +43,7 @@ use std::time::Instant;
 pub mod block;
 pub mod config;
 pub mod error;
+pub mod factor;
 pub(crate) mod expm;
 
 /// Matrix-free / quspin-expm-backed `exp(dt·L*)·b` engine. See module docs.
@@ -101,6 +102,7 @@ pub type Word<const W: usize = W_CHUNKS> = PauliWord<[Chunk; W], FxBuildHasher, 
 pub use block::BlockLindbladSpec;
 pub use config::PcStepConfig;
 pub use error::Error;
+pub use factor::{Csr, CsrC, FactorBlockInput};
 
 /// Per-phase timing breakdown (microseconds) returned by
 /// [`LindbladSpec::pc_step_timed`].
@@ -691,6 +693,14 @@ pub struct LindbladSpec<const W: usize = W_CHUNKS> {
     rd_cache: std::sync::Mutex<FxHashMap<Word<W>, (f64, f64)>>,
     /// The leakage merge's shard maps, kept across steps (their allocation and release cost a step 0.1–0.2 s).
     merge_scratch: std::sync::Mutex<Vec<FxHashMap<Word<W>, f64>>>,
+    /// Factor-form Kossakowski dissipator (`factor.rs`): its own operator
+    /// table, per-qubit support index, operator -> block map, the compiled
+    /// blocks and the absolute compile floor. All empty / 0 without one.
+    kf_ops: Vec<Vec<PauliTerm<W>>>,
+    kf_support: Vec<Vec<u32>>,
+    kf_block_of: Vec<u32>,
+    kf_blocks: Vec<factor::FactorBlock>,
+    kf_floor: f64,
 }
 
 /// User-facing description of one jump operator: a complex Pauli linear
@@ -799,6 +809,11 @@ impl<const W: usize> LindbladSpec<W> {
             transfer: std::sync::OnceLock::new(),
             rd_cache: std::sync::Mutex::new(FxHashMap::default()),
             merge_scratch: std::sync::Mutex::new(Vec::new()),
+            kf_ops: Vec::new(),
+            kf_support: Vec::new(),
+            kf_block_of: Vec::new(),
+            kf_blocks: Vec::new(),
+            kf_floor: 0.0,
         })
     }
 
@@ -2142,6 +2157,11 @@ impl<const W: usize> LindbladSpec<W> {
                     }
                 }
             }
+        }
+
+        // ── factor-form dissipator (factor.rs; no-op without one) ─────
+        if !self.kf_blocks.is_empty() {
+            self.factor_action(p, scratch_support, scratch_cands, local);
         }
 
         // L* preserves Hermiticity; imaginary parts must cancel to FP noise.

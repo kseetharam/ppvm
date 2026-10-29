@@ -386,7 +386,7 @@ fn locality_step_on_register_qubits_above_255() {
     let mut spec = LindbladSpec::<W>::new(n, &h, &jumps).unwrap();
     spec.add_kossakowski(&ops, &k).unwrap();
     // the grouped action bitwise against the legacy action on words touching the block
-    let mut word = |pairs: &[(usize, char)]| -> String {
+    let word = |pairs: &[(usize, char)]| -> String {
         let mut s = vec!['I'; n];
         for &(q, c) in pairs {
             s[q] = c;
