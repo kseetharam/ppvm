@@ -43,6 +43,17 @@ pub struct PcStepConfig {
     /// thread pool of `n` threads (useful for benchmarking parallel
     /// scaling). When `None`, the global rayon pool is used.
     pub num_threads: Option<usize>,
+    /// Run the locality-aware step ([`crate::locality`]): the generator is
+    /// built from the dissipator's transfer index and a per-word raw / diag
+    /// cache instead of a full action pass, the leakage merge is sharded
+    /// across threads, the discarded second leakage pass is skipped and the
+    /// corrector reuses the predictor's generator when nothing was admitted.
+    /// Every action coefficient, generator entry and leakage value is the
+    /// legacy one bit for bit; the admitted strings enter the basis sorted by
+    /// word rather than in hash-map order, which changes the association
+    /// order of the matvec reduction (round-off level). `false` (default) is
+    /// the legacy step.
+    pub locality: bool,
 }
 
 impl Default for PcStepConfig {
@@ -56,6 +67,7 @@ impl Default for PcStepConfig {
             drop_tol: 0.0,
             tau_add: None,
             num_threads: None,
+            locality: false,
         }
     }
 }

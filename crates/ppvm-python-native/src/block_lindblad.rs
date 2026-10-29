@@ -481,6 +481,7 @@ impl BlockLindbladSpec {
             drop_tol,
             tau_add,
             num_threads,
+            locality: false,
         };
         dispatch!(&self.inner, s => pc_step_impl(
             s, py, basis, species, coeffs, dt, cfg, protected_basis, protected_species))

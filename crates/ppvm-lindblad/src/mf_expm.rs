@@ -251,6 +251,26 @@ where
     }
 }
 
+/// The per-call generator cache of [`expm_apply_mf`]: the CSC columns of the
+/// in-basis action and the per-column `(raw, diag)` the `μ` / 1-norm
+/// selection reads. Built by [`mf_cache_full`] (one full action pass) or,
+/// value-identically, by [`crate::LindbladSpec::mf_cache_local`] (the
+/// transfer index + the raw / diag cache; `PcStepConfig::locality`).
+pub(crate) struct MfCache {
+    pub(crate) cols: MfCols,
+    pub(crate) per_col: MfPerCol,
+}
+
+/// The legacy cache: one full action pass over `basis`.
+pub(crate) fn mf_cache_full<const W: usize, S: ActionTerms<W> + ?Sized>(
+    spec: &S,
+    basis: &[Word<W>],
+) -> MfCache {
+    let index = build_basis_index(basis);
+    let (cols, per_col) = build_mf_cols(spec, basis, &index);
+    MfCache { cols, per_col }
+}
+
 /// Compute `exp(dt · M) · coeffs` for the in-basis-restricted generator
 /// `M`, matrix-free, via `quspin-expm`. Returns a fresh `Vec<f64>` of length
 /// `basis.len()`.
@@ -266,18 +286,27 @@ pub(crate) fn expm_apply_mf<const W: usize, S: ActionTerms<W> + ?Sized>(
     coeffs: &[f64],
     drop_tol: f64,
 ) -> Vec<f64> {
-    let n = basis.len();
-    if n == 0 {
+    if basis.is_empty() {
         return Vec::new();
     }
-
     // ONE action pass: build the CSC cache `cols` (reused across every matvec)
     // and, in the same pass, `per_col = (raw, diag)` for the `μ`/1-norm
     // selection. `raw = Σ|coeff|` (all outputs), `diag` = coeff of the
     // output == input term. From these: `trace = Σ diag`, `μ = trace/n`, and
     // the column 1-norm of `M − μ·I` is `raw − |diag| + |diag − μ|`.
-    let index = build_basis_index(basis);
-    let (cols, per_col) = build_mf_cols(spec, basis, &index);
+    let cache = mf_cache_full(spec, basis);
+    apply_cache(&cache, dt, coeffs, drop_tol)
+}
+
+/// `exp(dt · M) · coeffs` from a prebuilt generator cache (the second half of
+/// [`expm_apply_mf`]; the same arithmetic in the same order).
+pub(crate) fn apply_cache(cache: &MfCache, dt: f64, coeffs: &[f64], drop_tol: f64) -> Vec<f64> {
+    let n = cache.cols.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let cols = &cache.cols;
+    let per_col = &cache.per_col;
 
     let trace: f64 = per_col.iter().map(|(_, d)| *d).sum();
     let mu = trace / n as f64;
@@ -304,7 +333,7 @@ pub(crate) fn expm_apply_mf<const W: usize, S: ActionTerms<W> + ?Sized>(
 
     let mut v = coeffs.to_vec();
     let op = CscOp {
-        cols: &cols,
+        cols: cols.as_slice(),
         dim: n,
     };
     let expm = quspin_expm::ExpmOp::from_parts(op, dt, mu, s as usize, m_star as usize, expm_tol);

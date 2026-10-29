@@ -172,6 +172,128 @@ def sigma_minus(site: int, n_qubits: int) -> list[tuple[str, complex]]:
     return [(x_str, 0.5 + 0.0j), (y_str, 0.0 - 0.5j)]
 
 
+def _k_form(K) -> str:
+    """Classify the ``K`` of ``kossakowski=(ops, K)``: ``"dense"``, ``"blocks"`` or ``"coo"``.
+
+    Blocks: an object with a ``blocks`` attribute (a sequence of
+    ``(op_indices, K_block)`` pairs) or a ``dict`` with a ``"blocks"`` key.
+    COO: a ``scipy.sparse`` matrix (anything with ``tocoo``), an object
+    with ``to_coo()`` returning ``(rows, cols, vals)``, or a ``dict`` with
+    ``"rows"``, ``"cols"`` and ``"vals"`` keys. Everything else (an array
+    or nested sequence) is the dense ``(M, M)`` matrix. A bare tuple of
+    three arrays is deliberately *not* read as COO: a ``3 × 3`` dense
+    matrix given as rows looks the same.
+    """
+    if isinstance(K, dict):
+        if "blocks" in K:
+            return "blocks"
+        if {"rows", "cols", "vals"} <= set(K):
+            return "coo"
+        raise ValueError(
+            "kossakowski K given as a dict needs the key 'blocks' or the keys 'rows', 'cols', 'vals'"
+        )
+    if hasattr(K, "blocks") and not isinstance(K, np.ndarray):
+        return "blocks"
+    if (hasattr(K, "tocoo") or hasattr(K, "to_coo")) and not isinstance(K, np.ndarray):
+        return "coo"
+    return "dense"
+
+
+def _k_blocks(K) -> list:
+    """The ``[(op_indices, K_block), ...]`` list behind a blocks-form ``K``."""
+    if isinstance(K, dict):
+        return list(K["blocks"])
+    if hasattr(K, "blocks") and not isinstance(K, (list, tuple, np.ndarray)):
+        return list(K.blocks)
+    return list(K)
+
+
+def _k_coo(K) -> tuple:
+    """The ``(rows, cols, vals)`` behind a COO-form ``K``."""
+    if isinstance(K, dict):
+        return K["rows"], K["cols"], K["vals"]
+    if hasattr(K, "tocoo"):
+        c = K.tocoo()
+        return c.row, c.col, c.data
+    return tuple(K.to_coo())
+
+
+def _blocks_to_coo(blocks) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Validated blocks → COO arrays (int64, int64, complex128), nonzero entries only."""
+    rows, cols, vals = [], [], []
+    for idx, K_b in blocks:
+        r, c = np.meshgrid(idx, idx, indexing="ij")
+        keep = K_b != 0
+        rows.append(r[keep])
+        cols.append(c[keep])
+        vals.append(K_b[keep])
+    if not rows:
+        empty = np.zeros(0, dtype=np.int64)
+        return empty, empty.copy(), np.zeros(0, dtype=np.complex128)
+    return (
+        np.ascontiguousarray(np.concatenate(rows), dtype=np.int64),
+        np.ascontiguousarray(np.concatenate(cols), dtype=np.int64),
+        np.ascontiguousarray(np.concatenate(vals), dtype=np.complex128),
+    )
+
+
+def _coo_components(rows: np.ndarray, cols: np.ndarray, m: int) -> np.ndarray:
+    """Component label per operator of the undirected graph with edges ``(rows[i], cols[i])``.
+
+    ``scipy.sparse.csgraph.connected_components`` when scipy is importable,
+    else a union-find pass over the edges (``O(nnz)`` Python steps).
+    """
+    try:
+        from scipy.sparse import coo_matrix
+        from scipy.sparse.csgraph import connected_components
+
+        g = coo_matrix((np.ones(rows.size), (rows, cols)), shape=(m, m))
+        return connected_components(g, directed=False)[1]
+    except ImportError:
+        parent = np.arange(m)
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        for r, c in zip(rows.tolist(), cols.tolist()):
+            a, b = find(r), find(c)
+            if a != b:
+                parent[max(a, b)] = min(a, b)
+        return np.array([find(i) for i in range(m)])
+
+
+def _check_coo_psd(rows, cols, vals, m: int, tol: float, what: str) -> None:
+    """Raise ``ValueError`` when a connected block of the COO matrix is not PSD to ``tol``.
+
+    Each component is assembled densely (duplicates summed, one-sided
+    entries Hermitian-completed as the Rust side does) and eigensolved;
+    the ``(m, m)`` matrix is never formed.
+    """
+    labels = _coo_components(rows, cols, m)
+    scale = max(float(np.abs(vals).max()), 1.0)
+    for lab in np.unique(labels[rows]):
+        members = np.flatnonzero(labels == lab)
+        pos = np.full(m, -1, dtype=np.int64)
+        pos[members] = np.arange(members.size)
+        sel = labels[rows] == lab
+        K_b = np.zeros((members.size, members.size), dtype=np.complex128)
+        np.add.at(K_b, (pos[rows[sel]], pos[cols[sel]]), vals[sel])
+        given = np.zeros_like(K_b, dtype=bool)
+        given[pos[rows[sel]], pos[cols[sel]]] = True
+        one_sided = given & ~given.T
+        K_b = np.where(one_sided.T, K_b.conj().T, K_b)
+        evals = np.linalg.eigvalsh(0.5 * (K_b + K_b.conj().T))
+        if float(evals.min()) < -tol * scale:
+            raise ValueError(
+                f"{what} is not positive semidefinite (block on operators "
+                f"{members[:8].tolist()}{'...' if members.size > 8 else ''}: min eigenvalue "
+                f"{evals.min():.3e}); a non-PSD pair matrix is not a valid GKSL generator"
+            )
+
+
 def _normalize_jump(jump_op: str | PauliLincomb) -> list[tuple[str, float, float]]:
     """Convert a user-supplied jump operator to ``[(pauli_str, re, im), ...]``.
 
@@ -275,14 +397,34 @@ class Lindbladian:
             j_rates.append(float(rate))
         k_ops: list[list[tuple[str, float, float]]] = []
         k_mat: list[list[tuple[float, float]]] = []
+        k_coo = None
         if kossakowski is not None:
             ops, K = kossakowski
             k_ops = [_normalize_jump(op) for op in ops]
-            K = self._validate_k(K, len(k_ops), check_psd=True, what="kossakowski K")
-            k_mat = [[(float(v.real), float(v.imag)) for v in row] for row in K]
+            form = _k_form(K)
+            if form == "dense":
+                K = self._validate_k(K, len(k_ops), check_psd=True, what="kossakowski K")
+                k_mat = [[(float(v.real), float(v.imag)) for v in row] for row in K]
+            elif form == "blocks":
+                blocks = self._validate_blocks(
+                    _k_blocks(K), len(k_ops), check_psd=True, what="kossakowski K"
+                )
+                k_coo = _blocks_to_coo(blocks)
+            else:
+                rows, cols, vals = _k_coo(K)
+                k_coo = self._validate_coo(
+                    rows, cols, vals, len(k_ops), check_psd=True, what="kossakowski K"
+                )
         self._spec = _LindbladSpec(
-            self.n_qubits, h_strs, h_coeffs, j_lincombs, j_rates, k_ops, k_mat,
-            None if word_width is None else int(word_width),
+            self.n_qubits,
+            h_strs,
+            h_coeffs,
+            j_lincombs,
+            j_rates,
+            k_ops,
+            k_mat,
+            kossakowski_coo=k_coo,
+            word_width=None if word_width is None else int(word_width),
         )
 
     @property
@@ -301,6 +443,58 @@ class Lindbladian:
         """Bytes of one packed Pauli word at this width (``16 * W + 16`` on
         64-bit targets); a basis string costs this plus its 8-byte coefficient."""
         return self._spec.word_bytes
+
+    @classmethod
+    def _validate_blocks(cls, blocks, m: int, *, check_psd: bool, what: str):
+        """Return ``[(indices int64[b], K_b complex128[b, b]), ...]`` after checking each block.
+
+        ``ValueError`` on an index outside ``range(m)`` or repeated within a
+        block, a shape mismatch, a block that is not Hermitian to
+        ``_K_TOL·max(‖K_b‖, 1)`` and, with ``check_psd``, one with an
+        eigenvalue below ``−_K_TOL·max(‖K_b‖, 1)``. Each block is checked
+        on its own: blocks sharing operators add up, and a sum of PSD
+        blocks is PSD.
+        """
+        out = []
+        for b, (indices, K_b) in enumerate(blocks):
+            idx = np.ascontiguousarray(indices, dtype=np.int64).reshape(-1)
+            if idx.size and (idx.min() < 0 or idx.max() >= m):
+                raise ValueError(
+                    f"{what}: block {b} has an operator index outside range({m}): {idx.tolist()}"
+                )
+            if np.unique(idx).size != idx.size:
+                raise ValueError(f"{what}: block {b} lists an operator more than once")
+            K_b = cls._validate_k(K_b, idx.size, check_psd=check_psd, what=f"{what}: block {b}")
+            out.append((idx, K_b))
+        return out
+
+    @classmethod
+    def _validate_coo(cls, rows, cols, vals, m: int, *, check_psd: bool, what: str):
+        """Return ``(rows, cols, vals)`` as int64, int64, complex128 1-D arrays after the checks.
+
+        Equal lengths and indices in ``range(m)`` are checked here; the Rust
+        side sums duplicates, Hermitian-completes one-sided entries and
+        checks Hermiticity (``ValueError``). With ``check_psd`` the
+        connected components of the sparsity pattern (the blocks of ``K``
+        under any permutation) are each checked for an eigenvalue below
+        ``−_K_TOL·max(‖K‖, 1)`` — exact, since ``K`` is PSD iff every
+        block is, and never forms the ``(m, m)`` matrix.
+        """
+        rows = np.ascontiguousarray(rows, dtype=np.int64).reshape(-1)
+        cols = np.ascontiguousarray(cols, dtype=np.int64).reshape(-1)
+        vals = np.ascontiguousarray(vals, dtype=np.complex128).reshape(-1)
+        if not (rows.size == cols.size == vals.size):
+            raise ValueError(
+                f"{what}: rows, cols and vals must have the same length; "
+                f"got {rows.size}, {cols.size} and {vals.size}"
+            )
+        if rows.size and (
+            rows.min() < 0 or cols.min() < 0 or rows.max() >= m or cols.max() >= m
+        ):
+            raise ValueError(f"{what}: operator indices must lie in range({m})")
+        if check_psd and rows.size:
+            _check_coo_psd(rows, cols, vals, m, cls._K_TOL, what)
+        return rows, cols, vals
 
     @classmethod
     def _validate_k(cls, K, m: int, *, check_psd: bool, what: str) -> np.ndarray:
@@ -445,6 +639,129 @@ class Lindbladian:
         K = self._validate_k(K, m, check_psd=check_psd, what="set_kossakowski: K")
         self._spec.set_kossakowski(K)
 
+    def set_kossakowski_blocks(self, blocks, check_psd: bool = True) -> None:
+        """Replace the Kossakowski matrix in place from blocks, never forming ``K``.
+
+        ``blocks`` is a sequence of ``(op_indices, K_block)`` pairs (or an
+        object with a ``blocks`` attribute holding one): ``op_indices`` an
+        integer array of distinct operator indices into the ``ops`` given
+        at construction, ``K_block`` a Hermitian PSD ``(len, len)`` array
+        placed there, ``K[np.ix_(op_indices, op_indices)] += K_block``.
+        Blocks normally partition the operators (a block-diagonal ``K``);
+        blocks sharing operators add up. Operators in no block get zero
+        rows; an empty sequence is the zero dissipator. ``ValueError`` on
+        an index out of range or repeated within a block, a shape
+        mismatch, a non-Hermitian block (``_K_TOL`` relative) and, with
+        ``check_psd=True`` (default), a block with an eigenvalue below
+        ``−_K_TOL·max(‖K_block‖, 1)`` — each block is eigensolved on its
+        own, so the check costs ``Σ_b len_b³``, not ``M³``. Nothing changes
+        on an error.
+
+        Rust assembles the entries, keeps the pair templates whose
+        ``(n, m)`` stay nonzero and templates the new pairs, so a drive
+        rescaling a fixed block pattern costs one complex multiply per
+        stored coefficient; the result is bit-identical to
+        ``set_kossakowski`` with the assembled dense matrix (which is never
+        formed: memory ``O(Σ_b len_b²)`` plus the templates).
+        """
+        m = self._spec.num_kossakowski_ops
+        if m == 0:
+            raise ValueError(
+                "set_kossakowski_blocks: this Lindbladian was built without a kossakowski block"
+            )
+        checked = self._validate_blocks(
+            _k_blocks(blocks), m, check_psd=check_psd, what="set_kossakowski_blocks"
+        )
+        self._spec.set_kossakowski_blocks(checked)
+
+    def set_kossakowski_sparse(
+        self, rows, cols, vals, n_ops: int | None = None, check_psd: bool = True
+    ) -> None:
+        """Replace the Kossakowski matrix in place from COO triples, never forming ``K``.
+
+        ``rows``, ``cols`` (integer, ``nnz`` each) and ``vals`` (complex,
+        ``nnz``) describe ``K[rows[i], cols[i]] = vals[i]`` over the
+        operator index of the ``ops`` given at construction, in any order;
+        duplicate ``(row, col)`` pairs are summed (the COO convention) and
+        exact zeros ignored. ``n_ops``, when given, must equal
+        ``num_kossakowski_ops`` (a consistency check for callers that
+        carry it). An off-diagonal entry given in one triangle only is
+        Hermitian-completed (its mirror is the conjugate), so a single
+        triangle is a valid input; one given in both triangles must match
+        its mirror's conjugate and a diagonal entry must be real, to
+        ``_K_TOL·max(‖K‖, 1)`` — otherwise ``ValueError``, as for an index
+        outside ``range(num_kossakowski_ops)`` or mismatched lengths. With
+        ``check_psd=True`` (default) the connected components of the
+        pattern are eigensolved one by one (exact: ``K`` is PSD iff every
+        block is); ``check_psd=False`` skips it. Nothing changes on an
+        error. Bit-identical to ``set_kossakowski`` with the dense matrix
+        these triples describe; see `set_kossakowski_blocks` for the cost.
+        """
+        m = self._spec.num_kossakowski_ops
+        if m == 0:
+            raise ValueError(
+                "set_kossakowski_sparse: this Lindbladian was built without a kossakowski block"
+            )
+        if n_ops is not None and int(n_ops) != m:
+            raise ValueError(
+                f"set_kossakowski_sparse: n_ops = {n_ops} but this Lindbladian has "
+                f"num_kossakowski_ops = {m}"
+            )
+        rows, cols, vals = self._validate_coo(
+            rows, cols, vals, m, check_psd=check_psd, what="set_kossakowski_sparse"
+        )
+        self._spec.set_kossakowski_sparse(rows, cols, vals)
+
+    @property
+    def kossakowski_coo(self) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+        """Current ``K`` as COO arrays ``(rows, cols, vals)``: every nonzero entry, both triangles.
+
+        uint64, uint64, complex128, sorted by ``(row, col)``; copies.
+        ``None`` when built without a ``kossakowski`` block. The sparse twin
+        of `kossakowski`, which materialises the ``(M, M)`` matrix.
+        """
+        if self._spec.num_kossakowski_ops == 0:
+            return None
+        return self._spec.kossakowski_coo
+
+    @property
+    def num_kossakowski_nonzeros(self) -> int:
+        """Number of stored nonzero entries of ``K`` (both triangles)."""
+        return self._spec.num_kossakowski_nonzeros
+
+    @property
+    def num_pair_templates(self) -> int:
+        """Number of distinct pair templates among the compiled Kossakowski pairs.
+
+        A template is the ``K``-independent compilation of one operator-pattern
+        relationship: the Pauli structure of ``(A_n, A_m)`` up to a qubit
+        relabelling (both operators' terms, in order, with their exact
+        coefficients, over the pair's qubits numbered by first appearance).
+        Pairs with the same structure on other qubits — the same tensor
+        components of a dipolar / CSA dissipator on other spins — share one
+        template, so this count is bounded by the number of distinct patterns,
+        not by `num_compiled_pairs`, and the compiled memory scales with it.
+        """
+        return self._spec.num_pair_templates
+
+    @property
+    def num_compiled_pairs(self) -> int:
+        """Number of compiled Kossakowski pairs ``n ≤ m`` (``|K_nm| > 1e-14·max|K|``), one record each."""
+        return self._spec.num_compiled_pairs
+
+    @property
+    def kossakowski_memory_bytes(self) -> dict[str, int]:
+        """Heap bytes of the Kossakowski compilation: ``{'templates', 'pairs', 'entries'}``.
+
+        ``templates``: the shared pair templates (Pauli tables, keys and index);
+        ``pairs``: the per-pair records (template index, qubit map, ``K_nm``,
+        support slots); ``entries``: the stored nonzero ``K`` entries (24 B
+        each). Vector capacities, i.e. what was asked of the allocator; the
+        operator table is not counted.
+        """
+        t, p, e = self._spec.kossakowski_memory_bytes
+        return {"templates": int(t), "pairs": int(p), "entries": int(e)}
+
     # ── Pure-ndarray hot path ──
 
     def action_arr(self, p: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -490,6 +807,7 @@ class Lindbladian:
         num_threads: int | None = None,
         admit_basis: int | None = None,
         tau_add: float | None = None,
+        locality: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
         """One predictor-corrector adaptive step.
 
@@ -524,6 +842,19 @@ class Lindbladian:
         turnover. With the default ``None``, admission is bounded by
         ``max_basis`` and turnover requires ``drop_tol > 0``.
 
+        ``locality`` (default ``False``) runs the locality-aware step: the
+        in-basis generator is built from the dissipator's difference-word
+        index and a per-word cache of the column 1-norm / diagonal instead
+        of a full action pass, the leakage merge is sharded over the
+        threads, the second leakage pass is skipped when the working set is
+        full and the corrector reuses the predictor's generator when nothing
+        was admitted. Every action coefficient, generator entry and leakage
+        value is the legacy one bit for bit; the admitted strings enter the
+        basis sorted by word instead of in hash-map order, so the propagated
+        coefficients differ from the legacy step at round-off (the same kind
+        of difference as a change of thread count). See
+        ``locality_stats`` / ``build_locality_index``.
+
         Returns ``(new_basis_arr, new_coeffs)``; the basis may have grown
         (or shrunk, if ``max_basis`` / ``drop_tol`` pruned entries).
         """
@@ -540,7 +871,29 @@ class Lindbladian:
             None if num_threads is None else int(num_threads),
             None if admit_basis is None else int(admit_basis),
             None if tau_add is None else float(tau_add),
+            bool(locality),
         )
+
+    @property
+    def locality_stats(self) -> dict[str, int | bool]:
+        """The locality-aware step's structures (``pc_step_arr(..., locality=True)``):
+        ``index_built``, ``index_bytes``, ``index_entries`` (one per table entry of
+        every compiled pair and general jump), ``index_keys`` (distinct difference
+        words), ``max_delta`` (largest difference-word support) and ``cache_len``
+        (words with a cached column 1-norm / diagonal)."""
+        built, nbytes, entries, keys, max_delta, cache_len = self._spec.locality_stats
+        return {
+            "index_built": bool(built),
+            "index_bytes": int(nbytes),
+            "index_entries": int(entries),
+            "index_keys": int(keys),
+            "max_delta": int(max_delta),
+            "cache_len": int(cache_len),
+        }
+
+    def build_locality_index(self) -> int:
+        """Build the difference-word index now (else the first locality step does); returns its bytes."""
+        return int(self._spec.build_locality_index())
 
     def pc_step_orbit_rep(
         self,

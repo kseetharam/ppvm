@@ -124,6 +124,7 @@ fn evolve<const W: usize>(n: usize, n_steps: usize, max_basis: usize) -> HashMap
         drop_tol: 0.0,
         tau_add: None,
         num_threads: Some(1),
+        locality: false,
     };
     for _ in 0..n_steps {
         spec.pc_step(&mut basis, &mut coeffs, 0.05, &[], &cfg).unwrap();
@@ -270,4 +271,185 @@ fn words_beyond_128_qubits_round_trip_and_evolve() {
     let w = z_at(n - 1);
     assert_eq!(w.zbits.data[(n - 1) / CHUNK_BITS] >> ((n - 1) % CHUNK_BITS) & 1, 1);
     let _ = codes_of("I");
+}
+
+// ────────────────── the locality step at every width ──────────────────
+//
+// The locality-aware step (`PcStepConfig::locality`) and the support-grouped
+// action keep the pair templates in a LOCAL frame of the default width and
+// embed into a register of width `W`; the register qubit index of a pair's
+// qubit map is wide enough for every width. These tests pin (v) the grouped
+// action bitwise against the legacy action at W = 2 / 4 / 17 on the same
+// system and across the widths, and (vi) a dissipator sitting on register
+// qubits above 255 (only reachable at W ≥ 8) evolving under the locality
+// step within round-off of the legacy step.
+
+fn action_bits<const W: usize>(spec: &LindbladSpec<W>, s: &str, n: usize) -> Vec<(Vec<u8>, u64)> {
+    let p = word_from_codes::<W>(&codes_of(s)).unwrap();
+    let mut out: Vec<(Vec<u8>, u64)> = spec
+        .action(&p)
+        .into_iter()
+        .map(|(w, c)| {
+            let mut buf = vec![0u8; n];
+            codes_from_word(&w, &mut buf);
+            (buf, c.to_bits())
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn action_locality_bits<const W: usize>(spec: &LindbladSpec<W>, s: &str, n: usize) -> Vec<(Vec<u8>, u64)> {
+    let p = word_from_codes::<W>(&codes_of(s)).unwrap();
+    let mut sc = ppvm_lindblad::support::ActScratch::<W>::default();
+    let mut out: Vec<(Vec<u8>, u64)> = spec
+        .action_terms_locality_pub(&p, &mut sc)
+        .into_iter()
+        .map(|(w, c)| {
+            let mut buf = vec![0u8; n];
+            codes_from_word(&w, &mut buf);
+            (buf, c.to_bits())
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn locality_action_bitwise_identical_across_widths() {
+    let n = 6;
+    let words = ["ZIIIII", "IXIIII", "IIYIII", "IXYIII", "ZZZIII", "IXXZII", "YIYIII", "IIIIZI"];
+    let s2 = build::<2>(n);
+    let s4 = build::<4>(n);
+    let s17 = build::<17>(n);
+    let mut n_terms = 0;
+    for s in words {
+        let legacy = action_bits(&s2, s, n);
+        assert!(!legacy.is_empty(), "{s}: empty action");
+        n_terms += legacy.len();
+        // the grouped action against the legacy action at every width
+        assert!(action_locality_bits(&s2, s, n) == legacy, "{s}: W = 2 grouped action differs");
+        assert!(action_locality_bits(&s4, s, n) == legacy, "{s}: W = 4 grouped action differs");
+        assert!(action_locality_bits(&s17, s, n) == legacy, "{s}: W = 17 grouped action differs");
+        // and the legacy action itself across the widths
+        assert!(action_bits(&s4, s, n) == legacy, "{s}: W = 4 legacy action differs");
+        assert!(action_bits(&s17, s, n) == legacy, "{s}: W = 17 legacy action differs");
+    }
+    assert!(n_terms > words.len());
+    let (tuples, sets, _exclusive, bytes) = s17.support_stats();
+    assert!(tuples > 0 && sets > 0 && bytes > 0);
+    assert_eq!(s17.support_stats(), s2.support_stats());
+}
+
+/// Z fields on every site, an XX+YY bond and a Kossakowski block of σ⁻ on
+/// two sites of a wide register (`lo`, `hi`), plus the same σ⁻ pair used as
+/// plain jumps elsewhere, so the pair's qubit map carries indices > 255.
+fn wide_inputs(n: usize, lo: usize, hi: usize) -> (Vec<(String, f64)>, Vec<JumpInput>, Vec<Vec<(String, Complex<f64>)>>, Vec<Vec<Complex<f64>>>) {
+    let mut h = Vec::new();
+    for j in [lo - 1, lo, hi, hi + 1] {
+        let mut s = vec!['I'; n];
+        s[j] = 'Z';
+        h.push((s.into_iter().collect::<String>(), 0.3 * (j as f64 % 7.0 + 1.0)));
+    }
+    for op in ['X', 'Y'] {
+        let mut s = vec!['I'; n];
+        s[lo] = op;
+        s[hi] = op;
+        h.push((s.into_iter().collect::<String>(), 0.45));
+    }
+    let sm = |site: usize| {
+        let mut x = vec!['I'; n];
+        x[site] = 'X';
+        let mut y = vec!['I'; n];
+        y[site] = 'Y';
+        vec![
+            (x.into_iter().collect::<String>(), Complex::new(0.5, 0.0)),
+            (y.into_iter().collect::<String>(), Complex::new(0.0, -0.5)),
+        ]
+    };
+    let jumps = vec![JumpInput { lincomb: sm(lo - 1), rate: 0.2 }];
+    let ops = vec![sm(lo), sm(hi)];
+    let k = vec![
+        vec![Complex::new(1.0, 0.0), Complex::new(0.3, 0.2)],
+        vec![Complex::new(0.3, -0.2), Complex::new(0.8, 0.0)],
+    ];
+    (h, jumps, ops, k)
+}
+
+#[test]
+fn locality_step_on_register_qubits_above_255() {
+    const W: usize = 8;
+    let n = 300;
+    let (lo, hi) = (290usize, 297usize);
+    assert!(hi < max_qubits_for(W));
+    let (h, jumps, ops, k) = wide_inputs(n, lo, hi);
+    let mut spec = LindbladSpec::<W>::new(n, &h, &jumps).unwrap();
+    spec.add_kossakowski(&ops, &k).unwrap();
+    // the grouped action bitwise against the legacy action on words touching the block
+    let mut word = |pairs: &[(usize, char)]| -> String {
+        let mut s = vec!['I'; n];
+        for &(q, c) in pairs {
+            s[q] = c;
+        }
+        s.into_iter().collect()
+    };
+    let probes = [
+        word(&[(lo, 'Z')]),
+        word(&[(hi, 'X')]),
+        word(&[(lo, 'X'), (hi, 'Y')]),
+        word(&[(lo - 1, 'Z'), (lo, 'Z'), (hi, 'Z')]),
+        word(&[(hi + 1, 'X')]),
+    ];
+    for s in &probes {
+        let legacy = action_bits(&spec, s, n);
+        assert!(!legacy.is_empty(), "empty action");
+        assert!(action_locality_bits(&spec, s, n) == legacy, "grouped action differs on a > 255 register");
+    }
+    // the locality step against the legacy step: same system, same start,
+    // the coefficients within round-off (the admitted strings enter sorted
+    // by word on the locality path; the values are the legacy ones)
+    let start: Vec<Word<W>> = [lo - 1, lo, hi, hi + 1]
+        .iter()
+        .map(|&j| {
+            let mut s = vec!['I'; n];
+            s[j] = 'Z';
+            let st: String = s.into_iter().collect();
+            parse_pauli_string::<W>(&st, n).unwrap().0
+        })
+        .collect();
+    let coeffs0: Vec<f64> = vec![1.0, 0.5, 0.25, 0.125];
+    let run = |locality: bool| -> HashMap<Vec<u8>, f64> {
+        let mut basis = start.clone();
+        let mut coeffs = coeffs0.clone();
+        let cfg = PcStepConfig {
+            max_basis: 600,
+            admit_basis: Some(1800),
+            drop_tol: 0.0,
+            tau_add: None,
+            num_threads: Some(1),
+            locality,
+        };
+        for _ in 0..4 {
+            spec.pc_step(&mut basis, &mut coeffs, 0.05, &[], &cfg).unwrap();
+        }
+        let mut out = HashMap::new();
+        let mut buf = vec![0u8; n];
+        for (w, c) in basis.iter().zip(coeffs.iter()) {
+            codes_from_word(w, &mut buf);
+            out.insert(buf.clone(), *c);
+        }
+        out
+    };
+    let legacy = run(false);
+    let local = run(true);
+    assert!(legacy.len() > 4, "nothing admitted: {}", legacy.len());
+    assert_eq!(legacy.len(), local.len(), "basis sizes differ");
+    let mut max_diff = 0.0f64;
+    for (k, v) in &legacy {
+        let l = local.get(k).unwrap_or_else(|| panic!("locality basis misses a legacy word"));
+        max_diff = max_diff.max((v - l).abs());
+    }
+    assert!(max_diff < 1e-12, "locality step deviates from the legacy step by {max_diff:e}");
+    let (built, bytes, entries, keys, max_delta, _cache) = spec.locality_stats();
+    assert!(built && bytes > 0 && entries > 0 && keys > 0 && max_delta >= 2);
 }

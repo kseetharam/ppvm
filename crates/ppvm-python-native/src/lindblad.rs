@@ -187,6 +187,46 @@ pub(crate) fn map_err(e: ppvm_lindblad::Error) -> PyErr {
     PyValueError::new_err(e.to_string())
 }
 
+/// `(pauli_string, re, im)` triples per operator into complex lincombs.
+fn lincombs_from_triples(ops: Vec<Vec<(String, f64, f64)>>) -> Vec<Vec<(String, Complex<f64>)>> {
+    ops.into_iter()
+        .map(|op| {
+            op.into_iter()
+                .map(|(s, re, im)| (s, Complex::new(re, im)))
+                .collect()
+        })
+        .collect()
+}
+
+/// Validate COO arrays (equal lengths, non-negative indices) and turn them
+/// into the core's `(row, col, value)` triples.
+fn coo_entries(
+    rows: &PyReadonlyArray1<'_, i64>,
+    cols: &PyReadonlyArray1<'_, i64>,
+    vals: &PyReadonlyArray1<'_, Complex64>,
+    what: &str,
+) -> PyResult<Vec<(usize, usize, Complex<f64>)>> {
+    let (r, c, v) = (rows.as_array(), cols.as_array(), vals.as_array());
+    if r.len() != c.len() || r.len() != v.len() {
+        return Err(PyValueError::new_err(format!(
+            "{what}: rows, cols and vals must have the same length; got {}, {} and {}",
+            r.len(),
+            c.len(),
+            v.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(r.len());
+    for ((&ri, &ci), &vi) in r.iter().zip(c.iter()).zip(v.iter()) {
+        if ri < 0 || ci < 0 {
+            return Err(PyValueError::new_err(format!(
+                "{what}: operator indices must be non-negative; got ({ri}, {ci})"
+            )));
+        }
+        out.push((ri as usize, ci as usize, Complex::new(vi.re, vi.im)));
+    }
+    Ok(out)
+}
+
 /// Reject a basis that contains the same Pauli word at two distinct rows.
 /// Duplicate rows would silently overwrite each other in the generator's
 /// row-index map and produce an incorrect sparse matrix.
@@ -580,6 +620,86 @@ fn set_kossakowski_impl<const W: usize>(
     spec.set_kossakowski(&rows).map_err(map_err)
 }
 
+fn action_census_impl<'py, const W: usize>(
+    spec: &CoreSpec<W>,
+    basis: PyReadonlyArray2<'py, u8>,
+) -> PyResult<Vec<(u64, u64, u64, u64, u64, u64)>> {
+    let n_q = spec.n_qubits();
+    let words = decode_basis::<W>(&basis.as_array(), n_q)?;
+    use rayon::prelude::*;
+    Ok(words
+        .par_iter()
+        .map(|w| {
+            let c = ppvm_lindblad::locality::action_census(spec, w);
+            (c[0], c[1], c[2], c[3], c[4], c[5])
+        })
+        .collect())
+}
+
+fn action_locality_impl<'py, const W: usize>(
+    spec: &CoreSpec<W>,
+    py: Python<'py>,
+    p: PyReadonlyArray1<'py, u8>,
+) -> PyResult<PyPauliMap<'py>> {
+    let p_slice = p.as_slice()?;
+    let p_word = word_from_codes::<W>(p_slice).map_err(map_err)?;
+    let mut sc = ppvm_lindblad::support::ActScratch::<W>::default();
+    let pairs = spec.action_terms_locality_pub(&p_word, &mut sc);
+    pack_pauli_map(py, pairs, spec.n_qubits())
+}
+
+fn action_locality_stats_impl<'py, const W: usize>(
+    spec: &CoreSpec<W>,
+    basis: PyReadonlyArray2<'py, u8>,
+) -> PyResult<Vec<Vec<u64>>> {
+    let n_q = spec.n_qubits();
+    let words = decode_basis::<W>(&basis.as_array(), n_q)?;
+    let mut sc = ppvm_lindblad::support::ActScratch::<W>::default();
+    Ok(words
+        .iter()
+        .map(|w| {
+            let _ = spec.action_terms_locality_pub(w, &mut sc);
+            sc.stats.to_vec()
+        })
+        .collect())
+}
+
+fn action_locality_profile_impl<'py, const W: usize>(
+    spec: &CoreSpec<W>,
+    basis: PyReadonlyArray2<'py, u8>,
+    mode: u8,
+) -> PyResult<Vec<Vec<u64>>> {
+    let n_q = spec.n_qubits();
+    let words = decode_basis::<W>(&basis.as_array(), n_q)?;
+    let _ = spec.support_stats();
+    use rayon::prelude::*;
+    Ok(words
+        .par_iter()
+        .map_init(
+            || {
+                let mut sc = ppvm_lindblad::support::ActScratch::<W>::default();
+                sc.prof_mode = mode;
+                sc
+            },
+            |sc, w| {
+                let t0 = std::time::Instant::now();
+                let _ = spec.action_terms_locality_pub(w, sc);
+                let wall = t0.elapsed().as_micros() as u64;
+                vec![
+                    sc.phase_us[0],
+                    sc.phase_us[1],
+                    sc.phase_us[2],
+                    sc.phase_us[3],
+                    sc.stats[1],
+                    sc.stats[2],
+                    sc.stats[3],
+                    wall,
+                ]
+            },
+        )
+        .collect())
+}
+
 #[pymethods]
 impl LindbladSpec {
     /// Construct a Lindbladian spec from Hamiltonian terms and jump operators.
@@ -592,13 +712,19 @@ impl LindbladSpec {
     /// dissipator `D*(O) = Σ_nm K_nm (A_n† O A_m − ½{A_n†A_m, O})`:
     /// `kossakowski_ops[i]` is the Pauli lincomb of `A_i` in the same triple
     /// encoding, `kossakowski_k[n][m] = (re, im)` the Hermitian pair matrix.
+    /// `kossakowski_coo = (rows, cols, vals)` (int64, int64, complex128 1-D
+    /// arrays over the operator index) gives `K` as COO triples instead, so
+    /// a block-sparse `K` over thousands of operators is never materialised
+    /// (same rules as `set_kossakowski_sparse`); `kossakowski_k` must then
+    /// be empty.
     ///
     /// `word_width` (chunks of `lindblad_chunk_bits()` bits) forces a
     /// compiled Pauli-word width; `None` picks the smallest one that holds
     /// `n_qubits` (`lindblad_word_width_for`).
     #[new]
     #[pyo3(signature = (n_qubits, h_terms, h_coeffs, jump_lincombs, jump_rates,
-                        kossakowski_ops = vec![], kossakowski_k = vec![], word_width = None))]
+                        kossakowski_ops = vec![], kossakowski_k = vec![],
+                        kossakowski_coo = None, word_width = None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         n_qubits: usize,
@@ -608,9 +734,35 @@ impl LindbladSpec {
         jump_rates: Vec<f64>,
         kossakowski_ops: Vec<Vec<(String, f64, f64)>>,
         kossakowski_k: Vec<Vec<(f64, f64)>>,
+        kossakowski_coo: Option<&Bound<'_, PyAny>>,
         word_width: Option<usize>,
     ) -> PyResult<Self> {
         let width = pick_width(n_qubits, word_width, "LindbladSpec")?;
+        let coo_entries_opt = match kossakowski_coo {
+            Some(coo) => {
+                if !kossakowski_k.is_empty() {
+                    return Err(PyValueError::new_err(
+                        "kossakowski_k and kossakowski_coo are alternatives; give one of them",
+                    ));
+                }
+                if kossakowski_ops.is_empty() {
+                    return Err(PyValueError::new_err(
+                        "kossakowski_coo needs a non-empty kossakowski_ops",
+                    ));
+                }
+                let (rows, cols, vals): (
+                    PyReadonlyArray1<'_, i64>,
+                    PyReadonlyArray1<'_, i64>,
+                    PyReadonlyArray1<'_, Complex64>,
+                ) = coo.extract().map_err(|_| {
+                    PyValueError::new_err(
+                        "kossakowski_coo: expected a tuple (rows: int64[nnz], cols: int64[nnz], vals: complex128[nnz])",
+                    )
+                })?;
+                Some(coo_entries(&rows, &cols, &vals, "kossakowski_coo")?)
+            }
+            None => None,
+        };
         let inputs = SpecInputs::new(
             h_terms,
             h_coeffs,
@@ -620,7 +772,14 @@ impl LindbladSpec {
             kossakowski_k,
             "",
         )?;
-        let inner = with_width!(width, W => { AnySpec::from(inputs.build::<W>(n_qubits)?) });
+        let inner = match coo_entries_opt {
+            Some(entries) => with_width!(width, W => {
+                let mut inner = CoreSpec::<W>::new(n_qubits, &inputs.h, &inputs.jumps).map_err(map_err)?;
+                inner.add_kossakowski_sparse(&inputs.ops, &entries).map_err(map_err)?;
+                AnySpec::from(inner)
+            }),
+            None => with_width!(width, W => { AnySpec::from(inputs.build::<W>(n_qubits)?) }),
+        };
         Ok(Self { inner })
     }
 
@@ -742,6 +901,183 @@ impl LindbladSpec {
         dispatch!(&mut self.inner, s => set_kossakowski_impl(s, k))
     }
 
+    /// Replace the Kossakowski matrix in place from COO triples over the
+    /// operator index: `rows`, `cols` (int64, `nnz` each) and `vals`
+    /// (complex128, `nnz`). Any order; duplicates are summed; exact zeros
+    /// are ignored; an off-diagonal entry given in one triangle only is
+    /// Hermitian-completed, one given in both must match its mirror's
+    /// conjugate and a diagonal entry must be real (to
+    /// `1e-10·max(‖K‖, 1)`), otherwise `ValueError`. The dense `(M, M)`
+    /// matrix is never formed; the result is bit-identical to
+    /// `set_kossakowski` with it. PSD is checked in the Python layer.
+    fn set_kossakowski_sparse(
+        &mut self,
+        rows: PyReadonlyArray1<'_, i64>,
+        cols: PyReadonlyArray1<'_, i64>,
+        vals: PyReadonlyArray1<'_, Complex64>,
+    ) -> PyResult<()> {
+        if self.num_kossakowski_ops() == 0 {
+            return Err(PyValueError::new_err(
+                "set_kossakowski_sparse: this LindbladSpec was built without a Kossakowski block",
+            ));
+        }
+        let entries = coo_entries(&rows, &cols, &vals, "set_kossakowski_sparse")?;
+        dispatch!(&mut self.inner, s => s.set_kossakowski_sparse(&entries).map_err(map_err))
+    }
+
+    /// Replace the Kossakowski matrix in place from blocks: `blocks[b] =
+    /// (indices, K_block)` with `indices` an int64 array of distinct
+    /// operator indices and `K_block` a Hermitian complex128
+    /// `(len, len)` array placed at those indices (`K[indices[i],
+    /// indices[j]] += K_block[i, j]`; blocks sharing operators add up).
+    /// `ValueError` on an index out of range or repeated within a block,
+    /// a shape mismatch or a non-Hermitian block, leaving the spec
+    /// unchanged. The dense matrix is never formed; the result is
+    /// bit-identical to `set_kossakowski` with it. PSD is checked in the
+    /// Python layer.
+    fn set_kossakowski_blocks<'py>(
+        &mut self,
+        blocks: Vec<(PyReadonlyArray1<'py, i64>, PyReadonlyArray2<'py, Complex64>)>,
+    ) -> PyResult<()> {
+        if self.num_kossakowski_ops() == 0 {
+            return Err(PyValueError::new_err(
+                "set_kossakowski_blocks: this LindbladSpec was built without a Kossakowski block",
+            ));
+        }
+        let mut core: Vec<(Vec<usize>, Vec<Vec<Complex<f64>>>)> = Vec::with_capacity(blocks.len());
+        for (b, (idx, kb)) in blocks.iter().enumerate() {
+            let idx_view = idx.as_array();
+            let mut indices: Vec<usize> = Vec::with_capacity(idx_view.len());
+            for &i in idx_view.iter() {
+                if i < 0 {
+                    return Err(PyValueError::new_err(format!(
+                        "set_kossakowski_blocks: block {b} has a negative operator index {i}"
+                    )));
+                }
+                indices.push(i as usize);
+            }
+            let kv = kb.as_array();
+            let shape = kv.shape();
+            if shape[0] != indices.len() || shape[1] != indices.len() {
+                return Err(PyValueError::new_err(format!(
+                    "set_kossakowski_blocks: block {b} has {} indices but K_block has shape {:?}",
+                    indices.len(),
+                    shape
+                )));
+            }
+            let mat: Vec<Vec<Complex<f64>>> = (0..shape[0])
+                .map(|i| (0..shape[1]).map(|j| Complex::new(kv[[i, j]].re, kv[[i, j]].im)).collect())
+                .collect();
+            core.push((indices, mat));
+        }
+        dispatch!(&mut self.inner, s => s.set_kossakowski_blocks(&core).map_err(map_err))
+    }
+
+    /// Current Kossakowski matrix as COO arrays `(rows, cols, vals)`
+    /// (uint64, uint64, complex128): every nonzero entry, both triangles,
+    /// sorted by `(row, col)`. The sparse twin of `kossakowski`.
+    #[getter]
+    fn kossakowski_coo<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> (
+        Bound<'py, PyArray1<u64>>,
+        Bound<'py, PyArray1<u64>>,
+        Bound<'py, PyArray1<Complex64>>,
+    ) {
+        let entries = dispatch!(&self.inner, s => s.kossakowski_entries());
+        let rows: Vec<u64> = entries.iter().map(|e| e.0 as u64).collect();
+        let cols: Vec<u64> = entries.iter().map(|e| e.1 as u64).collect();
+        let vals: Vec<Complex64> = entries.iter().map(|e| Complex64::new(e.2.re, e.2.im)).collect();
+        (rows.into_pyarray(py), cols.into_pyarray(py), vals.into_pyarray(py))
+    }
+
+    /// Number of stored nonzero entries of `K` (both triangles).
+    #[getter]
+    fn num_kossakowski_nonzeros(&self) -> usize {
+        dispatch!(&self.inner, s => s.num_kossakowski_nonzeros())
+    }
+
+    /// Number of distinct pair templates: operator-pattern relationships
+    /// (the Pauli structure of `(A_n, A_m)` up to a qubit relabelling)
+    /// shared by the compiled pairs.
+    #[getter]
+    fn num_pair_templates(&self) -> usize {
+        dispatch!(&self.inner, s => s.num_pair_templates())
+    }
+
+    /// Number of compiled Kossakowski pairs `n ≤ m` (`|K_nm| > 1e-14·max|K|`).
+    #[getter]
+    fn num_compiled_pairs(&self) -> usize {
+        dispatch!(&self.inner, s => s.num_compiled_pairs())
+    }
+
+    /// Heap bytes of the Kossakowski compilation: `(templates, pairs, entries)`.
+    #[getter]
+    fn kossakowski_memory_bytes(&self) -> (usize, usize, usize) {
+        dispatch!(&self.inner, s => s.kossakowski_memory_bytes())
+    }
+
+    /// The locality-aware step's structures: `(index_built, index_bytes,
+    /// index_entries, index_keys, max_delta, cache_len)`.
+    #[getter]
+    fn locality_stats(&self) -> (bool, usize, usize, usize, u32, usize) {
+        dispatch!(&self.inner, s => s.locality_stats())
+    }
+
+    /// Build the transfer index now (it is otherwise built by the first
+    /// locality step); returns its heap bytes.
+    fn build_locality_index(&self) -> usize {
+        dispatch!(&self.inner, s => s.transfer_index().bytes)
+    }
+
+    /// Per-word census of the full action over the rows of `basis`:
+    /// `(h candidates, dissipator candidates, one-sided pairs, both-sided
+    /// pairs, table entries visited, distinct output words)`.
+    fn action_census<'py>(
+        &self,
+        basis: PyReadonlyArray2<'py, u8>,
+    ) -> PyResult<Vec<(u64, u64, u64, u64, u64, u64)>> {
+        dispatch!(&self.inner, s => action_census_impl(s, basis))
+    }
+
+    /// Apply `L*` to a single Pauli string `p` through the support-grouped
+    /// action of the locality step (value-identical to `action`).
+    fn action_locality<'py>(
+        &self,
+        py: Python<'py>,
+        p: PyReadonlyArray1<'py, u8>,
+    ) -> PyResult<PyPauliMap<'py>> {
+        dispatch!(&self.inner, s => action_locality_impl(s, py, p))
+    }
+
+    /// Per-row counters of the grouped action (`ActScratch::stats`): dense groups, pairs in groups, dense
+    /// emissions, deferred emissions from groups, generic candidates, generic emissions, Hamiltonian emissions,
+    /// distinct deferred words.
+    fn action_locality_stats<'py>(
+        &self,
+        basis: PyReadonlyArray2<'py, u8>,
+    ) -> PyResult<Vec<Vec<u64>>> {
+        dispatch!(&self.inner, s => action_locality_stats_impl(s, basis))
+    }
+
+    /// Profiling of the grouped action over the rows of `basis`, in parallel (the thread pool's size): per row
+    /// `[merge_us, dense_us, generic_us, final_us, pairs, dense emissions, deferred emissions, wall_us]` in
+    /// `mode` 0 (normal), 1 (values computed, not accumulated) or 2 (entry loops skipped). Modes 1–2 give wrong
+    /// actions and are for the attribution only.
+    fn action_locality_profile<'py>(
+        &self,
+        basis: PyReadonlyArray2<'py, u8>,
+        mode: u8,
+    ) -> PyResult<Vec<Vec<u64>>> {
+        dispatch!(&self.inner, s => action_locality_profile_impl(s, basis, mode))
+    }
+
+    /// `(tuples, sets, exclusive sets, bytes)` of the support tables (builds the index).
+    fn support_stats(&self) -> (usize, usize, usize, usize) {
+        dispatch!(&self.inner, s => s.support_stats())
+    }
+
     /// Apply `L*` to a single Pauli string `p`.
     fn action<'py>(
         &self,
@@ -786,6 +1122,7 @@ impl LindbladSpec {
         num_threads = None,
         admit_basis = None,
         tau_add = None,
+        locality = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn pc_step<'py>(
@@ -800,6 +1137,7 @@ impl LindbladSpec {
         num_threads: Option<usize>,
         admit_basis: Option<usize>,
         tau_add: Option<f64>,
+        locality: bool,
     ) -> PyResult<PyPauliMap<'py>> {
         let cfg = ppvm_lindblad::PcStepConfig {
             max_basis,
@@ -807,6 +1145,7 @@ impl LindbladSpec {
             drop_tol,
             tau_add,
             num_threads,
+            locality,
         };
         let (map, _) =
             dispatch!(&self.inner, s => pc_step_impl(s, py, basis, coeffs, dt, cfg, protected, false))?;
@@ -822,6 +1161,7 @@ impl LindbladSpec {
         num_threads = None,
         admit_basis = None,
         tau_add = None,
+        locality = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn pc_step_timed<'py>(
@@ -836,6 +1176,7 @@ impl LindbladSpec {
         num_threads: Option<usize>,
         admit_basis: Option<usize>,
         tau_add: Option<f64>,
+        locality: bool,
     ) -> PyResult<(PyPauliMap<'py>, Bound<'py, pyo3::types::PyDict>)> {
         let cfg = ppvm_lindblad::PcStepConfig {
             max_basis,
@@ -843,6 +1184,7 @@ impl LindbladSpec {
             drop_tol,
             tau_add,
             num_threads,
+            locality,
         };
         let (map, timings) =
             dispatch!(&self.inner, s => pc_step_impl(s, py, basis, coeffs, dt, cfg, protected, true))?;
@@ -854,6 +1196,23 @@ impl LindbladSpec {
         d.set_item("leakage2_us", timings.leakage2_us)?;
         d.set_item("expand2_us", timings.expand2_us)?;
         d.set_item("expm2_us", timings.expm2_us)?;
+        d.set_item("build1_us", timings.build1_us)?;
+        d.set_item("build2_us", timings.build2_us)?;
+        d.set_item("prune_cap_us", timings.prune_cap_us)?;
+        let l = &timings.locality;
+        d.set_item("leak_action_us", l.leak_action_us)?;
+        d.set_item("leak_cache_us", l.leak_cache_us)?;
+        d.set_item("leak_merge_us", l.leak_merge_us)?;
+        d.set_item("leak_cap_us", l.leak_cap_us)?;
+        d.set_item("leak_sort_us", l.leak_sort_us)?;
+        d.set_item("build_index_us", l.build_index_us)?;
+        d.set_item("build_hit_us", l.build_hit_us)?;
+        d.set_item("build_miss_us", l.build_miss_us)?;
+        d.set_item("leak_words_n", l.leak_words)?;
+        d.set_item("leak_merged_n", l.leak_merged)?;
+        d.set_item("leak_strings_n", l.leak_strings)?;
+        d.set_item("build_hits_n", l.build_hits)?;
+        d.set_item("build_misses_n", l.build_misses)?;
         Ok((map, d))
     }
 
@@ -909,6 +1268,7 @@ impl LindbladSpec {
             drop_tol,
             tau_add,
             num_threads: None,
+            locality: false,
         };
         dispatch!(&self.inner, s => pc_step_orbit_rep_impl(
             s, py, basis, coeffs, dt, cfg, group, momentum, protected, canonicalize_first))
