@@ -61,6 +61,10 @@ pub enum Error {
         c: usize,
         d: usize,
     },
+    /// Factor-form Kossakowski input (`add_kossakowski_factor` /
+    /// `set_kossakowski_factor`): shapes, signs or masks that do not describe
+    /// a block `K_b = (G G†) ∘ W + diag(D)`.
+    KossakowskiFactor(String),
     Internal(String),
 }
 
@@ -123,6 +127,7 @@ impl fmt::Display for Error {
                 f,
                 "reset mask ({c}, {d}): species pair out of range, equal, or a qubit beyond n_qubits"
             ),
+            Error::KossakowskiFactor(msg) => write!(f, "kossakowski factor: {msg}"),
             Error::Internal(msg) => write!(f, "internal error: {msg}"),
         }
     }

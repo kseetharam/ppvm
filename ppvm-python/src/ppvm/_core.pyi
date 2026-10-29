@@ -396,6 +396,38 @@ class LindbladSpec:
     @property
     def kossakowski(self) -> np.ndarray: ...
     def set_kossakowski(self, k: np.ndarray) -> None: ...
+    def add_kossakowski_factor(
+        self,
+        ops: list[list[tuple[str, float, float]]],
+        sizes: list[int],
+        ranks: list[int],
+        g_values: np.ndarray,
+        d_values: np.ndarray,
+        mask: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = ...,
+        neg_ranks: list[int] | None = ...,
+        g_neg_values: np.ndarray | None = ...,
+        private: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = ...,
+    ) -> None: ...
+    def set_kossakowski_factor(
+        self,
+        sizes: list[int],
+        ranks: list[int],
+        g_values: np.ndarray,
+        d_values: np.ndarray,
+        mask: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = ...,
+        neg_ranks: list[int] | None = ...,
+        g_neg_values: np.ndarray | None = ...,
+        private: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = ...,
+    ) -> None: ...
+    @property
+    def num_kossakowski_factor_ops(self) -> int: ...
+    @property
+    def num_kossakowski_factor_blocks(self) -> int: ...
+    @property
+    def kossakowski_factor_memory_bytes(self) -> tuple[int, int]: ...
+    @property
+    def kossakowski_factor_floor(self) -> float: ...
+    def kossakowski_factor_dense_block(self, b: int) -> np.ndarray: ...
     def action(self, p: np.ndarray) -> tuple[np.ndarray, np.ndarray]: ...
     def leakage(
         self,

@@ -191,6 +191,119 @@ def _normalize_jump(jump_op: str | PauliLincomb) -> list[tuple[str, float, float
     return out
 
 
+def _csr_parts(m, what: str):
+    """``(indptr, indices, data)`` of a CSR-like object (attributes or a 3-tuple), copied to int64 / int64 / ndarray."""
+    if isinstance(m, tuple) and len(m) == 3:
+        indptr, indices, data = m
+    else:
+        try:
+            indptr, indices, data = m.indptr, m.indices, m.data
+        except AttributeError:
+            raise TypeError(f"{what}: expected a CSR-like object with indptr / indices / data, got {type(m).__name__}") from None
+    return (
+        np.ascontiguousarray(indptr, dtype=np.int64),
+        np.ascontiguousarray(indices, dtype=np.int64),
+        np.asarray(data),
+    )
+
+
+def _concat_csr(parts, sizes, what: str, dtype):
+    """Concatenate per-block CSR parts (``None`` = empty row set) into the flat ``(indptr, indices, data, offsets)``."""
+    indptr, indices, data, offsets = [], [], [], [0]
+    for b, (m, s) in enumerate(zip(parts, sizes)):
+        if m is None:
+            ip = np.zeros(s + 1, dtype=np.int64)
+            ix = np.zeros(0, dtype=np.int64)
+            dt = np.zeros(0, dtype=dtype)
+        else:
+            ip, ix, dt = _csr_parts(m, f"{what} block {b}")
+            if ip.shape != (s + 1,):
+                raise ValueError(f"{what} block {b}: indptr has shape {ip.shape}, expected ({s + 1},)")
+            dt = np.ascontiguousarray(dt, dtype=dtype)
+        indptr.append(ip)
+        indices.append(ix)
+        data.append(dt)
+        offsets.append(offsets[-1] + s + 1)
+    return (
+        np.concatenate(indptr) if indptr else np.zeros(0, dtype=np.int64),
+        np.concatenate(indices) if indices else np.zeros(0, dtype=np.int64),
+        np.concatenate(data) if data else np.zeros(0, dtype=dtype),
+        np.asarray(offsets, dtype=np.int64),
+    )
+
+
+def _normalize_factor(factor, m: int, *, what: str):
+    """The flat arguments of ``_core.LindbladSpec.add_kossakowski_factor`` from a factor-form object (docstring of
+    `Lindbladian`): ``(sizes, ranks, G_values, D_values, mask, neg_ranks, G_neg_values, private)``; validated shapes,
+    ``D ≥ 0``, finite entries, ``Σ sizes == m``."""
+    get = (lambda k: factor.get(k)) if isinstance(factor, dict) else (lambda k: getattr(factor, k, None))
+    if get("G_values") is not None:
+        # the flat kfactor/1 layout
+        g_values = np.ascontiguousarray(get("G_values"), dtype=np.complex128).reshape(-1)
+        d_values = np.ascontiguousarray(get("D_values"), dtype=np.float64).reshape(-1)
+        d_off = np.asarray(get("D_offsets"), dtype=np.int64)
+        ranks = [int(r) for r in np.asarray(get("G_ranks"), dtype=np.int64)]
+        sizes = [int(x) for x in np.diff(d_off)]
+        g_off = np.asarray(get("G_offsets"), dtype=np.int64)
+        if len(ranks) != len(sizes) or g_off.shape != (len(sizes) + 1,):
+            raise ValueError(f"{what}: G_ranks / G_offsets / D_offsets disagree on the block count")
+        if any(int(g_off[b + 1] - g_off[b]) != sizes[b] * ranks[b] for b in range(len(sizes))):
+            raise ValueError(f"{what}: G_offsets do not match size x rank per block")
+        mask = None
+        if get("mask_indptr") is not None:
+            mask = tuple(
+                np.ascontiguousarray(get(k), dtype=t)
+                for k, t in (("mask_indptr", np.int64), ("mask_indices", np.int64), ("mask_data", np.float64), ("mask_offsets", np.int64))
+            )
+        neg_ranks = g_neg = None
+        if get("G_neg_values") is not None:
+            neg_ranks = [int(r) for r in np.asarray(get("G_neg_ranks"), dtype=np.int64)]
+            g_neg = np.ascontiguousarray(get("G_neg_values"), dtype=np.complex128).reshape(-1)
+        private = None
+        if get("private_offdiag_indptr") is not None:
+            private = tuple(
+                np.ascontiguousarray(get(k), dtype=t)
+                for k, t in (("private_offdiag_indptr", np.int64), ("private_offdiag_indices", np.int64),
+                             ("private_offdiag_data", np.complex128), ("private_offdiag_offsets", np.int64))
+            )
+    else:
+        G, D = get("G"), get("D")
+        if G is None or D is None:
+            raise TypeError(f"{what}: expected G and D per block (or the flat G_values / D_values layout)")
+        G = [np.ascontiguousarray(g, dtype=np.complex128) for g in G]
+        D = [np.ascontiguousarray(d, dtype=np.float64).reshape(-1) for d in D]
+        if len(G) != len(D):
+            raise ValueError(f"{what}: {len(G)} G blocks but {len(D)} D blocks")
+        sizes, ranks = [], []
+        for b, (g, d) in enumerate(zip(G, D)):
+            if g.ndim != 2 or g.shape[0] != d.shape[0]:
+                raise ValueError(f"{what} block {b}: G has shape {g.shape}, D has {d.shape}")
+            sizes.append(int(g.shape[0]))
+            ranks.append(int(g.shape[1]))
+        g_values = np.concatenate([g.reshape(-1) for g in G]) if G else np.zeros(0, dtype=np.complex128)
+        d_values = np.concatenate(D) if D else np.zeros(0, dtype=np.float64)
+        masks = get("mask")
+        mask = None if masks is None or all(x is None for x in masks) else _concat_csr(list(masks), sizes, f"{what} mask", np.float64)
+        neg = get("G_neg")
+        neg_ranks = g_neg = None
+        if neg is not None and any(x is not None and np.asarray(x).shape[1] for x in neg):
+            neg = [np.zeros((s, 0), dtype=np.complex128) if x is None else np.ascontiguousarray(x, dtype=np.complex128) for x, s in zip(neg, sizes)]
+            for b, (x, s) in enumerate(zip(neg, sizes)):
+                if x.ndim != 2 or x.shape[0] != s:
+                    raise ValueError(f"{what} block {b}: G_neg has shape {x.shape}, expected ({s}, r_neg)")
+            neg_ranks = [int(x.shape[1]) for x in neg]
+            g_neg = np.concatenate([x.reshape(-1) for x in neg])
+        po = get("private_offdiag")
+        private = None if po is None or all(x is None for x in po) else _concat_csr(list(po), sizes, f"{what} private_offdiag", np.complex128)
+    if sum(sizes) != m:
+        raise ValueError(f"{what}: the blocks hold {sum(sizes)} operators but ops has length {m}")
+    if d_values.size and (not np.all(np.isfinite(d_values)) or d_values.min() < 0.0):
+        raise ValueError(f"{what}: D must be finite and non-negative (min {d_values.min() if d_values.size else 0})")
+    if not np.all(np.isfinite(g_values.view(np.float64))):
+        raise ValueError(f"{what}: G has a non-finite entry")
+    return sizes, ranks, g_values, d_values, mask, neg_ranks, g_neg, private
+
+
 class Lindbladian:
     """Pre-compiled adjoint Pauli-Lindbladian acting on Pauli strings.
 
@@ -231,6 +344,24 @@ class Lindbladian:
         ``ValueError`` if ``K`` is not Hermitian or has an eigenvalue
         below ``−tol·‖K‖`` (a non-PSD ``K`` is not a valid GKSL
         generator; no silent clipping).
+    kossakowski_factor:
+        Optional ``(ops, factor)`` pair adding a Kossakowski-form dissipator
+        given per block in **factor form**, applied without a per-pair
+        table (memory ``Σ_b s_b r_b`` instead of ``Σ_b s_b²``):
+        ``K_b = (G_b G_b† − G_neg,b G_neg,b†) ∘ W_b + P_b + diag(D_b)``, blocks
+        partitioning ``ops`` in order. ``factor`` is either an object / dict
+        with ``G`` (per block, ``(s_b, r_b)`` complex), ``D`` (per block,
+        ``(s_b,)`` float ≥ 0) and optional ``mask`` (per block, a CSR-like
+        object with ``indptr`` / ``indices`` / ``data`` or ``None``;
+        ``W_b`` real, diagonal present), ``G_neg`` (per block, ``(s_b,
+        r_neg)``) and ``private_offdiag`` (per block, complex CSR or
+        ``None``), or the flat ``nmr-csim-kfactor/1`` arrays ``G_values /
+        G_offsets / G_ranks / D_values / D_offsets`` with the optional
+        ``mask_*``, ``G_neg_*`` and ``private_offdiag_*`` members. PSD is
+        the caller's responsibility (``check_psd`` has no eigensolve here:
+        a Gram form plus a non-negative diagonal is PSD; masked / unclipped
+        forms carry their own records). May coexist with ``kossakowski``
+        (a dense block for a few extra operators) and ``jump_terms``.
 
     Examples
     --------
@@ -260,6 +391,7 @@ class Lindbladian:
         jump_terms: Iterable[tuple[str | PauliLincomb, float]] = (),
         kossakowski: tuple[Sequence[str | PauliLincomb], object] | None = None,
         word_width: int | None = None,
+        kossakowski_factor: tuple[Sequence[str | PauliLincomb], object] | None = None,
     ):
         self.n_qubits = int(n_qubits)
         _check_n_qubits(self.n_qubits, "Lindbladian")
@@ -284,6 +416,11 @@ class Lindbladian:
             self.n_qubits, h_strs, h_coeffs, j_lincombs, j_rates, k_ops, k_mat,
             None if word_width is None else int(word_width),
         )
+        if kossakowski_factor is not None:
+            f_ops, factor = kossakowski_factor
+            f_ops = [_normalize_jump(op) for op in f_ops]
+            flat = _normalize_factor(factor, len(f_ops), what="kossakowski_factor")
+            self._spec.add_kossakowski_factor(f_ops, *flat)
 
     @property
     def word_width(self) -> int:
@@ -444,6 +581,42 @@ class Lindbladian:
             )
         K = self._validate_k(K, m, check_psd=check_psd, what="set_kossakowski: K")
         self._spec.set_kossakowski(K)
+
+    # ── factor-form Kossakowski dissipator ──
+
+    @property
+    def num_kossakowski_factor_ops(self) -> int:
+        """Number of operators of the ``kossakowski_factor`` dissipator (0 without one)."""
+        return self._spec.num_kossakowski_factor_ops
+
+    @property
+    def num_kossakowski_factor_blocks(self) -> int:
+        """Number of blocks of the ``kossakowski_factor`` dissipator (0 without one)."""
+        return self._spec.num_kossakowski_factor_blocks
+
+    @property
+    def kossakowski_factor_memory_bytes(self) -> tuple[int, int]:
+        """``(factor_bytes, ops_bytes)``: the bytes of ``G`` / ``G_neg`` / ``D`` / masks / private parts, and of the parsed operators."""
+        return tuple(self._spec.kossakowski_factor_memory_bytes)
+
+    @property
+    def kossakowski_factor_floor(self) -> float:
+        """The absolute compile floor of the factor dissipator (pairs with ``|K_nm|`` at or below it are skipped)."""
+        return float(self._spec.kossakowski_factor_floor)
+
+    def kossakowski_factor_dense_block(self, b: int) -> np.ndarray:
+        """Block ``b`` of the factor dissipator re-formed as a dense ``(s_b, s_b)`` complex128 array (inspection, tests)."""
+        return np.asarray(self._spec.kossakowski_factor_dense_block(int(b)))
+
+    def set_kossakowski_factor(self, factor) -> None:
+        """Replace ``G`` / ``G_neg`` / ``D`` / masks / private parts of the factor dissipator in place, keeping its operator
+        table (same number of blocks and block sizes; ``factor`` as in the constructor). ``ValueError`` when the object was
+        built without a ``kossakowski_factor`` or the shapes disagree. Later results are bit-identical to a fresh build."""
+        m = self._spec.num_kossakowski_factor_ops
+        if m == 0:
+            raise ValueError("set_kossakowski_factor: this Lindbladian was built without a kossakowski_factor block")
+        flat = _normalize_factor(factor, m, what="set_kossakowski_factor")
+        self._spec.set_kossakowski_factor(*flat)
 
     # ── Pure-ndarray hot path ──
 
