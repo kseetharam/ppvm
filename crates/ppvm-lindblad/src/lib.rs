@@ -275,6 +275,41 @@ fn pauli_mul<const W: usize>(p: &Word<W>, q: &Word<W>) -> (Word<W>, u8) {
     (out, ((2 * sign_count + imag_count) & 3) as u8)
 }
 
+/// [`pauli_mul`] for words in a Kossakowski pair's local frame: the same
+/// bits and phase, without the hash (the result is embedded into the
+/// register and hashed there).
+#[inline(always)]
+fn pauli_mul_local<const W: usize>(p: &Word<W>, q: &Word<W>) -> (Word<W>, u8) {
+    let mut out = Word::<W>::new(p.n_qubits());
+    let mut sign_count: u32 = 0;
+    let mut imag_count: u32 = 0;
+    for i in 0..W {
+        let a = p.xbits.data[i];
+        let b = p.zbits.data[i];
+        let c = q.xbits.data[i];
+        let d = q.zbits.data[i];
+        let sign = (a & b & c & !d) | (a & !b & !c & d) | (!a & b & c & d);
+        let imag = (a & !b & d) | (a & !c & d) | (!a & b & c) | (b & c & !d);
+        sign_count += sign.count_ones();
+        imag_count += imag.count_ones();
+        out.xbits.data[i] = a ^ c;
+        out.zbits.data[i] = b ^ d;
+    }
+    (out, ((2 * sign_count + imag_count) & 3) as u8)
+}
+
+/// [`comm_product`] on local-frame words ([`pauli_mul_local`]).
+#[inline(always)]
+fn comm_product_local<const W: usize>(h: &Word<W>, p: &Word<W>) -> (Word<W>, f64) {
+    let (out, phase) = pauli_mul_local(h, p);
+    let eps = match phase {
+        1 => -2.0,
+        3 => 2.0,
+        _ => 0.0,
+    };
+    (out, eps)
+}
+
 // ────────────────── Spec types ──────────────────
 
 /// Parsed Hamiltonian term.
@@ -297,25 +332,66 @@ struct PauliTerm<const W: usize> {
 /// computed once per group and reused across its `P_b` partners.
 type SandwichGroups<const W: usize> = Vec<(Word<W>, Vec<(Word<W>, Complex<f64>)>)>;
 
-/// The `K`-independent part of one Kossakowski pair `(n ≤ m)`, computed
-/// once per operator pair by [`LindbladSpec::add_kossakowski`] and reused
-/// by every [`LindbladSpec::set_kossakowski`]: the Pauli products of
+/// One Pauli term of a Kossakowski operator in the local frame of a pair,
+/// as part of a template key: the `x` / `z` bits over the local qubits and
+/// the exact coefficient bits.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct LocalTerm<const W: usize> {
+    x: [Chunk; W],
+    z: [Chunk; W],
+    re: u64,
+    im: u64,
+}
+
+/// The operator-pattern relationship of a pair `(A_n, A_m)`: both
+/// operators' terms, in order, relabelled into the pair's local frame
+/// (qubits numbered by first appearance over the terms of `A_n`, then
+/// `A_m`; [`LindbladSpec::pair_local_frame`]). Two pairs with the same key
+/// have the same Pauli products `A_n†A_m`, sandwich tables and support
+/// masks up to that relabelling — a qubit permutation changes no
+/// Pauli-product phase — so they share one [`PairTemplate`]. The
+/// tensor-pattern operators of a Redfield dissipator (the components
+/// `T^(l)_k` of every dipolar pair / CSA interaction) repeat the same few
+/// patterns across blocks, so the number of templates is bounded by the
+/// number of distinct patterns, not by the number of compiled pairs.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct TemplateKey<const W: usize> {
+    left: Vec<LocalTerm<W>>,
+    right: Vec<LocalTerm<W>>,
+}
+
+/// The `K`-independent compilation of one operator-pattern relationship,
+/// in the pair's local frame (qubits `0..n_local`): the Pauli products of
 /// `A_n†A_m`, the sandwich word table with coefficients `λ_a*·μ_b` (no
-/// `K_nm` yet), the support masks and the per-qubit support union. Turning
-/// it into a `JumpKind::KossakowskiPair` is one complex multiply per
-/// stored coefficient.
+/// `K_nm` yet) and the support masks. Shared by every compiled pair with
+/// the same [`TemplateKey`]; the pair's own record ([`PairRef`] and its
+/// `JumpKind::KossakowskiPair` entry) holds `K_nm` and the qubit map that
+/// embeds the local frame into the register. Built once per distinct key
+/// ([`LindbladSpec::pair_ref`]); the action folds `K_nm` in on the fly
+/// (one complex multiply per table coefficient, the same products the
+/// fully precompiled per-pair tables held).
 #[derive(Clone)]
 struct PairTemplate<const W: usize> {
-    n: usize,
-    m: usize,
-    /// `A_n†A_m = Σ_w γ_w W` (FP-noise zeros dropped).
+    /// Number of qubits of the local frame (the union support of the pair).
+    n_local: u16,
+    /// `A_n†A_m = Σ_w γ_w W` (FP-noise zeros dropped), local words.
     adag_b: Vec<PauliTerm<W>>,
-    /// `(P_a, [(P_b, λ_a*·μ_b), …])` grouped by the left word.
+    /// `(P_a, [(P_b, λ_a*·μ_b), …])` grouped by the left word, local words.
     sand: SandwichGroups<W>,
+    /// Support bit masks (`xbits | zbits` union) of `A_n` and `A_m`, local frame.
     left_mask: [Chunk; W],
     right_mask: [Chunk; W],
-    /// Sorted union of the supports of `A_n` and `A_m`.
-    support: Vec<u32>,
+}
+
+/// One compiled pair `(n ≤ m)`: its template and the start of its qubit
+/// map (local index → register qubit, `n_local` entries) in
+/// `LindbladSpec::k_pair_qubits`.
+#[derive(Clone, Copy)]
+struct PairRef {
+    n: u32,
+    m: u32,
+    template: u32,
+    q_off: u32,
 }
 
 /// One jump operator `L_k` with rate `γ_k`. The `HermitianPauli` variant
@@ -336,36 +412,31 @@ enum JumpKind<const W: usize> {
         rate: f64,
     },
     /// One `(n, m)` pair of a Kossakowski-form dissipator
-    /// `D*(O) = Σ_{n,m} K_nm (A_n† O A_m − ½ {A_n† A_m, O})`, fully
-    /// precompiled: `sand` groups the sandwich terms by the left word `P_a`
-    /// — one `(P_a, [(P_b, λ_a*·μ_b·K_nm), …])` group per distinct `P_a` —
-    /// so `P_a · p` is computed once per group instead of once per
-    /// `(P_a, P_b)` pair (a win when `A_n` has several Pauli terms, e.g. the
-    /// 2-local rank-2 tensors of dipolar relaxation). `dd` is the lincomb
-    /// `−K_nm · A_n†A_m` (the ½ cancels the anticommutator's 2). Coefficients
-    /// are complex — not Hermitian per pair; Hermiticity of the total action
-    /// is restored by the conjugate `(m, n)` pair.
+    /// `D*(O) = Σ_{n,m} K_nm (A_n† O A_m − ½ {A_n† A_m, O})`: the shared
+    /// `K`-independent template (index into `LindbladSpec::k_templates`),
+    /// the qubit map that embeds the template's local frame into the
+    /// register (`n_local` entries of `LindbladSpec::k_pair_qubits` from
+    /// `q_off`) and `K_nm`. The action restricts the input word to the
+    /// pair's qubits, runs the template's sandwich table — grouped by the
+    /// left word `P_a`, so `P_a · p` is computed once per group and reused
+    /// across its `P_b` partners (a win when `A_n` has several Pauli terms,
+    /// e.g. the 2-local rank-2 tensors of dipolar relaxation) — and its
+    /// anticommutator table `−K_nm · A_n†A_m` (the ½ cancels the
+    /// anticommutator's 2) in that frame, folding `λ_a*·μ_b·K_nm` in on
+    /// the fly, and embeds the output words back. Coefficients are complex
+    /// — not Hermitian per pair; Hermiticity of the total action is
+    /// restored by folding the conjugate `(m, n)` pair.
     KossakowskiPair {
-        sand: SandwichGroups<W>,
-        /// Diagonal pair (`n == m`): `K_nn · A_n†A_n`.
-        /// Off-diagonal pair (`n < m`, folds in the conjugate `(m,n)`):
-        /// the Hermitian sum `2·Re(K_nm·A_n†A_m)` (real coefficients), for
-        /// the both-sided anticommutator.
-        dd: Vec<PauliTerm<W>>,
-        /// Off-diagonal only: the anti-Hermitian difference
-        /// `−2i·Im(K_nm·A_n†A_m)` (pure-imaginary coefficients), for the
-        /// one-sided commutator of the folded conjugate pair. Empty on the
-        /// diagonal.
-        dd_anti: Vec<PauliTerm<W>>,
+        template: u32,
+        q_off: u32,
         /// `true` for a folded off-diagonal pair (`n < m`): the both-sided
-        /// sandwich doubles and takes the real part, and the one-sided path
-        /// uses `dd_anti`. `false` on the diagonal (original single-pair
+        /// sandwich doubles and takes the real part, the anticommutator
+        /// uses the Hermitian sum `2·Re(K_nm·A_n†A_m)` and the one-sided
+        /// path the anti-Hermitian difference `−2i·Im(K_nm·A_n†A_m)`.
+        /// `false` on the diagonal (`K_nn · A_n†A_n`, original single-pair
         /// handling).
         off_diag: bool,
-        /// Support bit masks (`xbits | zbits` union) of `A_n` and `A_m`,
-        /// for the one-sided fast path in the action.
-        left_mask: [Chunk; W],
-        right_mask: [Chunk; W],
+        k_nm: Complex<f64>,
     },
 }
 
@@ -432,6 +503,103 @@ fn check_k_matrix(
     Ok(())
 }
 
+/// One stored entry `(row, col, K[row][col])` of the Kossakowski matrix.
+pub type KEntry = (u32, u32, Complex<f64>);
+
+/// Bring `(row, col, value)` triples over an `m_ops`-operator table into the
+/// stored form: indices checked, sorted by `(row, col)`, duplicates summed
+/// (the COO convention), exact zeros dropped. No Hermiticity check here
+/// ([`hermitian_completion`] does it on the merged list).
+fn ingest_k_entries(
+    entries: impl IntoIterator<Item = (usize, usize, Complex<f64>)>,
+    m_ops: usize,
+    what: &'static str,
+) -> Result<Vec<KEntry>, Error> {
+    let mut out: Vec<KEntry> = Vec::new();
+    for (r, c, v) in entries {
+        for &i in &[r, c] {
+            if i >= m_ops {
+                return Err(Error::KIndexOutOfRange {
+                    what,
+                    index: i,
+                    m_ops,
+                });
+            }
+        }
+        out.push((r as u32, c as u32, v));
+    }
+    out.sort_by_key(|&(r, c, _)| (r, c));
+    let mut merged: Vec<KEntry> = Vec::with_capacity(out.len());
+    for e in out {
+        if let Some(last) = merged.last_mut() {
+            if last.0 == e.0 && last.1 == e.1 {
+                last.2 += e.2;
+                continue;
+            }
+        }
+        merged.push(e);
+    }
+    merged.retain(|e| e.2.re != 0.0 || e.2.im != 0.0);
+    Ok(merged)
+}
+
+/// The nonzero entries of a dense (already Hermitian-checked) `K`, offset
+/// by `base` on both indices, in row-major order — the stored form of a
+/// dense input.
+fn dense_k_entries(k: &[Vec<Complex<f64>>], base: usize) -> impl Iterator<Item = KEntry> + '_ {
+    k.iter().enumerate().flat_map(move |(n, row)| {
+        row.iter().enumerate().filter_map(move |(m, &v)| {
+            (v.re != 0.0 || v.im != 0.0).then_some(((base + n) as u32, (base + m) as u32, v))
+        })
+    })
+}
+
+/// Check sorted, deduplicated entries for Hermiticity to
+/// `1e-10·max(max|K|, 1)` — the tolerance of [`check_k_matrix`] — and return
+/// the Hermitian completion: every entry as stored plus the conjugate mirror
+/// of each off-diagonal entry whose mirror was not given (a one-sided COO
+/// input: "only one triangle" means "the other is its conjugate"). A
+/// diagonal entry must be real to the tolerance; an off-diagonal entry
+/// present in both triangles must match its mirror's conjugate. Sorted by
+/// `(row, col)`.
+fn hermitian_completion(entries: &[KEntry]) -> Result<Vec<KEntry>, Error> {
+    let max_abs = entries
+        .iter()
+        .map(|e| e.2.norm())
+        .fold(0.0_f64, f64::max);
+    let tol = 1e-10 * max_abs.max(1.0);
+    let mut out: Vec<KEntry> = Vec::with_capacity(entries.len());
+    for &(r, c, v) in entries {
+        if r == c {
+            if (v - v.conj()).norm() > tol {
+                return Err(Error::KMatrixNotHermitian {
+                    n: r as usize,
+                    m: c as usize,
+                });
+            }
+            out.push((r, c, v));
+            continue;
+        }
+        match entries.binary_search_by_key(&(c, r), |e| (e.0, e.1)) {
+            Ok(j) => {
+                if (v - entries[j].2.conj()).norm() > tol {
+                    return Err(Error::KMatrixNotHermitian {
+                        n: r.min(c) as usize,
+                        m: r.max(c) as usize,
+                    });
+                }
+                out.push((r, c, v));
+            }
+            Err(_) => {
+                out.push((r, c, v));
+                out.push((c, r, v.conj()));
+            }
+        }
+    }
+    out.sort_by_key(|&(r, c, _)| (r, c));
+    Ok(out)
+}
+
 /// Precompiled Lindbladian. Constructed once from string-form Hamiltonian
 /// terms + jump operators; reused across many calls to [`Self::action`],
 /// [`Self::leakage`], [`Self::generator`]. `L*(p)` is recomputed on every
@@ -453,13 +621,33 @@ pub struct LindbladSpec<const W: usize = W_CHUNKS> {
     k_ops: Vec<Vec<PauliTerm<W>>>,
     /// Per-qubit support of each `k_ops` entry (sorted qubit indices).
     k_op_support: Vec<Vec<u32>>,
-    /// `K`-independent precompilation of every pair `n ≤ m` of `k_ops`, in
-    /// the `(n, m)` lexicographic order the constructor compiles them in.
-    k_pairs: Vec<PairTemplate<W>>,
-    /// Current Kossakowski matrix over the whole `k_ops` table, row-major
-    /// (`k_mat[n][m] = K_nm`); block-diagonal when several blocks were
-    /// added. Source of truth for [`Self::rebuild_kossakowski_pairs`].
-    k_mat: Vec<Vec<Complex<f64>>>,
+    /// The compiled pairs `n ≤ m` of `k_ops` that are non-negligible in the
+    /// current `K` (`|K_nm| > 1e-14·max|K|`), in `(n, m)` lexicographic
+    /// order — the order the dense constructor always compiled them in.
+    /// Pairs that are zero in `K` (the off-block entries of a
+    /// block-diagonal `K`) get no record, so the memory is `O(nonzero
+    /// pairs)`, never `O(M²)`; a record is a few words (template index,
+    /// qubit map offset) — the Pauli tables live in the shared
+    /// `k_templates`. Records survive a `set_kossakowski*` call while their
+    /// pair stays non-negligible ([`Self::recompile_kossakowski`]).
+    k_pairs: Vec<PairRef>,
+    /// `K_nm` of each `k_pairs` entry (parallel to `k_pairs`).
+    k_vals: Vec<Complex<f64>>,
+    /// The distinct pair templates in use: one per operator-pattern
+    /// relationship ([`TemplateKey`]) among the compiled pairs; `k_pairs`
+    /// and the `KossakowskiPair` entries index into it.
+    k_templates: Vec<PairTemplate<W>>,
+    /// Key → index into `k_templates`.
+    k_template_index: FxHashMap<TemplateKey<W>, u32>,
+    /// Qubit maps of the compiled pairs, concatenated: `k_pairs[i]` owns
+    /// `k_pair_qubits[q_off..q_off + n_local]` (local index → qubit).
+    k_pair_qubits: Vec<u16>,
+    /// Current Kossakowski matrix over the whole `k_ops` table in sparse
+    /// form: every nonzero `(row, col, K[row][col])`, both triangles,
+    /// Hermitian-completed, sorted by `(row, col)`. Source of truth for
+    /// [`Self::kossakowski`] / [`Self::kossakowski_entries`]; the dense
+    /// matrix is never stored.
+    k_entries: Vec<KEntry>,
     /// User-facing GKSL rates `γ_k` of the jump operators given to
     /// [`Self::new`], in construction order. `j_kinds[..j_rates.len()]`
     /// are those jumps; every later entry is a `KossakowskiPair`.
@@ -563,7 +751,11 @@ impl<const W: usize> LindbladSpec<W> {
             k_ops: Vec::new(),
             k_op_support: Vec::new(),
             k_pairs: Vec::new(),
-            k_mat: Vec::new(),
+            k_vals: Vec::new(),
+            k_templates: Vec::new(),
+            k_template_index: FxHashMap::default(),
+            k_pair_qubits: Vec::new(),
+            k_entries: Vec::new(),
             j_rates,
         })
     }
@@ -590,9 +782,45 @@ impl<const W: usize> LindbladSpec<W> {
     ) -> Result<(), Error> {
         let m_ops = ops.len();
         check_k_matrix(k, m_ops, "kossakowski ops and K rows", "kossakowski K row and ops")?;
+        let base = self.push_k_ops(ops)?;
+        let mut entries = self.k_entries.clone();
+        entries.extend(dense_k_entries(k, base));
+        self.recompile_kossakowski(entries)
+    }
 
-        // Parse the operator table once; record per-op support.
-        let base = self.k_ops.len();
+    /// [`Self::add_kossakowski`] with the pair matrix given as COO triples
+    /// `(row, col, K[row][col])` over the indices `0..ops.len()` of this
+    /// block (both triangles, or one triangle to be Hermitian-completed —
+    /// see [`Self::set_kossakowski_sparse`]), so a block-sparse `K` over
+    /// thousands of operators is never materialised.
+    pub fn add_kossakowski_sparse(
+        &mut self,
+        ops: &[Vec<(String, Complex<f64>)>],
+        entries: &[(usize, usize, Complex<f64>)],
+    ) -> Result<(), Error> {
+        let m_ops = ops.len();
+        let block = ingest_k_entries(
+            entries.iter().copied(),
+            m_ops,
+            "add_kossakowski_sparse",
+        )?;
+        hermitian_completion(&block)?;
+        let base = self.push_k_ops(ops)?;
+        let mut all = self.k_entries.clone();
+        all.extend(
+            block
+                .into_iter()
+                .map(|(r, c, v)| (r + base as u32, c + base as u32, v)),
+        );
+        self.recompile_kossakowski(all)
+    }
+
+    /// Parse an operator table into `k_ops` / `k_op_support` (appended;
+    /// nothing is pushed when a string fails to parse). Returns the index
+    /// of the first new operator.
+    fn push_k_ops(&mut self, ops: &[Vec<(String, Complex<f64>)>]) -> Result<usize, Error> {
+        let mut parsed: Vec<Vec<PauliTerm<W>>> = Vec::with_capacity(ops.len());
+        let mut supports: Vec<Vec<u32>> = Vec::with_capacity(ops.len());
         for (i, op) in ops.iter().enumerate() {
             if op.is_empty() {
                 return Err(Error::EmptyLincomb { index: i });
@@ -607,27 +835,88 @@ impl<const W: usize> LindbladSpec<W> {
                 }
                 terms.push(PauliTerm { word, coeff: *c });
             }
-            self.k_op_support.push(union_support.into_iter().collect());
-            self.k_ops.push(terms);
+            supports.push(union_support.into_iter().collect());
+            parsed.push(terms);
         }
+        let base = self.k_ops.len();
+        self.k_ops.extend(parsed);
+        self.k_op_support.extend(supports);
+        Ok(base)
+    }
 
-        // Extend the stored matrix block-diagonally: zero cross-block
-        // entries (dropped by the pair loop, so a second block behaves
-        // exactly as before this bookkeeping existed).
-        let total = base + m_ops;
-        let zero = Complex::new(0.0, 0.0);
-        for row in self.k_mat.iter_mut() {
-            row.resize(total, zero);
-        }
-        for row in k {
-            let mut full = vec![zero; total];
-            full[base..].copy_from_slice(row);
-            self.k_mat.push(full);
-        }
+    /// The local frame of the pair `(n, m)`: the qubit map (local index →
+    /// register qubit; qubits numbered by first appearance over the terms
+    /// of `A_n`, then `A_m`, each term's qubits in increasing order) and
+    /// the two operators relabelled into it. The relabelling is a qubit
+    /// permutation, so every Pauli product and phase of the pair is the
+    /// same in the local frame as in the register.
+    #[allow(clippy::type_complexity)]
+    fn pair_local_frame(
+        &self,
+        n: usize,
+        m: usize,
+    ) -> (Vec<u16>, Vec<PauliTerm<W>>, Vec<PauliTerm<W>>) {
+        // Qubit indices are `u16` (the widest compiled word holds 1 088).
+        let mut qubits: Vec<u16> = Vec::new();
+        let mut local_of = vec![u16::MAX; self.n_qubits];
+        let n_qubits = self.n_qubits;
+        let mut relabel = |terms: &[PauliTerm<W>], support: &[u32]| -> Vec<PauliTerm<W>> {
+            terms
+                .iter()
+                .map(|t| {
+                    let mut w = Word::<W>::new(n_qubits);
+                    for &q in support {
+                        let q = q as usize;
+                        let (x, z) = (t.word.xbits[q], t.word.zbits[q]);
+                        if x || z {
+                            if local_of[q] == u16::MAX {
+                                local_of[q] = qubits.len() as u16;
+                                qubits.push(q as u16);
+                            }
+                            let li = local_of[q] as usize;
+                            w.xbits.set(li, x);
+                            w.zbits.set(li, z);
+                        }
+                    }
+                    w.rehash();
+                    PauliTerm { word: w, coeff: t.coeff }
+                })
+                .collect()
+        };
+        let left = relabel(&self.k_ops[n], &self.k_op_support[n]);
+        let right = relabel(&self.k_ops[m], &self.k_op_support[m]);
+        (qubits, left, right)
+    }
 
-        // K-independent part of every pair `n ≤ m` over the whole table
-        // (templates of earlier blocks are recomputed; the result is the
-        // same, and Python only ever adds one block).
+    /// The template key of a pair given in its local frame: the terms of
+    /// both operators, in order, with their exact coefficient bits.
+    fn template_key(left: &[PauliTerm<W>], right: &[PauliTerm<W>]) -> TemplateKey<W> {
+        let local = |terms: &[PauliTerm<W>]| -> Vec<LocalTerm<W>> {
+            terms
+                .iter()
+                .map(|t| LocalTerm {
+                    x: t.word.xbits.data,
+                    z: t.word.zbits.data,
+                    re: t.coeff.re.to_bits(),
+                    im: t.coeff.im.to_bits(),
+                })
+                .collect()
+        };
+        TemplateKey {
+            left: local(left),
+            right: local(right),
+        }
+    }
+
+    /// The `K`-independent template of a pair given in its local frame:
+    /// `A_n†A_m`, the sandwich table `λ_a*·μ_b` and the support masks — the
+    /// per-pair precompilation of the dense constructor, now done once per
+    /// distinct [`TemplateKey`].
+    fn build_template(
+        left: &[PauliTerm<W>],
+        right: &[PauliTerm<W>],
+        n_local: usize,
+    ) -> PairTemplate<W> {
         let support_mask = |terms: &[PauliTerm<W>]| {
             let mut mask = [0 as Chunk; W];
             for t in terms {
@@ -637,33 +926,132 @@ impl<const W: usize> LindbladSpec<W> {
             }
             mask
         };
-        self.k_pairs.clear();
-        for n in 0..total {
-            for m in n..total {
-                let adag_b = precompute_adag_b(&self.k_ops[n], &self.k_ops[m]);
-                let mut sand = Vec::with_capacity(self.k_ops[n].len());
-                for a in &self.k_ops[n] {
-                    let rights = self.k_ops[m]
-                        .iter()
-                        .map(|b| (b.word, a.coeff.conj() * b.coeff))
-                        .collect();
-                    sand.push((a.word, rights));
-                }
-                let mut union: std::collections::BTreeSet<u32> =
-                    self.k_op_support[n].iter().copied().collect();
-                union.extend(self.k_op_support[m].iter().copied());
-                self.k_pairs.push(PairTemplate {
-                    n,
-                    m,
-                    adag_b,
-                    sand,
-                    left_mask: support_mask(&self.k_ops[n]),
-                    right_mask: support_mask(&self.k_ops[m]),
-                    support: union.into_iter().collect(),
-                });
+        let adag_b = precompute_adag_b(left, right);
+        let mut sand = Vec::with_capacity(left.len());
+        for a in left {
+            let rights = right
+                .iter()
+                .map(|b| (b.word, a.coeff.conj() * b.coeff))
+                .collect();
+            sand.push((a.word, rights));
+        }
+        PairTemplate {
+            n_local: n_local as u16,
+            adag_b,
+            sand,
+            left_mask: support_mask(left),
+            right_mask: support_mask(right),
+        }
+    }
+
+    /// The record of the pair `(n, m)`: its template (looked up by key,
+    /// built when the key is new) and its qubit map, appended to
+    /// `k_pair_qubits`.
+    fn pair_ref(&mut self, n: usize, m: usize) -> PairRef {
+        let (qubits, left, right) = self.pair_local_frame(n, m);
+        let key = Self::template_key(&left, &right);
+        let template = match self.k_template_index.get(&key) {
+            Some(&t) => t,
+            None => {
+                let t = self.k_templates.len() as u32;
+                self.k_templates
+                    .push(Self::build_template(&left, &right, qubits.len()));
+                self.k_template_index.insert(key, t);
+                t
+            }
+        };
+        let q_off = self.k_pair_qubits.len() as u32;
+        self.k_pair_qubits.extend_from_slice(&qubits);
+        PairRef {
+            n: n as u32,
+            m: m as u32,
+            template,
+            q_off,
+        }
+    }
+
+    /// Drop the templates no compiled pair uses any more (a pattern that
+    /// left `K`), renumbering the survivors, so that
+    /// [`Self::num_pair_templates`] counts the distinct patterns of the
+    /// current pairs and the template memory is bounded by them.
+    fn prune_templates(&mut self) {
+        let mut used = vec![false; self.k_templates.len()];
+        for r in &self.k_pairs {
+            used[r.template as usize] = true;
+        }
+        if used.iter().all(|&u| u) {
+            return;
+        }
+        let mut new_index = vec![u32::MAX; self.k_templates.len()];
+        let mut kept = Vec::with_capacity(used.iter().filter(|&&u| u).count());
+        for (t, tpl) in std::mem::take(&mut self.k_templates).into_iter().enumerate() {
+            if used[t] {
+                new_index[t] = kept.len() as u32;
+                kept.push(tpl);
             }
         }
+        self.k_templates = kept;
+        self.k_template_index.retain(|_, t| {
+            let i = new_index[*t as usize];
+            *t = i;
+            i != u32::MAX
+        });
+        for r in &mut self.k_pairs {
+            r.template = new_index[r.template as usize];
+        }
+    }
 
+    /// Install a new Kossakowski matrix given as ingested entries
+    /// ([`ingest_k_entries`] form, over the whole operator table): check
+    /// Hermiticity and complete the mirrors, select the non-negligible
+    /// upper-triangle pairs (`|K_nm| > 1e-14·max|K|`, `n ≤ m`) in `(n, m)`
+    /// order, reuse the template of every pair that already has one and
+    /// build the templates of the new pairs, then rebuild the
+    /// `KossakowskiPair` entries. Nothing is modified when the check fails.
+    ///
+    /// The pair list, its order and every compiled coefficient are exactly
+    /// what the dense constructor produced for the same `K`, so the action
+    /// is bit-identical however `K` was given (dense, COO or blocks).
+    fn recompile_kossakowski(&mut self, entries: Vec<KEntry>) -> Result<(), Error> {
+        let full = hermitian_completion(&entries)?;
+        let max_abs = full.iter().map(|e| e.2.norm()).fold(0.0_f64, f64::max);
+        let pair_tol = 1e-14 * max_abs;
+        let kept: Vec<KEntry> = full
+            .iter()
+            .filter(|e| e.0 <= e.1 && e.2.norm() > pair_tol)
+            .copied()
+            .collect();
+
+        // Merge-walk the old records (sorted by (n, m)) against the kept
+        // pairs (sorted the same way): reuse the record — its template and
+        // qubit map, the map copied into the fresh arena — else build one.
+        let old_qubits = std::mem::take(&mut self.k_pair_qubits);
+        let mut old = std::mem::take(&mut self.k_pairs).into_iter().peekable();
+        let mut pairs: Vec<PairRef> = Vec::with_capacity(kept.len());
+        let mut vals: Vec<Complex<f64>> = Vec::with_capacity(kept.len());
+        for &(n, m, v) in &kept {
+            let key = (n, m);
+            while old.peek().is_some_and(|r| (r.n, r.m) < key) {
+                old.next();
+            }
+            let rec = if old.peek().is_some_and(|r| (r.n, r.m) == key) {
+                let r = old.next().expect("peeked");
+                let nl = self.k_templates[r.template as usize].n_local as usize;
+                let q_off = self.k_pair_qubits.len() as u32;
+                let start = r.q_off as usize;
+                self.k_pair_qubits
+                    .extend_from_slice(&old_qubits[start..start + nl]);
+                PairRef { q_off, ..r }
+            } else {
+                self.pair_ref(n as usize, m as usize)
+            };
+            pairs.push(rec);
+            vals.push(v);
+        }
+        self.k_pairs = pairs;
+        self.k_vals = vals;
+        self.k_entries = full;
+        self.prune_templates();
         self.rebuild_kossakowski_pairs();
         Ok(())
     }
@@ -681,10 +1069,15 @@ impl<const W: usize> LindbladSpec<W> {
     /// with the very same loop the constructor runs: the result is
     /// bit-identical to a spec freshly built with `k`. The Pauli products
     /// of `A_n†A_m` and the sandwich word tables are `K`-independent and
-    /// cached per pair ([`PairTemplate`]) at `add_kossakowski`, so the
-    /// rebuild is one complex multiply per stored coefficient
-    /// (`O(Σ_{n≤m} |A_n|·|A_m|)` multiplies, no Pauli arithmetic, no
-    /// hashing). The Hamiltonian and plain jump data are untouched.
+    /// cached per non-negligible pair ([`PairTemplate`]), so while the
+    /// zero pattern of `K` is unchanged (a drive rescaling a block-diagonal
+    /// `K`) the rebuild is one complex multiply per stored coefficient
+    /// (`O(Σ_{nonzero n≤m} |A_n|·|A_m|)` multiplies, no Pauli arithmetic,
+    /// no hashing); pairs new to the pattern are templated on the spot and
+    /// pairs that left it are dropped. The Hamiltonian and plain jump data
+    /// are untouched. For a large block-sparse `K` prefer
+    /// [`Self::set_kossakowski_sparse`] / [`Self::set_kossakowski_blocks`],
+    /// which never see the `M × M` matrix.
     pub fn set_kossakowski(&mut self, k: &[Vec<Complex<f64>>]) -> Result<(), Error> {
         let m_ops = self.k_ops.len();
         if m_ops == 0 {
@@ -696,15 +1089,166 @@ impl<const W: usize> LindbladSpec<W> {
             "set_kossakowski: num_kossakowski_ops vs K rows",
             "set_kossakowski: K row and num_kossakowski_ops",
         )?;
-        self.k_mat = k.to_vec();
-        self.rebuild_kossakowski_pairs();
-        Ok(())
+        let entries: Vec<KEntry> = dense_k_entries(k, 0).collect();
+        self.recompile_kossakowski(entries)
+    }
+
+    /// [`Self::set_kossakowski`] with `K` given as COO triples
+    /// `(row, col, K[row][col])` over the operator index
+    /// `0..num_kossakowski_ops`, in any order; duplicate `(row, col)`
+    /// triples are summed (the COO convention), exact zeros ignored.
+    /// Hermiticity (to `1e-10·max(max|K|, 1)`) is checked on the merged
+    /// entries: a diagonal entry must be real, an off-diagonal entry given
+    /// in both triangles must equal its mirror's conjugate, and an
+    /// off-diagonal entry given in one triangle only is Hermitian-completed
+    /// (its mirror is taken to be the conjugate), so a single triangle is a
+    /// valid input. The compiled dissipator is bit-identical to
+    /// [`Self::set_kossakowski`] with the dense matrix these triples
+    /// describe; the dense matrix is never formed (`O(nnz)` memory and
+    /// `O(nnz log nnz)` time plus the templates of pairs new to the
+    /// pattern).
+    pub fn set_kossakowski_sparse(
+        &mut self,
+        entries: &[(usize, usize, Complex<f64>)],
+    ) -> Result<(), Error> {
+        let m_ops = self.k_ops.len();
+        if m_ops == 0 {
+            return Err(Error::NoKossakowski);
+        }
+        let ingested = ingest_k_entries(entries.iter().copied(), m_ops, "set_kossakowski_sparse")?;
+        self.recompile_kossakowski(ingested)
+    }
+
+    /// [`Self::set_kossakowski`] with `K` given as blocks: `blocks[b] =
+    /// (indices, K_b)` places the Hermitian `|indices| × |indices|` matrix
+    /// `K_b` at the operator indices `indices` (row-major, `K[indices[i]]
+    /// [indices[j]] += K_b[i][j]`). Blocks normally partition the operator
+    /// table (a block-diagonal `K`); blocks sharing operators add up (`K =
+    /// Σ_b P_b K_b P_bᵀ`, PSD when every `K_b` is). An index listed twice
+    /// in one block, an index outside the table or a non-Hermitian `K_b`
+    /// is an error and leaves the spec unchanged. Operators in no block
+    /// have zero rows. Bit-identical to the dense setter with the assembled
+    /// matrix, which is never formed.
+    pub fn set_kossakowski_blocks(
+        &mut self,
+        blocks: &[(Vec<usize>, Vec<Vec<Complex<f64>>>)],
+    ) -> Result<(), Error> {
+        let m_ops = self.k_ops.len();
+        if m_ops == 0 {
+            return Err(Error::NoKossakowski);
+        }
+        let mut triples: Vec<(usize, usize, Complex<f64>)> = Vec::new();
+        for (b, (idx, kb)) in blocks.iter().enumerate() {
+            check_k_matrix(
+                kb,
+                idx.len(),
+                "set_kossakowski_blocks: block indices vs K_block rows",
+                "set_kossakowski_blocks: K_block row and block indices",
+            )?;
+            let mut seen = vec![false; m_ops];
+            for &i in idx {
+                if i >= m_ops {
+                    return Err(Error::KIndexOutOfRange {
+                        what: "set_kossakowski_blocks",
+                        index: i,
+                        m_ops,
+                    });
+                }
+                if seen[i] {
+                    return Err(Error::KBlockDuplicateIndex { block: b, index: i });
+                }
+                seen[i] = true;
+            }
+            for (i, &r) in idx.iter().enumerate() {
+                for (j, &c) in idx.iter().enumerate() {
+                    let v = kb[i][j];
+                    if v.re != 0.0 || v.im != 0.0 {
+                        triples.push((r, c, v));
+                    }
+                }
+            }
+        }
+        let ingested = ingest_k_entries(triples, m_ops, "set_kossakowski_blocks")?;
+        self.recompile_kossakowski(ingested)
     }
 
     /// Current Kossakowski matrix over the whole operator table, row-major
-    /// (`M × M`, empty when no block was added).
+    /// (`M × M`, empty when no block was added). Materialises the dense
+    /// matrix from the stored entries: `O(M²)` memory — use
+    /// [`Self::kossakowski_entries`] for a large sparse `K`.
     pub fn kossakowski(&self) -> Vec<Vec<Complex<f64>>> {
-        self.k_mat.clone()
+        let m = self.k_ops.len();
+        let mut out = vec![vec![Complex::new(0.0, 0.0); m]; m];
+        for &(r, c, v) in &self.k_entries {
+            out[r as usize][c as usize] = v;
+        }
+        out
+    }
+
+    /// Current Kossakowski matrix as sorted COO triples
+    /// `(row, col, K[row][col])`: every nonzero entry, both triangles
+    /// (Hermitian-completed), the stored form.
+    pub fn kossakowski_entries(&self) -> &[KEntry] {
+        &self.k_entries
+    }
+
+    /// Number of stored nonzero entries of the Kossakowski matrix (both
+    /// triangles).
+    pub fn num_kossakowski_nonzeros(&self) -> usize {
+        self.k_entries.len()
+    }
+
+    /// Number of distinct pair templates in use: the operator-pattern
+    /// relationships ([`TemplateKey`]: the Pauli structure of `(A_n, A_m)`
+    /// up to a qubit relabelling) among the compiled pairs. Bounded by the
+    /// number of distinct patterns, not by the number of pairs
+    /// ([`Self::num_compiled_pairs`]); the compiled memory scales with it.
+    pub fn num_pair_templates(&self) -> usize {
+        self.k_templates.len()
+    }
+
+    /// Number of compiled pairs `n ≤ m` with `|K_nm| > 1e-14·max|K|`, one
+    /// `KossakowskiPair` entry each — what `num_pair_templates` counted
+    /// before the templates were shared across pairs.
+    pub fn num_compiled_pairs(&self) -> usize {
+        self.k_pairs.len()
+    }
+
+    /// Heap bytes of the Kossakowski compilation as `(templates, pairs,
+    /// entries)`: the shared templates (Pauli tables, keys and the key
+    /// index), the per-pair records (`k_pairs`, `k_vals`, the qubit maps,
+    /// the `KossakowskiPair` entries and their `j_support` slots) and the
+    /// stored `K` entries. Vector capacities, i.e. what was asked of the
+    /// allocator; the operator table `k_ops` is not counted.
+    pub fn kossakowski_memory_bytes(&self) -> (usize, usize, usize) {
+        use std::mem::size_of;
+        let mut templates = self.k_templates.capacity() * size_of::<PairTemplate<W>>();
+        for t in &self.k_templates {
+            templates += t.adag_b.capacity() * size_of::<PauliTerm<W>>();
+            templates +=
+                t.sand.capacity() * size_of::<(Word<W>, Vec<(Word<W>, Complex<f64>)>)>();
+            for (_, rights) in &t.sand {
+                templates += rights.capacity() * size_of::<(Word<W>, Complex<f64>)>();
+            }
+        }
+        templates +=
+            self.k_template_index.capacity() * (size_of::<TemplateKey<W>>() + size_of::<u32>());
+        for key in self.k_template_index.keys() {
+            templates += (key.left.capacity() + key.right.capacity()) * size_of::<LocalTerm<W>>();
+        }
+        let start = self.j_rates.len();
+        let mut pairs = self.k_pairs.capacity() * size_of::<PairRef>()
+            + self.k_vals.capacity() * size_of::<Complex<f64>>()
+            + self.k_pair_qubits.capacity() * size_of::<u16>();
+        pairs += (self.j_kinds.capacity() - start) * size_of::<JumpKind<W>>();
+        pairs += self
+            .j_support
+            .iter()
+            .map(|l| l.iter().filter(|&&i| (i as usize) >= start).count())
+            .sum::<usize>()
+            * size_of::<u32>();
+        let entries = self.k_entries.capacity() * size_of::<KEntry>();
+        (templates, pairs, entries)
     }
 
     /// Number `M` of Kossakowski operators `A_n` (0 without a block).
@@ -712,22 +1256,19 @@ impl<const W: usize> LindbladSpec<W> {
         self.k_ops.len()
     }
 
-    /// Drop every `KossakowskiPair` entry and rebuild them from `k_ops` /
-    /// `k_mat`. The plain jumps of [`Self::new`] occupy
-    /// `j_kinds[..j_rates.len()]` and are kept; `j_support` is pruned of
-    /// the old pair indices (`candidate_terms` sorts and dedups, so the
-    /// order of a support list is immaterial) and refilled.
+    /// Drop every `KossakowskiPair` entry and rebuild them from the pair
+    /// templates `k_pairs` and their values `k_vals` (the non-negligible
+    /// upper-triangle pairs of the current `K`, in `(n, m)` order). The
+    /// plain jumps of [`Self::new`] occupy `j_kinds[..j_rates.len()]` and
+    /// are kept; `j_support` is pruned of the old pair indices
+    /// (`candidate_terms` sorts and dedups, so the order of a support list
+    /// is immaterial) and refilled.
     fn rebuild_kossakowski_pairs(&mut self) {
         let start = self.j_rates.len();
         self.j_kinds.truncate(start);
         for list in self.j_support.iter_mut() {
             list.retain(|&i| (i as usize) < start);
         }
-        let k = &self.k_mat;
-        let max_abs = k
-            .iter()
-            .flat_map(|row| row.iter().map(|c| c.norm()))
-            .fold(0.0_f64, f64::max);
 
         // One JumpKind entry per non-negligible pair, indexed by the union
         // support of A_n and A_m so the per-string candidate lookup only
@@ -737,63 +1278,21 @@ impl<const W: usize> LindbladSpec<W> {
         // output words with conjugate phase, and the final action keeps only
         // the real part, so `(n,m)` alone suffices if it doubles-and-takes-Re
         // — halving the pair count. The diagonal `(n,n)` is a single pair.
-        let pair_tol = 1e-14 * max_abs;
-        for t in &self.k_pairs {
-            let k_nm = k[t.n][t.m];
-            if k_nm.norm() <= pair_tol {
-                continue;
-            }
-            let off_diag = t.n != t.m;
-            // A_n†A_m as `Σ γ_w W`, scaled by `K_nm`.
-            let (dd, dd_anti): (Vec<PauliTerm<W>>, Vec<PauliTerm<W>>) = if off_diag {
-                // dd = 2·Re(K_nm γ_w) (Hermitian sum, both-sided anticomm);
-                // dd_anti = −2i·Im(K_nm γ_w) (anti-Herm diff, one-sided).
-                let mut dd = Vec::with_capacity(t.adag_b.len());
-                let mut da = Vec::with_capacity(t.adag_b.len());
-                for term in &t.adag_b {
-                    let c = k_nm * term.coeff;
-                    if c.re.abs() > 1e-14 {
-                        dd.push(PauliTerm {
-                            word: term.word,
-                            coeff: Complex::new(2.0 * c.re, 0.0),
-                        });
-                    }
-                    if c.im.abs() > 1e-14 {
-                        da.push(PauliTerm {
-                            word: term.word,
-                            coeff: Complex::new(0.0, -2.0 * c.im),
-                        });
-                    }
-                }
-                (dd, da)
-            } else {
-                let dd = t
-                    .adag_b
-                    .iter()
-                    .map(|term| PauliTerm {
-                        word: term.word,
-                        coeff: k_nm * term.coeff,
-                    })
-                    .collect();
-                (dd, Vec::new())
-            };
-            let sand: SandwichGroups<W> = t
-                .sand
-                .iter()
-                .map(|(wa, rights)| {
-                    (*wa, rights.iter().map(|(wb, c0)| (*wb, c0 * k_nm)).collect())
-                })
-                .collect();
+        // The `K`-dependent tables (`λ_a*·μ_b·K_nm`, `2·Re(K_nm γ_w)`,
+        // `−2i·Im(K_nm γ_w)`) are no longer materialised per pair: the
+        // action forms the same products from the shared template and
+        // `K_nm` when it visits the pair.
+        for (r, &k_nm) in self.k_pairs.iter().zip(self.k_vals.iter()) {
+            let nl = self.k_templates[r.template as usize].n_local as usize;
             let idx = self.j_kinds.len() as u32;
             self.j_kinds.push(JumpKind::KossakowskiPair {
-                sand,
-                dd,
-                dd_anti,
-                off_diag,
-                left_mask: t.left_mask,
-                right_mask: t.right_mask,
+                template: r.template,
+                q_off: r.q_off,
+                off_diag: r.n != r.m,
+                k_nm,
             });
-            for &q in &t.support {
+            let start = r.q_off as usize;
+            for &q in &self.k_pair_qubits[start..start + nl] {
                 self.j_support[q as usize].push(idx);
             }
         }
@@ -1346,13 +1845,54 @@ impl<const W: usize> LindbladSpec<W> {
                     }
                 }
                 JumpKind::KossakowskiPair {
-                    sand,
-                    dd,
-                    dd_anti,
+                    template,
+                    q_off,
                     off_diag,
-                    left_mask,
-                    right_mask,
+                    k_nm,
                 } => {
+                    // The pair's tables live in a shared template over the
+                    // pair's local frame: restrict `p` to the pair's qubits,
+                    // run the tables there and embed the outputs back. The
+                    // template's words are the identity outside those qubits,
+                    // so every product and phase below is what the register-
+                    // frame product would give, and `p`'s other bits pass
+                    // through unchanged. `K_nm` is folded in exactly as the
+                    // per-pair precompilation did (`c0 * K_nm`, `K_nm * γ_w`
+                    // with the same drop thresholds), so the result is
+                    // bit-identical to it.
+                    let t = &self.k_templates[*template as usize];
+                    let nl = t.n_local as usize;
+                    let start = *q_off as usize;
+                    let qs = &self.k_pair_qubits[start..start + nl];
+                    // `p` on the pair's qubits in the local frame, and the
+                    // register mask of those qubits (raw chunk ops: the
+                    // storage is Lsb0, bit `q` of chunk `q / CHUNK_BITS`).
+                    let mut p_loc = Word::<W>::new(nl);
+                    let mut sup = [0 as Chunk; W];
+                    for (li, &q) in qs.iter().enumerate() {
+                        let q = q as usize;
+                        let (ci, bi) = (q / CHUNK_BITS, q % CHUNK_BITS);
+                        let (lc, lb) = (li / CHUNK_BITS, li % CHUNK_BITS);
+                        sup[ci] |= (1 as Chunk) << bi;
+                        p_loc.xbits.data[lc] |= ((p.xbits.data[ci] >> bi) & 1) << lb;
+                        p_loc.zbits.data[lc] |= ((p.zbits.data[ci] >> bi) & 1) << lb;
+                    }
+                    let embed = |w: &Word<W>| -> Word<W> {
+                        let mut out = Word::<W>::new(p.n_qubits());
+                        for i in 0..W {
+                            out.xbits.data[i] = p.xbits.data[i] & !sup[i];
+                            out.zbits.data[i] = p.zbits.data[i] & !sup[i];
+                        }
+                        for (li, &q) in qs.iter().enumerate() {
+                            let q = q as usize;
+                            let (ci, bi) = (q / CHUNK_BITS, q % CHUNK_BITS);
+                            let (lc, lb) = (li / CHUNK_BITS, li % CHUNK_BITS);
+                            out.xbits.data[ci] |= ((w.xbits.data[lc] >> lb) & 1) << bi;
+                            out.zbits.data[ci] |= ((w.zbits.data[lc] >> lb) & 1) << bi;
+                        }
+                        out.rehash();
+                        out
+                    };
                     // One-sided fast path: when `p` is disjoint from one of
                     // the two operators, the pair contribution collapses to a
                     // commutator. For a diagonal pair with `D = K·A_n†A_m`:
@@ -1360,42 +1900,48 @@ impl<const W: usize> LindbladSpec<W> {
                     //   p disjoint from A_m (right): C = +½ [D, p]
                     // For a folded off-diagonal pair the two conjugate
                     // one-sided contributions combine into `±½ [F, p]` with
-                    // the anti-Hermitian `F = dd_anti = −2i·Im(K_nm A_n†A_m)`
-                    // and the opposite sign:
+                    // the anti-Hermitian `F = −2i·Im(K_nm A_n†A_m)` and the
+                    // opposite sign:
                     //   p hits A_m only (right): C = +½ [F, p]
                     //   p hits A_n only (left):  C = −½ [F, p]
                     // With `[P_c, p] = −i·eps·out` from `comm_product`, the
                     // term coefficient is `∓ t_c · (i/2) · eps`.
-                    let mut p_bits = [0 as Chunk; W];
-                    for (i, slot) in p_bits.iter_mut().enumerate() {
-                        *slot = p.xbits.data[i] | p.zbits.data[i];
-                    }
-                    let hits =
-                        |mask: &[Chunk; W]| (0..W).any(|i| mask[i] & p_bits[i] != 0);
-                    let (hit_l, hit_r) = (hits(left_mask), hits(right_mask));
+                    let hits = |mask: &[Chunk; W]| {
+                        (0..W)
+                            .any(|i| mask[i] & (p_loc.xbits.data[i] | p_loc.zbits.data[i]) != 0)
+                    };
+                    let (hit_l, hit_r) = (hits(&t.left_mask), hits(&t.right_mask));
                     if !(hit_l && hit_r) {
                         // exactly one side hit (pair is a candidate, so at
                         // least one side overlaps). `off_diag` flips the sign
-                        // and uses `dd_anti` instead of `dd`.
-                        let (comm, half_i) = if *off_diag {
-                            let hi = if hit_r {
+                        // and uses the anti-Hermitian part instead of `dd`.
+                        let half_i = if *off_diag {
+                            if hit_r {
                                 Complex::new(0.0, -0.5)
                             } else {
                                 Complex::new(0.0, 0.5)
-                            };
-                            (dd_anti, hi)
+                            }
+                        } else if hit_r {
+                            Complex::new(0.0, 0.5)
                         } else {
-                            let hi = if hit_r {
-                                Complex::new(0.0, 0.5)
-                            } else {
-                                Complex::new(0.0, -0.5)
-                            };
-                            (dd, hi)
+                            Complex::new(0.0, -0.5)
                         };
-                        for c_term in comm {
-                            let (out, eps) = comm_product(&c_term.word, p);
+                        for term in &t.adag_b {
+                            let c = *k_nm * term.coeff;
+                            // the term's coefficient in `dd_anti` (off-diagonal:
+                            // −2i·Im, dropped below 1e-14) or `dd` (diagonal: K_nn γ_w)
+                            let coeff = if *off_diag {
+                                if c.im.abs() > 1e-14 {
+                                    Complex::new(0.0, -2.0 * c.im)
+                                } else {
+                                    continue;
+                                }
+                            } else {
+                                c
+                            };
+                            let (out, eps) = comm_product_local(&term.word, &p_loc);
                             if eps != 0.0 {
-                                *local.entry(out).or_insert(zero) += c_term.coeff * half_i * eps;
+                                *local.entry(embed(&out)).or_insert(zero) += coeff * half_i * eps;
                             }
                         }
                         continue;
@@ -1407,25 +1953,37 @@ impl<const W: usize> LindbladSpec<W> {
                     // and its real part taken (the conjugate `(m,n)` pair
                     // supplies the other half); the anticommutator uses the
                     // Hermitian `dd = 2·Re(K_nm A_n†A_m)`.
-                    for (wa, rights) in sand {
-                        let (r_ap, phi1) = pauli_mul(wa, p);
+                    for (wa, rights) in &t.sand {
+                        let (r_ap, phi1) = pauli_mul_local(wa, &p_loc);
                         for (wb, c0) in rights {
-                            let (s, phi2) = pauli_mul(&r_ap, wb);
-                            let v = c0 * phase_factor(phi1 + phi2);
+                            let (s, phi2) = pauli_mul_local(&r_ap, wb);
+                            let v = (c0 * k_nm) * phase_factor(phi1 + phi2);
                             let contrib = if *off_diag {
                                 Complex::new(2.0 * v.re, 0.0)
                             } else {
                                 v
                             };
-                            *local.entry(s).or_insert(zero) += contrib;
+                            *local.entry(embed(&s)).or_insert(zero) += contrib;
                         }
                     }
-                    for c_term in dd {
-                        let (r, phase) = pauli_mul(&c_term.word, p);
+                    for term in &t.adag_b {
+                        let c = *k_nm * term.coeff;
+                        // the term's coefficient in `dd` (off-diagonal: 2·Re,
+                        // dropped below 1e-14; diagonal: K_nn γ_w)
+                        let coeff = if *off_diag {
+                            if c.re.abs() > 1e-14 {
+                                Complex::new(2.0 * c.re, 0.0)
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            c
+                        };
+                        let (r, phase) = pauli_mul_local(&term.word, &p_loc);
                         if phase & 1 == 0 {
                             let sign = if phase == 0 { 1.0 } else { -1.0 };
-                            *local.entry(r).or_insert(zero) -=
-                                c_term.coeff * Complex::new(sign, 0.0);
+                            *local.entry(embed(&r)).or_insert(zero) -=
+                                coeff * Complex::new(sign, 0.0);
                         }
                     }
                 }
@@ -1883,6 +2441,377 @@ mod tests {
         assert!(matches!(none.set_jump_rates(&[]), Err(Error::NoJumpOps)));
         assert_eq!(none.jump_rates(), Vec::<f64>::new());
         assert!(none.kossakowski().is_empty());
+    }
+
+    /// Dense, block and COO inputs compile the same dissipator: bitwise
+    /// identical actions for every way of giving one block-diagonal `K`
+    /// (dense setter, blocks, COO in both triangles with shuffled and split
+    /// entries, COO upper triangle only, fresh `add_kossakowski_sparse`);
+    /// the templates follow the zero pattern and the stored entries round
+    /// trip through `kossakowski()`.
+    #[test]
+    fn block_and_sparse_setters_match_dense() {
+        let n = 4;
+        let rates = [0.2, 0.5, 0.1];
+        let zero = Complex::new(0.0, 0.0);
+        // blocks {0, 2} and {1, 3} of a complex PSD matrix
+        let mut block_k = psd_matrix(n, 11);
+        for i in 0..n {
+            for j in 0..n {
+                if (i % 2) != (j % 2) {
+                    block_k[i][j] = zero;
+                }
+            }
+        }
+        let words = [
+            "ZIII", "IZII", "XIII", "IYII", "XXII", "ZYZI", "XYZZ", "IXXI", "IIZX", "YIIY",
+        ];
+        let same_actions = |a: &LindbladSpec, b: &LindbladSpec| {
+            assert_eq!(a.num_jump_terms(), b.num_jump_terms());
+            for s in words {
+                let (p, _) = parse_pauli_string(s, n).unwrap();
+                assert_actions_identical(&action_map(a, &p), &action_map(b, &p));
+            }
+        };
+
+        let dense = setter_fixture(n, &rates, &block_k);
+        assert_eq!(dense.num_compiled_pairs(), 6); // 3 upper-triangle pairs per block
+        assert_eq!(dense.num_pair_templates(), 2); // σ⁻σ⁻ on one site, σ⁻σ⁻ on two sites
+        assert_eq!(dense.num_kossakowski_nonzeros(), 8);
+        assert_eq!(dense.kossakowski(), block_k);
+        assert_eq!(dense.num_jump_terms(), rates.len() + 6);
+
+        // blocks, on a spec that held a dense K with another pattern
+        let sub = |idx: &[usize]| -> Vec<Vec<Complex<f64>>> {
+            idx.iter()
+                .map(|&i| idx.iter().map(|&j| block_k[i][j]).collect())
+                .collect()
+        };
+        let mut spec = setter_fixture(n, &rates, &psd_matrix(n, 3));
+        assert_eq!(spec.num_compiled_pairs(), 10);
+        assert_eq!(spec.num_pair_templates(), 2);
+        spec.set_kossakowski_blocks(&[(vec![0, 2], sub(&[0, 2])), (vec![1, 3], sub(&[1, 3]))])
+            .unwrap();
+        assert_eq!(spec.num_compiled_pairs(), 6);
+        assert_eq!(spec.num_pair_templates(), 2);
+        assert_eq!(spec.kossakowski(), block_k);
+        same_actions(&spec, &dense);
+
+        // the same blocks in another order and with a block's rows permuted
+        let perm = |idx: &[usize]| -> Vec<Vec<Complex<f64>>> { sub(idx) };
+        spec.set_kossakowski_blocks(&[(vec![3, 1], perm(&[3, 1])), (vec![0, 2], sub(&[0, 2]))])
+            .unwrap();
+        assert_eq!(spec.kossakowski(), block_k);
+        same_actions(&spec, &dense);
+
+        // COO, both triangles, reversed order, the (0, 0) entry split in two
+        let mut triples: Vec<(usize, usize, Complex<f64>)> = Vec::new();
+        for i in 0..n {
+            for j in 0..n {
+                if block_k[i][j] != zero {
+                    triples.push((i, j, block_k[i][j]));
+                }
+            }
+        }
+        triples.reverse();
+        let k00 = block_k[0][0];
+        triples.retain(|t| !(t.0 == 0 && t.1 == 0));
+        triples.push((0, 0, k00 * 0.5));
+        triples.insert(0, (0, 0, k00 * 0.5));
+        spec.set_kossakowski_sparse(&triples).unwrap();
+        assert_eq!(spec.kossakowski(), block_k);
+        same_actions(&spec, &dense);
+
+        // the upper triangle alone: Hermitian completion fills the mirrors
+        let upper: Vec<(usize, usize, Complex<f64>)> = (0..n)
+            .flat_map(|i| (i..n).map(move |j| (i, j)))
+            .filter(|&(i, j)| block_k[i][j] != zero)
+            .map(|(i, j)| (i, j, block_k[i][j]))
+            .collect();
+        let mut spec2 = setter_fixture(n, &rates, &psd_matrix(n, 5));
+        spec2.set_kossakowski_sparse(&upper).unwrap();
+        assert_eq!(spec2.kossakowski(), block_k);
+        assert_eq!(spec2.num_kossakowski_nonzeros(), 8);
+        same_actions(&spec2, &dense);
+
+        // the lower triangle alone, likewise
+        let lower: Vec<(usize, usize, Complex<f64>)> =
+            upper.iter().map(|&(i, j, v)| (j, i, v.conj())).collect();
+        spec2.set_kossakowski_sparse(&lower).unwrap();
+        assert_eq!(spec2.kossakowski(), block_k);
+        same_actions(&spec2, &dense);
+
+        // a fresh spec built through add_kossakowski_sparse
+        let h = vec![("XZZZ".to_string(), 0.3), ("ZXZZ".to_string(), 0.4)];
+        let ops: Vec<_> = (0..n).map(|q| sigma_minus_lincomb(q, n)).collect();
+        let mut fresh_dense = LindbladSpec::<W_CHUNKS>::new(n, &h, &[]).unwrap();
+        fresh_dense.add_kossakowski(&ops, &block_k).unwrap();
+        let mut fresh_sparse = LindbladSpec::<W_CHUNKS>::new(n, &h, &[]).unwrap();
+        fresh_sparse.add_kossakowski_sparse(&ops, &upper).unwrap();
+        assert_eq!(fresh_sparse.kossakowski(), block_k);
+        same_actions(&fresh_sparse, &fresh_dense);
+
+        // templates are reused when the pattern is unchanged and rebuilt
+        // when it grows: a dense K after the blocks has all 10 pairs
+        spec.set_kossakowski(&psd_matrix(n, 3)).unwrap();
+        assert_eq!(spec.num_compiled_pairs(), 10);
+        let fresh = setter_fixture(n, &rates, &psd_matrix(n, 3));
+        same_actions(&spec, &fresh);
+    }
+
+    /// Overlapping blocks add up (`K = Σ_b P_b K_b P_bᵀ`), an empty block
+    /// list is the zero dissipator, and bad input leaves the spec unchanged.
+    #[test]
+    fn block_and_sparse_setters_overlap_and_reject_bad_input() {
+        let n = 3;
+        let rates = [0.2, 0.5, 0.1];
+        let k0 = psd_matrix(n, 2);
+        let mut spec = setter_fixture(n, &rates, &k0);
+        let (p, _) = parse_pauli_string("XYZ", n).unwrap();
+        let before = action_map(&spec, &p);
+
+        // overlap: blocks {0, 1} and {1, 2} sum on the shared operator 1
+        let a = psd_matrix(2, 4);
+        let b = psd_matrix(2, 6);
+        let zero = Complex::new(0.0, 0.0);
+        let mut expect = vec![vec![zero; n]; n];
+        for i in 0..2 {
+            for j in 0..2 {
+                expect[i][j] += a[i][j];
+                expect[i + 1][j + 1] += b[i][j];
+            }
+        }
+        spec.set_kossakowski_blocks(&[(vec![0, 1], a.clone()), (vec![1, 2], b.clone())])
+            .unwrap();
+        assert_eq!(spec.kossakowski(), expect);
+        let dense = setter_fixture(n, &rates, &expect);
+        assert_actions_identical(&action_map(&spec, &p), &action_map(&dense, &p));
+
+        // no blocks: K = 0, no Kossakowski pairs
+        spec.set_kossakowski_blocks(&[]).unwrap();
+        assert_eq!(spec.num_compiled_pairs(), 0);
+        assert_eq!(spec.num_pair_templates(), 0); // unused templates are pruned
+        assert_eq!(spec.num_jump_terms(), rates.len());
+        spec.set_kossakowski_sparse(&[]).unwrap();
+        assert_eq!(spec.num_kossakowski_nonzeros(), 0);
+
+        // back to k0, then every rejection leaves it there
+        spec.set_kossakowski(&k0).unwrap();
+        assert_actions_identical(&action_map(&spec, &p), &before);
+        let one = Complex::new(1.0, 0.0);
+        assert!(matches!(
+            spec.set_kossakowski_blocks(&[(vec![0, 3], psd_matrix(2, 1))]),
+            Err(Error::KIndexOutOfRange { index: 3, m_ops: 3, .. })
+        ));
+        assert!(matches!(
+            spec.set_kossakowski_blocks(&[(vec![1, 1], psd_matrix(2, 1))]),
+            Err(Error::KBlockDuplicateIndex { block: 0, index: 1 })
+        ));
+        assert!(matches!(
+            spec.set_kossakowski_blocks(&[(vec![0, 1], psd_matrix(3, 1))]),
+            Err(Error::LengthMismatch { .. })
+        ));
+        let mut bad = psd_matrix(2, 1);
+        bad[0][1] += Complex::new(0.0, 1e-3);
+        assert!(matches!(
+            spec.set_kossakowski_blocks(&[(vec![0, 1], bad)]),
+            Err(Error::KMatrixNotHermitian { .. })
+        ));
+        assert!(matches!(
+            spec.set_kossakowski_sparse(&[(0, 5, one)]),
+            Err(Error::KIndexOutOfRange { index: 5, .. })
+        ));
+        // mirror mismatch and an imaginary diagonal
+        assert!(matches!(
+            spec.set_kossakowski_sparse(&[(0, 1, one), (1, 0, Complex::new(1.0, 0.5))]),
+            Err(Error::KMatrixNotHermitian { n: 0, m: 1 })
+        ));
+        assert!(matches!(
+            spec.set_kossakowski_sparse(&[(2, 2, Complex::new(1.0, 1e-3))]),
+            Err(Error::KMatrixNotHermitian { n: 2, m: 2 })
+        ));
+        assert_eq!(spec.kossakowski(), k0);
+        assert_actions_identical(&action_map(&spec, &p), &before);
+        // without a block
+        let mut plain = LindbladSpec::<W_CHUNKS>::new(n, &[], &[jump_hpauli("ZII", 0.1)]).unwrap();
+        assert!(matches!(plain.set_kossakowski_blocks(&[]), Err(Error::NoKossakowski)));
+        assert!(matches!(plain.set_kossakowski_sparse(&[]), Err(Error::NoKossakowski)));
+    }
+
+    /// Pairs with the same operator-pattern relationship on other qubits
+    /// share one template: four site pairs carrying the same three
+    /// operators (`¼ZZ`; `¼XX + ¼YY`; `σ⁻` on the first spin), `K`
+    /// block-diagonal by operator class — 30 compiled pairs but 6 templates
+    /// (diagonal and off-diagonal pattern of each class), the same 6 with
+    /// eight site pairs. Dense and block inputs are bit-identical; the
+    /// action matches the jump form `L_l = Σ_m conj(A_ml) A_m` of
+    /// `K = A A†` to 1e-12 (an independent reference for the local-frame
+    /// action); a pattern that leaves `K` frees its templates.
+    #[test]
+    fn pair_templates_shared_across_blocks() {
+        let build = |n_sites: usize| {
+            let n = 2 * n_sites;
+            let word = |pairs: &[(usize, char)]| -> String {
+                let mut s = vec!['I'; n];
+                for &(q, c) in pairs {
+                    s[q] = c;
+                }
+                s.into_iter().collect()
+            };
+            let sites: Vec<(usize, usize)> = (0..n_sites).map(|s| (2 * s, 2 * s + 1)).collect();
+            let mut ops: Vec<Vec<(String, Complex<f64>)>> = Vec::new();
+            for &(i, j) in &sites {
+                ops.push(vec![(word(&[(i, 'Z'), (j, 'Z')]), Complex::new(0.25, 0.0))]);
+            }
+            for &(i, j) in &sites {
+                ops.push(vec![
+                    (word(&[(i, 'X'), (j, 'X')]), Complex::new(0.25, 0.0)),
+                    (word(&[(i, 'Y'), (j, 'Y')]), Complex::new(0.25, 0.0)),
+                ]);
+            }
+            for &(i, _) in &sites {
+                ops.push(sigma_minus_lincomb(i, n));
+            }
+            // K = A A† per class block (deterministic complex A), so the
+            // jump form is L_l = Σ_m conj(A[m][l]) A_m with unit rate.
+            let m = ops.len();
+            let zero = Complex::new(0.0, 0.0);
+            let mut k = vec![vec![zero; m]; m];
+            let mut blocks: Vec<(Vec<usize>, Vec<Vec<Complex<f64>>>)> = Vec::new();
+            let mut jumps: Vec<JumpInput> = Vec::new();
+            for b in 0..3 {
+                let idx: Vec<usize> = (b * n_sites..(b + 1) * n_sites).collect();
+                let a: Vec<Vec<Complex<f64>>> = (0..n_sites)
+                    .map(|i| {
+                        (0..n_sites)
+                            .map(|l| {
+                                let t = (1 + i + 3 * l + 7 * b) as f64;
+                                Complex::new(0.3 * t.sin(), 0.2 * (0.7 * t).cos())
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let kb: Vec<Vec<Complex<f64>>> = (0..n_sites)
+                    .map(|i| {
+                        (0..n_sites)
+                            .map(|j| (0..n_sites).map(|l| a[i][l] * a[j][l].conj()).sum())
+                            .collect()
+                    })
+                    .collect();
+                for i in 0..n_sites {
+                    for j in 0..n_sites {
+                        k[idx[i]][idx[j]] = kb[i][j];
+                    }
+                }
+                for l in 0..n_sites {
+                    let mut lincomb = Vec::new();
+                    for (i, &op) in idx.iter().enumerate() {
+                        for (s, c) in &ops[op] {
+                            lincomb.push((s.clone(), a[i][l].conj() * c));
+                        }
+                    }
+                    jumps.push(JumpInput { lincomb, rate: 1.0 });
+                }
+                blocks.push((idx, kb));
+            }
+            let h = vec![
+                (word(&[(0, 'X'), (1, 'Z')]), 0.3),
+                (word(&[(3, 'Z')]), 0.7),
+                (word(&[(2, 'Y'), (n - 1, 'Y')]), 0.2),
+            ];
+            let mut dense = LindbladSpec::<W_CHUNKS>::new(n, &h, &[]).unwrap();
+            dense.add_kossakowski(&ops, &k).unwrap();
+            let mut blk = LindbladSpec::<W_CHUNKS>::new(n, &h, &[]).unwrap();
+            blk.add_kossakowski(&ops, &vec![vec![zero; m]; m]).unwrap();
+            blk.set_kossakowski_blocks(&blocks).unwrap();
+            let jump_form = LindbladSpec::<W_CHUNKS>::new(n, &h, &jumps).unwrap();
+            (n, dense, blk, jump_form)
+        };
+
+        let (n, dense, blk, jump_form) = build(4);
+        assert_eq!(dense.num_compiled_pairs(), 3 * 10);
+        assert_eq!(dense.num_pair_templates(), 6);
+        assert_eq!(blk.num_compiled_pairs(), 30);
+        assert_eq!(blk.num_pair_templates(), 6);
+        let (t_bytes, p_bytes, e_bytes) = dense.kossakowski_memory_bytes();
+        assert!(t_bytes > 0 && p_bytes > 0 && e_bytes >= 48 * std::mem::size_of::<KEntry>());
+        for s in [
+            "XIIIIIII", "ZZIIIIII", "XYZIIIII", "IIIIIIZX", "XIXIXIXI", "YZYZYZYZ", "IXIIIYII",
+            "IIZZIIII",
+        ] {
+            let (p, _) = parse_pauli_string(s, n).unwrap();
+            let a = action_map(&dense, &p);
+            assert_actions_identical(&a, &action_map(&blk, &p));
+            assert_actions_match(&a, &action_map(&jump_form, &p), 1e-12);
+        }
+
+        // twice the sites: the pair count grows, the template count does not
+        let (_, dense8, _, _) = build(8);
+        assert_eq!(dense8.num_compiled_pairs(), 3 * 36);
+        assert_eq!(dense8.num_pair_templates(), 6);
+        assert_eq!(dense8.kossakowski_memory_bytes().0, t_bytes);
+
+        // one block over every operator: cross-class pairs bring new
+        // patterns; back to the class blocks they are pruned again
+        let mut spec = dense;
+        let idx: Vec<usize> = (0..12).collect();
+        let kb: Vec<Vec<Complex<f64>>> = psd_matrix(12, 5);
+        spec.set_kossakowski_blocks(&[(idx, kb.clone())]).unwrap();
+        assert_eq!(spec.num_compiled_pairs(), 78);
+        assert!(spec.num_pair_templates() > 6);
+        let fresh = {
+            let mut f = LindbladSpec::<W_CHUNKS>::new(n, &[("XZIIIIII".to_string(), 0.3), ("IIIZIIII".to_string(), 0.7), ("IIYIIIIY".to_string(), 0.2)], &[]).unwrap();
+            f.add_kossakowski(&blk_ops(n), &kb).unwrap();
+            f
+        };
+        let (p, _) = parse_pauli_string("XYZIIIII", n).unwrap();
+        assert_actions_identical(&action_map(&spec, &p), &action_map(&fresh, &p));
+        spec.set_kossakowski_blocks(&[]).unwrap();
+        assert_eq!(spec.num_pair_templates(), 0);
+    }
+
+    /// The raw chunk access the Kossakowski action uses to move bits between
+    /// the register and a pair's local frame agrees with the storage's own
+    /// indexing on every qubit of a word spanning both chunks.
+    #[test]
+    fn raw_bit_access_matches_bitvec() {
+        let n = MAX_QUBITS;
+        let mut s = String::new();
+        for q in 0..n {
+            s.push(['I', 'X', 'Y', 'Z'][(q * 7 + q / 5) % 4]);
+        }
+        let (w, _) = parse_pauli_string::<W_CHUNKS>(&s, n).unwrap();
+        for q in 0..n {
+            let (ci, bi) = (q / CHUNK_BITS, q % CHUNK_BITS);
+            assert_eq!((w.xbits.data[ci] >> bi) & 1 == 1, w.xbits[q], "x bit {q}");
+            assert_eq!((w.zbits.data[ci] >> bi) & 1 == 1, w.zbits[q], "z bit {q}");
+        }
+    }
+
+    /// The operator table of `pair_templates_shared_across_blocks` for `n` qubits.
+    fn blk_ops(n: usize) -> Vec<Vec<(String, Complex<f64>)>> {
+        let n_sites = n / 2;
+        let word = |pairs: &[(usize, char)]| -> String {
+            let mut s = vec!['I'; n];
+            for &(q, c) in pairs {
+                s[q] = c;
+            }
+            s.into_iter().collect()
+        };
+        let mut ops = Vec::new();
+        for s in 0..n_sites {
+            ops.push(vec![(word(&[(2 * s, 'Z'), (2 * s + 1, 'Z')]), Complex::new(0.25, 0.0))]);
+        }
+        for s in 0..n_sites {
+            ops.push(vec![
+                (word(&[(2 * s, 'X'), (2 * s + 1, 'X')]), Complex::new(0.25, 0.0)),
+                (word(&[(2 * s, 'Y'), (2 * s + 1, 'Y')]), Complex::new(0.25, 0.0)),
+            ]);
+        }
+        for s in 0..n_sites {
+            ops.push(sigma_minus_lincomb(2 * s, n));
+        }
+        ops
     }
 
     fn jump_hpauli(s: &str, rate: f64) -> JumpInput {
