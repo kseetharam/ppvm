@@ -189,17 +189,18 @@ def test_defaults_are_the_plain_step_bit_for_bit():
     L = Lindbladian(n, chain_h(n), [("IIZII", 0.1)])
     b0 = _basis_to_codes(["ZIIII", "IXXII"], n)
     c0 = np.array([1.0, 0.25])
-    ba, ca = L.pc_step_arr(b0, c0, dt, 50, drop_tol=1e-12, admit_basis=150)
-    bb, cb = L.pc_step_arr(b0, c0, dt, 50, drop_tol=1e-12, admit_basis=150, max_weight=None, depolarize_eps=0.0)
-    bc, cc, st = L.pc_step_arr(b0, c0, dt, 50, drop_tol=1e-12, admit_basis=150, return_stats=True)
+    ba, ca = L.pc_step_arr(b0, c0, dt, 20, drop_tol=1e-12, admit_basis=60)
+    bb, cb = L.pc_step_arr(b0, c0, dt, 20, drop_tol=1e-12, admit_basis=60, max_weight=None, depolarize_eps=0.0)
+    bc, cc, st = L.pc_step_arr(b0, c0, dt, 20, drop_tol=1e-12, admit_basis=60, return_stats=True)
     assert np.array_equal(ba, bb) and np.array_equal(ba, bc)
     assert ca.tobytes() == cb.tobytes() == cc.tobytes()
     assert st["max_weight"] is None and st["depolarize_eps"] == 0.0
     assert st["weight_dropped_terms"] == 0
-    assert st["basis_len"] == len(bc) == 50
-    assert st["trim_dropped"] > 0  # 150 admitted, 50 kept
-    assert st["trim_dropped_l2sq"] >= 0.0
-    (bt, ct), d = L._spec.pc_step_timed(b0, c0, dt, 50, 1e-12, None, None, 150, None, False, None, 0.0)
+    assert st["basis_len"] == len(bc) == 20
+    assert st["admitted1"] + st["admitted2"] > 18  # the two-hop shell of the two strings fills past the cap
+    assert st["trim_dropped"] == 2 + st["admitted1"] + st["admitted2"] - 20  # what was admitted and not kept
+    assert st["trim_dropped_l2sq"] > 0.0
+    (bt, ct), d = L._spec.pc_step_timed(b0, c0, dt, 20, 1e-12, None, None, 60, None, False, None, 0.0)
     assert ct.tobytes() == ca.tobytes()
     assert {"leakage1_us", "trim_dropped", "basis_max_weight"} <= set(d)
 
@@ -243,12 +244,18 @@ def test_block_max_weight_and_defaults():
     assert np.array_equal(ba, bb) and np.array_equal(spa, spb) and ca.tobytes() == cb.tobytes()
 
 
-@pytest.mark.parametrize("eps", [0.0, 0.1])
-def test_depolarize_preserves_the_identity(eps):
+def test_depolarize_preserves_the_identity():
+    """The identity (weight 0) is not damped: its coefficient is the same, bit for bit, with and without the channel
+    (the exponential's own round-off on the identity column is a few 1e-17 either way)."""
     n, dt = 4, 0.1
     L = Lindbladian(n, chain_h(n), [("IZII", 0.2)])
-    b = _basis_to_codes(["IIII", "ZIII"], n)
-    c = np.array([0.5, 1.0])
-    for _ in range(3):
-        b, c = L.pc_step_arr(b, c, dt, 10_000_000, drop_tol=0.0, depolarize_eps=eps)
-    assert as_map(b, c)["IIII"] == 0.5
+    out = {}
+    for eps in (0.0, 0.1):
+        b = _basis_to_codes(["IIII", "ZIII"], n)
+        c = np.array([0.5, 1.0])
+        for _ in range(3):
+            b, c = L.pc_step_arr(b, c, dt, 10_000_000, drop_tol=0.0, depolarize_eps=eps)
+        out[eps] = as_map(b, c)
+    assert out[0.0]["IIII"] == out[0.1]["IIII"]
+    assert abs(out[0.1]["IIII"] - 0.5) < 1e-14
+    assert out[0.1]["ZIII"] != out[0.0]["ZIII"]
