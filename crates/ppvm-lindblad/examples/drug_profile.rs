@@ -183,7 +183,7 @@ fn main() {
     for _ in 0..steps {
         let mut bb = basis.clone();
         let mut cf = coeffs.clone();
-        let t = spec.pc_step_timed(&mut bb, &mut cf, dt, &[], &cfg).unwrap();
+        let (t, _stats) = spec.pc_step_timed(&mut bb, &mut cf, dt, &[], &cfg).unwrap();
         totals.push(t.total_us());
         l1 += t.leakage1_us;
         e1 += t.expand1_us;

@@ -306,19 +306,26 @@ class BlockLindbladian:
         num_threads: int | None = None,
         admit_basis: int | None = None,
         tau_add: float | None = None,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        max_weight: int | None = None,
+        depolarize_eps: float = 0.0,
+        return_stats: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
         """One predictor-corrector step ``O ← exp(dt·L*_block) O`` on block rows.
 
         Same algorithm and truncation semantics as `Lindbladian.pc_step_arr`
         (``max_basis`` rank cap over all rows, ``admit_basis`` working-set
         bound, ``drop_tol`` magnitude prune, ``tau_add`` admission filter,
         protected rows never dropped); the protected rows are given as a
-        ``(protected_arr, protected_species)`` pair. Returns
-        ``(new_basis, new_species, new_coeffs)``.
+        ``(protected_arr, protected_species)`` pair. ``max_weight`` /
+        ``depolarize_eps`` / ``return_stats`` as `Lindbladian.pc_step_arr`;
+        the Pauli weight of a row is taken over the physical sites (the
+        species index is not a letter). Returns
+        ``(new_basis, new_species, new_coeffs)`` (plus the stats dict with
+        ``return_stats=True``).
         """
         basis_arr = np.ascontiguousarray(basis_arr, dtype=np.uint8)
         p_arr, p_sp = self._protected(protected_arr, protected_species)
-        return self._spec.pc_step(
+        args = (
             basis_arr,
             self._species_arr(species, basis_arr.shape[0]),
             np.ascontiguousarray(coeffs, dtype=np.float64),
@@ -330,7 +337,13 @@ class BlockLindbladian:
             None if num_threads is None else int(num_threads),
             None if admit_basis is None else int(admit_basis),
             None if tau_add is None else float(tau_add),
+            None if max_weight is None else int(max_weight),
+            float(depolarize_eps),
         )
+        if return_stats:
+            (b, sp, c), stats = self._spec.pc_step_stats(*args)
+            return b, sp, c, stats
+        return self._spec.pc_step(*args)
 
     def generator_arr(self, basis_arr: np.ndarray, species: np.ndarray):
         """Generator on the given rows as COO triples ``(rows, cols, vals)``."""

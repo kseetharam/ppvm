@@ -55,8 +55,8 @@ use rayon::prelude::*;
 
 use crate::mf_expm::{self, ActionTerms};
 use crate::{
-    Error, LindbladSpec, PcStepConfig, W_CHUNKS, Word, add_leakage_capped, build_basis_index,
-    cap_basis, max_qubits_for, prune_basis, word_hash,
+    Error, LindbladSpec, PcStepConfig, PcStepStats, W_CHUNKS, WeightDrop, Word, add_leakage_capped,
+    build_basis_index, cap_basis, max_qubits_for, pauli_weight_upto, prune_basis, word_hash,
 };
 
 /// Heisenberg-picture inflow into one species from the rows of another:
@@ -484,6 +484,30 @@ impl<const W: usize> BlockLindbladSpec<W> {
         max_basis: usize,
         tau_add: f64,
     ) -> Result<Vec<(Word<W>, f64)>, Error> {
+        Ok(self
+            .leakage_with_prune_w(basis, coeffs, protected, max_basis, tau_add, None)?
+            .0)
+    }
+
+    /// Pauli weight of a block row over the physical sites (the species
+    /// digits are not letters).
+    #[inline]
+    pub fn row_weight(&self, w: &Word<W>) -> u32 {
+        pauli_weight_upto(w, self.n_qubits)
+    }
+
+    /// [`Self::leakage_with_prune`] with the admission weight cap over the
+    /// physical sites ([`PcStepConfig::max_weight`]), as
+    /// [`LindbladSpec::leakage_with_prune_w`].
+    pub fn leakage_with_prune_w(
+        &self,
+        basis: &[Word<W>],
+        coeffs: &[f64],
+        protected: &[Word<W>],
+        max_basis: usize,
+        tau_add: f64,
+        max_weight: Option<u32>,
+    ) -> Result<(Vec<(Word<W>, f64)>, WeightDrop), Error> {
         if basis.len() != coeffs.len() {
             return Err(Error::LengthMismatch {
                 what: "basis and coeffs",
@@ -491,6 +515,8 @@ impl<const W: usize> BlockLindbladSpec<W> {
                 b: coeffs.len(),
             });
         }
+        let mut wdrop: WeightDrop = (0, 0.0);
+        let n_phys = self.n_qubits;
         let in_basis: FxHashMap<u64, ()> = basis.iter().map(|w| (word_hash(w), ())).collect();
         let protected_set: FxHashMap<u64, ()> =
             protected.iter().map(|w| (word_hash(w), ())).collect();
@@ -505,7 +531,7 @@ impl<const W: usize> BlockLindbladSpec<W> {
         let room = max_basis.saturating_sub(basis.len());
         let mut merged: FxHashMap<Word<W>, f64> = FxHashMap::default();
         for chunk_indices in order.chunks(CHUNK_SIZE) {
-            let local: Vec<Vec<(Word<W>, f64)>> = chunk_indices
+            let local: Vec<(Vec<(Word<W>, f64)>, WeightDrop)> = chunk_indices
                 .par_iter()
                 .map_init(
                     || self.scratch(),
@@ -513,17 +539,27 @@ impl<const W: usize> BlockLindbladSpec<W> {
                         let terms = self.compute_action_terms(&basis[i], s1, s2, lm);
                         let c = coeffs[i];
                         let mut out = Vec::with_capacity(terms.len());
+                        let mut wd: WeightDrop = (0, 0.0);
                         for (w, v) in terms.iter() {
                             let h = word_hash(w);
                             if !in_basis.contains_key(&h) && !protected_set.contains_key(&h) {
+                                if let Some(mw) = max_weight
+                                    && pauli_weight_upto(w, n_phys) > mw
+                                {
+                                    wd.0 += 1;
+                                    wd.1 += (c * *v).abs();
+                                    continue;
+                                }
                                 out.push((*w, c * *v));
                             }
                         }
-                        out
+                        (out, wd)
                     },
                 )
                 .collect();
-            for v in local {
+            for (v, wd) in local {
+                wdrop.0 += wd.0;
+                wdrop.1 += wd.1;
                 for (k, val) in v {
                     *merged.entry(k).or_insert(0.0) += val;
                 }
@@ -542,10 +578,13 @@ impl<const W: usize> BlockLindbladSpec<W> {
                 }
             }
         }
-        Ok(merged
-            .into_iter()
-            .filter(|(_, c)| c.abs() > tau_add)
-            .collect())
+        Ok((
+            merged
+                .into_iter()
+                .filter(|(_, c)| c.abs() > tau_add)
+                .collect(),
+            wdrop,
+        ))
     }
 
     /// Uncapped leakage ([`Self::leakage_with_prune`] with no room limit).
@@ -597,7 +636,7 @@ impl<const W: usize> BlockLindbladSpec<W> {
         dt: f64,
         protected: &[Word<W>],
         cfg: &PcStepConfig,
-    ) -> Result<(), Error> {
+    ) -> Result<PcStepStats, Error> {
         if let Some(n) = cfg.num_threads {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(n)
@@ -616,26 +655,45 @@ impl<const W: usize> BlockLindbladSpec<W> {
         dt: f64,
         protected: &[Word<W>],
         cfg: &PcStepConfig,
-    ) -> Result<(), Error> {
+    ) -> Result<PcStepStats, Error> {
         let PcStepConfig {
             max_basis,
             admit_basis,
             drop_tol,
             tau_add,
+            max_weight,
+            depolarize_eps,
             ..
         } = *cfg;
         let admit = admit_basis.unwrap_or(max_basis).max(max_basis);
         let tau_add = tau_add.unwrap_or(0.0);
-        let leak = self.leakage_with_prune(basis, coeffs, protected, admit, tau_add)?;
+        let weight_of = |w: &Word<W>| self.row_weight(w);
+        let mut st = PcStepStats::for_cfg(cfg);
+        let n0 = basis.len();
+        let (leak, wd) = self.leakage_with_prune_w(basis, coeffs, protected, admit, tau_add, max_weight)?;
+        st.add_weight_drop(wd);
         add_leakage_capped(basis, coeffs, leak, admit);
-        let coeffs_predict = mf_expm::expm_apply_mf(self, basis, dt, coeffs, drop_tol);
-        let leak2 = self.leakage_with_prune(basis, &coeffs_predict, protected, admit, tau_add)?;
+        st.admitted1 = (basis.len() - n0) as u64;
+        // `expm_apply_mf` = `mf_cache_full` + `apply_cache` (the same arithmetic
+        // in the same order); the depolarizing diagonal is added in between.
+        let mut cache = mf_expm::mf_cache_full(self, basis);
+        mf_expm::add_depolarize(&mut cache, basis, depolarize_eps, weight_of);
+        let coeffs_predict = mf_expm::apply_cache(&cache, dt, coeffs, drop_tol);
+        drop(cache);
+        let n1 = basis.len();
+        let (leak2, wd2) = self.leakage_with_prune_w(basis, &coeffs_predict, protected, admit, tau_add, max_weight)?;
+        st.add_weight_drop(wd2);
         drop(coeffs_predict);
         add_leakage_capped(basis, coeffs, leak2, admit);
-        *coeffs = mf_expm::expm_apply_mf(self, basis, dt, coeffs, drop_tol);
-        prune_basis(basis, coeffs, drop_tol, protected);
-        cap_basis(basis, coeffs, max_basis, protected);
-        Ok(())
+        st.admitted2 = (basis.len() - n1) as u64;
+        let mut cache = mf_expm::mf_cache_full(self, basis);
+        mf_expm::add_depolarize(&mut cache, basis, depolarize_eps, weight_of);
+        *coeffs = mf_expm::apply_cache(&cache, dt, coeffs, drop_tol);
+        drop(cache);
+        st.add_trim(prune_basis(basis, coeffs, drop_tol, protected));
+        st.add_trim(cap_basis(basis, coeffs, max_basis, protected));
+        st.finish(basis, weight_of);
+        Ok(st)
     }
 }
 

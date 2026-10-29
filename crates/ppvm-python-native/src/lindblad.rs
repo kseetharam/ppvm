@@ -624,7 +624,7 @@ fn pc_step_impl<'py, const W: usize>(
     cfg: ppvm_lindblad::PcStepConfig,
     protected: Option<PyReadonlyArray2<'py, u8>>,
     timed: bool,
-) -> PyResult<(PyPauliMap<'py>, Option<ppvm_lindblad::PcStepTimings>)> {
+) -> PyResult<(PyPauliMap<'py>, Option<ppvm_lindblad::PcStepTimings>, ppvm_lindblad::PcStepStats)> {
     let n_q = spec.n_qubits();
     let basis_view = basis.as_array();
     let mut basis_words = decode_basis::<W>(&basis_view, n_q)?;
@@ -638,19 +638,42 @@ fn pc_step_impl<'py, const W: usize>(
         )));
     }
     let prot = protected_words::<W>(protected.as_ref(), n_q)?;
-    let timings = if timed {
-        Some(
-            spec.pc_step_timed(&mut basis_words, &mut coeffs_vec, dt, &prot, &cfg)
-                .map_err(map_err)?,
-        )
-    } else {
-        spec.pc_step(&mut basis_words, &mut coeffs_vec, dt, &prot, &cfg)
+    let (timings, stats) = if timed {
+        let (t, st) = spec
+            .pc_step_timed(&mut basis_words, &mut coeffs_vec, dt, &prot, &cfg)
             .map_err(map_err)?;
-        None
+        (Some(t), st)
+    } else {
+        let st = spec
+            .pc_step(&mut basis_words, &mut coeffs_vec, dt, &prot, &cfg)
+            .map_err(map_err)?;
+        (None, st)
     };
     // Pack output. Basis may have grown; coeffs has the same new length.
     let pairs: Vec<(Word<W>, f64)> = basis_words.into_iter().zip(coeffs_vec).collect();
-    Ok((pack_pauli_map(py, pairs, n_q)?, timings))
+    Ok((pack_pauli_map(py, pairs, n_q)?, timings, stats))
+}
+
+/// The step account ([`ppvm_lindblad::PcStepStats`]) as a Python dict:
+/// `max_weight` (None = off), `depolarize_eps` (0.0 = off), `admitted1` /
+/// `admitted2`, `weight_dropped_terms` / `weight_dropped_l1`, `trim_dropped` /
+/// `trim_dropped_l2sq`, `basis_max_weight`, `basis_len`.
+pub(crate) fn stats_dict<'py>(
+    py: Python<'py>,
+    st: &ppvm_lindblad::PcStepStats,
+) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    let d = pyo3::types::PyDict::new(py);
+    d.set_item("max_weight", st.max_weight)?;
+    d.set_item("depolarize_eps", st.depolarize_eps)?;
+    d.set_item("admitted1", st.admitted1)?;
+    d.set_item("admitted2", st.admitted2)?;
+    d.set_item("weight_dropped_terms", st.weight_dropped_terms)?;
+    d.set_item("weight_dropped_l1", st.weight_dropped_l1)?;
+    d.set_item("trim_dropped", st.trim_dropped)?;
+    d.set_item("trim_dropped_l2sq", st.trim_dropped_l2sq)?;
+    d.set_item("basis_max_weight", st.basis_max_weight)?;
+    d.set_item("basis_len", st.basis_len)?;
+    Ok(d)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1356,7 +1379,10 @@ impl LindbladSpec {
     /// cap selects the top-`max_basis` strings over the whole union
     /// (displacement truncation). `drop_tol` prunes by magnitude after the
     /// step; `tau_add` filters leakage admission by inflow rate. Protected
-    /// words are never dropped.
+    /// words are never dropped. `max_weight` (None = off) refuses leakage
+    /// candidates of Pauli weight above it at admission; `depolarize_eps`
+    /// (0.0 = off) adds the per-site depolarizing diagonal `-eps·w(P)` to the
+    /// generator of both exponentials. See `pc_step_stats` for the account.
     #[pyo3(signature = (
         basis, coeffs, dt, max_basis,
         drop_tol = 0.0,
@@ -1365,6 +1391,8 @@ impl LindbladSpec {
         admit_basis = None,
         tau_add = None,
         locality = false,
+        max_weight = None,
+        depolarize_eps = 0.0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn pc_step<'py>(
@@ -1380,6 +1408,8 @@ impl LindbladSpec {
         admit_basis: Option<usize>,
         tau_add: Option<f64>,
         locality: bool,
+        max_weight: Option<u32>,
+        depolarize_eps: f64,
     ) -> PyResult<PyPauliMap<'py>> {
         let cfg = ppvm_lindblad::PcStepConfig {
             max_basis,
@@ -1388,14 +1418,19 @@ impl LindbladSpec {
             tau_add,
             num_threads,
             locality,
+            max_weight,
+            depolarize_eps,
         };
-        let (map, _) =
+        let (map, _, _) =
             dispatch!(&self.inner, s => pc_step_impl(s, py, basis, coeffs, dt, cfg, protected, false))?;
         Ok(map)
     }
 
-    /// Same as [`Self::pc_step`] but also returns a dict mapping phase
-    /// name → microseconds spent in that phase, for profiling.
+    /// Same as [`Self::pc_step`] but also returns the step account as a dict
+    /// (the keys of `stats_dict`): what the weight cap refused, what the two
+    /// admission passes added, what the end-of-step trim removed, the largest
+    /// weight in the retained basis, and the two settings. The step itself is
+    /// the one `pc_step` runs (no timers).
     #[pyo3(signature = (
         basis, coeffs, dt, max_basis,
         drop_tol = 0.0,
@@ -1404,6 +1439,54 @@ impl LindbladSpec {
         admit_basis = None,
         tau_add = None,
         locality = false,
+        max_weight = None,
+        depolarize_eps = 0.0,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn pc_step_stats<'py>(
+        &self,
+        py: Python<'py>,
+        basis: PyReadonlyArray2<'py, u8>,
+        coeffs: PyReadonlyArray1<'py, f64>,
+        dt: f64,
+        max_basis: usize,
+        drop_tol: f64,
+        protected: Option<PyReadonlyArray2<'py, u8>>,
+        num_threads: Option<usize>,
+        admit_basis: Option<usize>,
+        tau_add: Option<f64>,
+        locality: bool,
+        max_weight: Option<u32>,
+        depolarize_eps: f64,
+    ) -> PyResult<(PyPauliMap<'py>, Bound<'py, pyo3::types::PyDict>)> {
+        let cfg = ppvm_lindblad::PcStepConfig {
+            max_basis,
+            admit_basis,
+            drop_tol,
+            tau_add,
+            num_threads,
+            locality,
+            max_weight,
+            depolarize_eps,
+        };
+        let (map, _, stats) =
+            dispatch!(&self.inner, s => pc_step_impl(s, py, basis, coeffs, dt, cfg, protected, false))?;
+        Ok((map, stats_dict(py, &stats)?))
+    }
+
+    /// Same as [`Self::pc_step`] but also returns a dict mapping phase
+    /// name → microseconds spent in that phase, for profiling, plus the
+    /// step-account keys of `pc_step_stats`.
+    #[pyo3(signature = (
+        basis, coeffs, dt, max_basis,
+        drop_tol = 0.0,
+        protected = None,
+        num_threads = None,
+        admit_basis = None,
+        tau_add = None,
+        locality = false,
+        max_weight = None,
+        depolarize_eps = 0.0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn pc_step_timed<'py>(
@@ -1419,6 +1502,8 @@ impl LindbladSpec {
         admit_basis: Option<usize>,
         tau_add: Option<f64>,
         locality: bool,
+        max_weight: Option<u32>,
+        depolarize_eps: f64,
     ) -> PyResult<(PyPauliMap<'py>, Bound<'py, pyo3::types::PyDict>)> {
         let cfg = ppvm_lindblad::PcStepConfig {
             max_basis,
@@ -1427,11 +1512,13 @@ impl LindbladSpec {
             tau_add,
             num_threads,
             locality,
+            max_weight,
+            depolarize_eps,
         };
-        let (map, timings) =
+        let (map, timings, stats) =
             dispatch!(&self.inner, s => pc_step_impl(s, py, basis, coeffs, dt, cfg, protected, true))?;
         let timings = timings.expect("timed step returns timings");
-        let d = pyo3::types::PyDict::new(py);
+        let d = stats_dict(py, &stats)?;
         d.set_item("leakage1_us", timings.leakage1_us)?;
         d.set_item("expand1_us", timings.expand1_us)?;
         d.set_item("expm1_us", timings.expm1_us)?;
@@ -1504,6 +1591,8 @@ impl LindbladSpec {
         admit_basis: Option<usize>,
         tau_add: Option<f64>,
     ) -> PyResult<PyPauliMapComplex<'py>> {
+        // The orbit-rep step has neither the weight cap nor the depolarizing
+        // channel (W1-FORK: the plain and block steps only).
         let cfg = ppvm_lindblad::PcStepConfig {
             max_basis,
             admit_basis,
@@ -1511,6 +1600,8 @@ impl LindbladSpec {
             tau_add,
             num_threads: None,
             locality: false,
+            max_weight: None,
+            depolarize_eps: 0.0,
         };
         dispatch!(&self.inner, s => pc_step_orbit_rep_impl(
             s, py, basis, coeffs, dt, cfg, group, momentum, protected, canonicalize_first))

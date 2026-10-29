@@ -7,6 +7,7 @@ from .generalized_tableau import MeasurementResult as MeasurementResult
 from .generalized_tableau import sample_stim as sample_stim
 from .block_lindblad import BlockLindbladian as BlockLindbladian
 from .lindblad import MAX_QUBITS as MAX_QUBITS
+from .lindblad import STEP_FEATURES as STEP_FEATURES
 from .lindblad import WORD_WIDTHS as WORD_WIDTHS
 from .lindblad import Lindbladian as Lindbladian
 from .lindblad import max_qubits as max_qubits

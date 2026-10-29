@@ -126,9 +126,7 @@ fn xor_word<const W: usize>(a: &Word<W>, b: &Word<W>) -> Word<W> {
 }
 
 fn weight<const W: usize>(w: &Word<W>) -> u32 {
-    (0..W)
-        .map(|i| (w.xbits.data[i] | w.zbits.data[i]).count_ones())
-        .sum()
+    crate::pauli_weight(w)
 }
 
 /// The difference-word index of a compiled dissipator (see the module docs).
@@ -767,12 +765,14 @@ impl<const W: usize> LindbladSpec<W> {
         protected: &[Word<W>],
         max_basis: usize,
         tau_add: f64,
+        max_weight: Option<u32>,
         mut prof: Option<&mut LocalityProfile>,
-    ) -> Vec<(Word<W>, f64)> {
+    ) -> (Vec<(Word<W>, f64)>, crate::WeightDrop) {
         debug_assert_eq!(basis.len(), coeffs.len());
+        let mut wdrop: crate::WeightDrop = (0, 0.0);
         let room = max_basis.saturating_sub(basis.len());
         if room == 0 || basis.is_empty() {
-            return Vec::new();
+            return (Vec::new(), wdrop);
         }
         macro_rules! lap {
             ($field:ident, $t0:expr) => {
@@ -818,7 +818,7 @@ impl<const W: usize> LindbladSpec<W> {
         for chunk_indices in order.chunks(CHUNK_SIZE) {
             // the action of every string of the chunk, its outputs bucketed by shard
             let t0 = std::time::Instant::now();
-            let local: Vec<(Vec<Vec<(Word<W>, f64)>>, (f64, f64))> = chunk_indices
+            let local: Vec<(Vec<Vec<(Word<W>, f64)>>, (f64, f64), crate::WeightDrop)> = chunk_indices
                 .par_iter()
                 .map_init(crate::support::ActScratch::default, |sc, &i| {
                         let p = &basis[i];
@@ -826,28 +826,40 @@ impl<const W: usize> LindbladSpec<W> {
                         let terms = self.action_terms_locality(p, sc);
                         let rd = raw_diag(p, &terms);
                         let mut buckets: Vec<Vec<(Word<W>, f64)>> = (0..shards).map(|_| Vec::new()).collect();
+                        let mut wd: crate::WeightDrop = (0, 0.0);
                         for (w, v) in terms.iter() {
                             let h = word_hash(w);
                             if !in_basis.contains_key(&h) && !protected_set.contains_key(&h) {
+                                if let Some(mw) = max_weight
+                                    && weight(w) > mw
+                                {
+                                    wd.0 += 1;
+                                    wd.1 += (c * *v).abs();
+                                    continue;
+                                }
                                 buckets[shard_of(h)].push((*w, c * *v));
                             }
                         }
-                        (buckets, rd)
+                        (buckets, rd, wd)
                     },
                 )
                 .collect();
+            for (_, _, wd) in &local {
+                wdrop.0 += wd.0;
+                wdrop.1 += wd.1;
+            }
             lap!(leak_action_us, t0);
             count!(leak_strings, chunk_indices.len() as u64);
-            count!(leak_words, local.iter().map(|(b, _)| b.iter().map(|v| v.len() as u64).sum::<u64>()).sum::<u64>());
+            count!(leak_words, local.iter().map(|(b, _, _)| b.iter().map(|v| v.len() as u64).sum::<u64>()).sum::<u64>());
             let t0 = std::time::Instant::now();
-            self.cache_store(chunk_indices.iter().zip(local.iter()).map(|(&i, (_, rd))| (basis[i], *rd)));
+            self.cache_store(chunk_indices.iter().zip(local.iter()).map(|(&i, (_, rd, _))| (basis[i], *rd)));
             lap!(leak_cache_us, t0);
             // per shard, merge in chunk (= descending |c|) order: the legacy accumulation order per word
             let t0 = std::time::Instant::now();
             merged.par_iter_mut().enumerate().for_each(|(s, map)| {
-                let extra: usize = local.iter().map(|(b, _)| b[s].len()).sum();
+                let extra: usize = local.iter().map(|(b, _, _)| b[s].len()).sum();
                 map.reserve(extra);
-                for (buckets, _) in &local {
+                for (buckets, _, _) in &local {
                     for (w, v) in &buckets[s] {
                         *map.entry(*w).or_insert(0.0) += *v;
                     }
@@ -895,7 +907,7 @@ impl<const W: usize> LindbladSpec<W> {
             *g = merged;
         }
         lap!(leak_sort_us, t0);
-        out
+        (out, wdrop)
     }
 }
 
@@ -1081,17 +1093,17 @@ mod tests {
             let legacy = spec
                 .leakage_with_prune(&basis, &coeffs, &protected, max_basis, tau_add)
                 .unwrap();
-            let local = spec.leakage_locality(&basis, &coeffs, &protected, max_basis, tau_add, None);
+            let local = spec.leakage_locality(&basis, &coeffs, &protected, max_basis, tau_add, None, None).0;
             assert_eq!(sorted_leak(legacy), sorted_leak(local), "max_basis {max_basis} tau_add {tau_add}");
             // the locality result is sorted by word
-            let again = spec.leakage_locality(&basis, &coeffs, &protected, max_basis, tau_add, None);
+            let again = spec.leakage_locality(&basis, &coeffs, &protected, max_basis, tau_add, None, None).0;
             assert!(again.windows(2).all(|w| {
                 (w[0].0.xbits.data, w[0].0.zbits.data) < (w[1].0.xbits.data, w[1].0.zbits.data)
             }));
         }
         // room == 0: both empty, the locality one without evaluating anything
         assert!(spec.leakage_with_prune(&basis, &coeffs, &protected, basis.len(), 0.0).unwrap().is_empty());
-        assert!(spec.leakage_locality(&basis, &coeffs, &protected, basis.len(), 0.0, None).is_empty());
+        assert!(spec.leakage_locality(&basis, &coeffs, &protected, basis.len(), 0.0, None, None).0.is_empty());
         // the pass fills the raw / diag cache for every basis word
         assert_eq!(spec.locality_stats().5, basis.len());
     }
@@ -1112,6 +1124,8 @@ mod tests {
             tau_add: None,
             num_threads: Some(1),
             locality: false,
+            max_weight: None,
+            depolarize_eps: 0.0,
         };
         let (mut b1, mut c1) = (vec![z0, x3], vec![0.8, 0.3]);
         let (mut b2, mut c2) = (b1.clone(), c1.clone());
@@ -1252,7 +1266,7 @@ mod tests {
         for room in [37usize, 400, 6000] {
             let max_basis = basis.len() + room;
             let legacy = spec.leakage_with_prune(&basis, &coeffs, &protected, max_basis, 0.0).unwrap();
-            let local = spec.leakage_locality(&basis, &coeffs, &protected, max_basis, 0.0, None);
+            let local = spec.leakage_locality(&basis, &coeffs, &protected, max_basis, 0.0, None, None).0;
             assert_eq!(legacy.len(), local.len(), "room {room}: count differs");
             assert!(sorted_leak(legacy) == sorted_leak(local), "room {room}: values differ");
         }

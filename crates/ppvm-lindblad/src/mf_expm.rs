@@ -261,6 +261,46 @@ pub(crate) struct MfCache {
     pub(crate) per_col: MfPerCol,
 }
 
+/// Add the per-site depolarizing channel `D*(P) = −eps·w(P)·P` to a built
+/// generator cache ([`crate::PcStepConfig::depolarize_eps`]): the diagonal
+/// entry of every column `c` is lowered by `eps·w(basis[c])` (pushed when the
+/// column had no diagonal entry) and `per_col[c] = (raw, diag)` is updated
+/// consistently (`raw − |diag| + |diag − d|`, so the off-diagonal column sum
+/// the `μ` / 1-norm selection reads is unchanged). `weight_of` gives the
+/// weight of a basis word (all sites for a [`LindbladSpec`], the physical
+/// sites for the block spec). No-op for `eps <= 0.0` and for the identity
+/// (`w = 0`), so the trace is preserved.
+pub(crate) fn add_depolarize<const W: usize>(
+    cache: &mut MfCache,
+    basis: &[Word<W>],
+    eps: f64,
+    weight_of: impl Fn(&Word<W>) -> u32 + Sync,
+) {
+    if eps <= 0.0 {
+        return;
+    }
+    cache
+        .cols
+        .par_iter_mut()
+        .zip(cache.per_col.par_iter_mut())
+        .enumerate()
+        .for_each(|(c, (col, pc))| {
+            let w = weight_of(&basis[c]);
+            if w == 0 {
+                return;
+            }
+            let d = eps * w as f64;
+            let row = c as u32;
+            let (raw, diag) = *pc;
+            match col.iter_mut().find(|(r, _)| *r == row) {
+                Some(e) => e.1 -= d,
+                None => col.push((row, -d)),
+            }
+            let new_diag = diag - d;
+            *pc = (raw - diag.abs() + new_diag.abs(), new_diag);
+        });
+}
+
 /// The legacy cache: one full action pass over `basis`.
 pub(crate) fn mf_cache_full<const W: usize, S: ActionTerms<W> + ?Sized>(
     spec: &S,
@@ -279,6 +319,7 @@ pub(crate) fn mf_cache_full<const W: usize, S: ActionTerms<W> + ?Sized>(
 /// exact column 1-norm of `M − μ·I`; from `‖dt·(M−μI)‖₁` we pick the Taylor
 /// partition `(m*, s)` and hand everything to
 /// [`quspin_expm::ExpmOp::from_parts`].
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn expm_apply_mf<const W: usize, S: ActionTerms<W> + ?Sized>(
     spec: &S,
     basis: &[Word<W>],

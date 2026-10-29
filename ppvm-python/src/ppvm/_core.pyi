@@ -468,7 +468,24 @@ class LindbladSpec:
         admit_basis: int | None = None,
         tau_add: float | None = None,
         locality: bool = False,
+        max_weight: int | None = None,
+        depolarize_eps: float = 0.0,
     ) -> tuple[np.ndarray, np.ndarray]: ...
+    def pc_step_stats(
+        self,
+        basis: np.ndarray,
+        coeffs: np.ndarray,
+        dt: float,
+        max_basis: int,
+        drop_tol: float = 0.0,
+        protected: np.ndarray | None = None,
+        num_threads: int | None = None,
+        admit_basis: int | None = None,
+        tau_add: float | None = None,
+        locality: bool = False,
+        max_weight: int | None = None,
+        depolarize_eps: float = 0.0,
+    ) -> tuple[tuple[np.ndarray, np.ndarray], dict[str, int | float | None]]: ...
     def pc_step_timed(
         self,
         basis: np.ndarray,
@@ -481,7 +498,9 @@ class LindbladSpec:
         admit_basis: int | None = None,
         tau_add: float | None = None,
         locality: bool = False,
-    ) -> tuple[tuple[np.ndarray, np.ndarray], dict[str, int]]: ...
+        max_weight: int | None = None,
+        depolarize_eps: float = 0.0,
+    ) -> tuple[tuple[np.ndarray, np.ndarray], dict[str, int | float | None]]: ...
     def pc_step_orbit_rep(
         self,
         basis: np.ndarray,
@@ -558,7 +577,25 @@ class BlockLindbladSpec:
         num_threads: int | None = None,
         admit_basis: int | None = None,
         tau_add: float | None = None,
+        max_weight: int | None = None,
+        depolarize_eps: float = 0.0,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]: ...
+    def pc_step_stats(
+        self,
+        basis: np.ndarray,
+        species: np.ndarray,
+        coeffs: np.ndarray,
+        dt: float,
+        max_basis: int,
+        drop_tol: float = 0.0,
+        protected_basis: np.ndarray | None = None,
+        protected_species: np.ndarray | None = None,
+        num_threads: int | None = None,
+        admit_basis: int | None = None,
+        tau_add: float | None = None,
+        max_weight: int | None = None,
+        depolarize_eps: float = 0.0,
+    ) -> tuple[tuple[np.ndarray, np.ndarray, np.ndarray], dict[str, int | float | None]]: ...
     def generator(
         self, basis: np.ndarray, species: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]: ...

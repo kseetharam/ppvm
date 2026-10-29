@@ -63,6 +63,15 @@ WORD_WIDTH_MAX_QUBITS: dict[int, int] = {int(w): int(m) for w, m in _word_widths
 MAX_QUBITS: int = int(_max_qubits())
 
 
+#: The step features of this build of the native core beyond the standing
+#: `pc_step_arr(basis, coeffs, dt, max_basis, drop_tol, protected_arr, num_threads,
+#: admit_basis, tau_add)` signature, for guarded imports: the locality-aware step
+#: (`locality=`), the admission weight cap (`max_weight=`), the per-site
+#: depolarizing channel (`depolarize_eps=`) and the step account
+#: (`return_stats=` / `_core.LindbladSpec.pc_step_stats`).
+STEP_FEATURES: tuple[str, ...] = ("locality", "max_weight", "depolarize_eps", "step_stats")
+
+
 def max_qubits() -> int:
     """The largest ``n_qubits`` a `Lindbladian` / `BlockLindbladian` of this
     build accepts (the top compiled Pauli-word width times `CHUNK_BITS`)."""
@@ -981,7 +990,10 @@ class Lindbladian:
         admit_basis: int | None = None,
         tau_add: float | None = None,
         locality: bool = False,
-    ) -> tuple[np.ndarray, np.ndarray]:
+        max_weight: int | None = None,
+        depolarize_eps: float = 0.0,
+        return_stats: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, dict]:
         """One predictor-corrector adaptive step.
 
         All work — leakage expansion, matrix-exponential step, second-hop
@@ -1028,13 +1040,41 @@ class Lindbladian:
         of difference as a change of thread count). See
         ``locality_stats`` / ``build_locality_index``.
 
+        ``max_weight`` (default ``None`` = off) is a Pauli-weight cap on
+        admission: a leakage candidate with more than ``max_weight``
+        non-identity sites is refused before the room cap (so the admission
+        slots go to strings of weight <= ``max_weight``); strings already in
+        the basis -- the observable, protected words -- are never touched.
+        The refused contributions are counted in the step account.
+
+        ``depolarize_eps`` (default ``0.0`` = off) is a per-site depolarizing
+        channel of rate ``eps``: the exact Lindblad dissipator with jumps
+        ``sqrt(eps/4) * {X_i, Y_i, Z_i}`` on every site, diagonal in the Pauli
+        basis (``D*(P) = -eps * w(P) * P``). It enters the in-basis generator
+        of both exponentials of the step -- a string of weight ``w`` decays as
+        ``exp(-eps * w * t)`` exactly for ``H = 0`` and the channel is the
+        exact generator term (not a split factor) otherwise -- and never
+        leaks. With both knobs at their defaults the step is the previous
+        step bit for bit.
+
+        ``return_stats`` (default ``False``) returns ``(new_basis_arr,
+        new_coeffs, stats)`` with the step account: ``max_weight``,
+        ``depolarize_eps``, ``admitted1`` / ``admitted2`` (strings admitted by
+        the two passes), ``weight_dropped_terms`` / ``weight_dropped_l1``
+        (leakage contributions the weight cap refused and the sum of their
+        magnitudes -- an upper bound on the L1 norm of the discarded leakage;
+        times ``dt`` the first-order coefficient weight removed in the step),
+        ``trim_dropped`` / ``trim_dropped_l2sq`` (strings the end-of-step
+        prune / cap removed and the sum of their squared coefficients),
+        ``basis_max_weight`` and ``basis_len`` of the retained basis.
+
         Returns ``(new_basis_arr, new_coeffs)``; the basis may have grown
         (or shrunk, if ``max_basis`` / ``drop_tol`` pruned entries).
         """
         n = self.n_qubits
         if protected_arr is None:
             protected_arr = np.zeros((0, n), dtype=np.uint8)
-        return self._spec.pc_step(
+        args = (
             np.ascontiguousarray(basis_arr, dtype=np.uint8),
             np.ascontiguousarray(coeffs, dtype=np.float64),
             float(dt),
@@ -1045,7 +1085,13 @@ class Lindbladian:
             None if admit_basis is None else int(admit_basis),
             None if tau_add is None else float(tau_add),
             bool(locality),
+            None if max_weight is None else int(max_weight),
+            float(depolarize_eps),
         )
+        if return_stats:
+            (new_basis, new_coeffs), stats = self._spec.pc_step_stats(*args)
+            return new_basis, new_coeffs, stats
+        return self._spec.pc_step(*args)
 
     @property
     def locality_stats(self) -> dict[str, int | bool]:

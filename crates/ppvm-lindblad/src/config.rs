@@ -54,6 +54,24 @@ pub struct PcStepConfig {
     /// order of the matvec reduction (round-off level). `false` (default) is
     /// the legacy step.
     pub locality: bool,
+    /// Pauli-weight cap on admission (`Some(l)`): a leakage candidate whose
+    /// weight (number of non-identity sites; on the block spec the physical
+    /// sites only, not the species digits) exceeds `l` is never admitted. The
+    /// filter runs before the room cap, so the admission slots go to strings
+    /// of weight `<= l`, and the dropped contributions are counted in
+    /// [`crate::PcStepStats`] (`weight_dropped_terms` / `weight_dropped_l1`).
+    /// Strings already in the basis (the observable, protected words) are
+    /// not touched. `None` (default): no cap, the step unchanged bit for bit.
+    pub max_weight: Option<u32>,
+    /// Per-site depolarizing channel of rate `eps` (when `> 0.0`): the exact
+    /// Lindblad dissipator with jumps `sqrt(eps/4)·{X_i, Y_i, Z_i}` on every
+    /// site, which is diagonal in the Pauli basis, `D*(P) = −eps·w(P)·P`. It
+    /// enters the in-basis generator of both exponentials of the step (so a
+    /// string of weight `w` decays as `exp(−eps·w·t)` exactly for `H = 0`,
+    /// and the channel is the exact generator term, not a split factor, for
+    /// `H ≠ 0`); being diagonal it never leaks. `0.0` (default): off, the
+    /// generator unchanged bit for bit.
+    pub depolarize_eps: f64,
 }
 
 impl Default for PcStepConfig {
@@ -68,6 +86,8 @@ impl Default for PcStepConfig {
             tau_add: None,
             num_threads: None,
             locality: false,
+            max_weight: None,
+            depolarize_eps: 0.0,
         }
     }
 }

@@ -225,7 +225,7 @@ fn pc_step_impl<'py, const W: usize>(
     cfg: ppvm_lindblad::PcStepConfig,
     protected_basis: Option<PyReadonlyArray2<'py, u8>>,
     protected_species: Option<PyReadonlyArray1<'py, u8>>,
-) -> PyResult<PyBlockMap<'py>> {
+) -> PyResult<(PyBlockMap<'py>, ppvm_lindblad::PcStepStats)> {
     let mut rows = decode_rows(spec, &basis.as_array(), species.as_slice()?)?;
     assert_rows_unique(&rows)?;
     let mut coeffs_vec = coeffs.as_slice()?.to_vec();
@@ -237,10 +237,11 @@ fn pc_step_impl<'py, const W: usize>(
         )));
     }
     let protected = protected_rows(spec, protected_basis.as_ref(), protected_species.as_ref())?;
-    spec.pc_step(&mut rows, &mut coeffs_vec, dt, &protected, &cfg)
+    let stats = spec
+        .pc_step(&mut rows, &mut coeffs_vec, dt, &protected, &cfg)
         .map_err(map_err)?;
     let pairs: Vec<(Word<W>, f64)> = rows.into_iter().zip(coeffs_vec).collect();
-    pack_rows(py, spec, pairs)
+    Ok((pack_rows(py, spec, pairs)?, stats))
 }
 
 fn generator_impl<'py, const W: usize>(
@@ -458,6 +459,8 @@ impl BlockLindbladSpec {
         num_threads = None,
         admit_basis = None,
         tau_add = None,
+        max_weight = None,
+        depolarize_eps = 0.0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn pc_step<'py>(
@@ -474,6 +477,8 @@ impl BlockLindbladSpec {
         num_threads: Option<usize>,
         admit_basis: Option<usize>,
         tau_add: Option<f64>,
+        max_weight: Option<u32>,
+        depolarize_eps: f64,
     ) -> PyResult<PyBlockMap<'py>> {
         let cfg = ppvm_lindblad::PcStepConfig {
             max_basis,
@@ -482,9 +487,59 @@ impl BlockLindbladSpec {
             tau_add,
             num_threads,
             locality: false,
+            max_weight,
+            depolarize_eps,
         };
-        dispatch!(&self.inner, s => pc_step_impl(
-            s, py, basis, species, coeffs, dt, cfg, protected_basis, protected_species))
+        let (map, _) = dispatch!(&self.inner, s => pc_step_impl(
+            s, py, basis, species, coeffs, dt, cfg, protected_basis, protected_species))?;
+        Ok(map)
+    }
+
+    /// Same as [`Self::pc_step`] but also returns the step account dict
+    /// (`LindbladSpec.pc_step_stats`); the weight of a row is taken over the
+    /// physical sites, not the species digits.
+    #[pyo3(signature = (
+        basis, species, coeffs, dt, max_basis,
+        drop_tol = 0.0,
+        protected_basis = None,
+        protected_species = None,
+        num_threads = None,
+        admit_basis = None,
+        tau_add = None,
+        max_weight = None,
+        depolarize_eps = 0.0,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn pc_step_stats<'py>(
+        &self,
+        py: Python<'py>,
+        basis: PyReadonlyArray2<'py, u8>,
+        species: PyReadonlyArray1<'py, u8>,
+        coeffs: PyReadonlyArray1<'py, f64>,
+        dt: f64,
+        max_basis: usize,
+        drop_tol: f64,
+        protected_basis: Option<PyReadonlyArray2<'py, u8>>,
+        protected_species: Option<PyReadonlyArray1<'py, u8>>,
+        num_threads: Option<usize>,
+        admit_basis: Option<usize>,
+        tau_add: Option<f64>,
+        max_weight: Option<u32>,
+        depolarize_eps: f64,
+    ) -> PyResult<(PyBlockMap<'py>, Bound<'py, pyo3::types::PyDict>)> {
+        let cfg = ppvm_lindblad::PcStepConfig {
+            max_basis,
+            admit_basis,
+            drop_tol,
+            tau_add,
+            num_threads,
+            locality: false,
+            max_weight,
+            depolarize_eps,
+        };
+        let (map, stats) = dispatch!(&self.inner, s => pc_step_impl(
+            s, py, basis, species, coeffs, dt, cfg, protected_basis, protected_species))?;
+        Ok((map, crate::lindblad::stats_dict(py, &stats)?))
     }
 
     /// Sparse generator on the given rows in COO form `(rows, cols, vals)`.

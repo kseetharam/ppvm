@@ -125,6 +125,8 @@ fn evolve<const W: usize>(n: usize, n_steps: usize, max_basis: usize) -> HashMap
         tau_add: None,
         num_threads: Some(1),
         locality: false,
+        max_weight: None,
+        depolarize_eps: 0.0,
     };
     for _ in 0..n_steps {
         spec.pc_step(&mut basis, &mut coeffs, 0.05, &[], &cfg).unwrap();
@@ -428,6 +430,8 @@ fn locality_step_on_register_qubits_above_255() {
             tau_add: None,
             num_threads: Some(1),
             locality,
+            max_weight: None,
+            depolarize_eps: 0.0,
         };
         for _ in 0..4 {
             spec.pc_step(&mut basis, &mut coeffs, 0.05, &[], &cfg).unwrap();
