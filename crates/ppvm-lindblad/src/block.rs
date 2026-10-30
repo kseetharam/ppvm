@@ -515,8 +515,9 @@ impl<const W: usize> BlockLindbladSpec<W> {
                 b: coeffs.len(),
             });
         }
-        let mut wdrop: WeightDrop = (0, 0.0);
+        let mut wdrop = WeightDrop::default();
         let n_phys = self.n_qubits;
+        let n_bins = n_phys + 1;
         let in_basis: FxHashMap<u64, ()> = basis.iter().map(|w| (word_hash(w), ())).collect();
         let protected_set: FxHashMap<u64, ()> =
             protected.iter().map(|w| (word_hash(w), ())).collect();
@@ -539,16 +540,16 @@ impl<const W: usize> BlockLindbladSpec<W> {
                         let terms = self.compute_action_terms(&basis[i], s1, s2, lm);
                         let c = coeffs[i];
                         let mut out = Vec::with_capacity(terms.len());
-                        let mut wd: WeightDrop = (0, 0.0);
+                        let mut wd = WeightDrop::default();
                         for (w, v) in terms.iter() {
                             let h = word_hash(w);
                             if !in_basis.contains_key(&h) && !protected_set.contains_key(&h) {
-                                if let Some(mw) = max_weight
-                                    && pauli_weight_upto(w, n_phys) > mw
-                                {
-                                    wd.0 += 1;
-                                    wd.1 += (c * *v).abs();
-                                    continue;
+                                if let Some(mw) = max_weight {
+                                    let pw = pauli_weight_upto(w, n_phys);
+                                    if pw > mw {
+                                        wd.add_term(pw, (c * *v).abs(), n_bins);
+                                        continue;
+                                    }
                                 }
                                 out.push((*w, c * *v));
                             }
@@ -558,8 +559,7 @@ impl<const W: usize> BlockLindbladSpec<W> {
                 )
                 .collect();
             for (v, wd) in local {
-                wdrop.0 += wd.0;
-                wdrop.1 += wd.1;
+                wdrop.merge(&wd);
                 for (k, val) in v {
                     *merged.entry(k).or_insert(0.0) += val;
                 }
@@ -668,10 +668,10 @@ impl<const W: usize> BlockLindbladSpec<W> {
         let admit = admit_basis.unwrap_or(max_basis).max(max_basis);
         let tau_add = tau_add.unwrap_or(0.0);
         let weight_of = |w: &Word<W>| self.row_weight(w);
-        let mut st = PcStepStats::for_cfg(cfg);
+        let mut st = PcStepStats::for_cfg(cfg, self.n_qubits + 1);
         let n0 = basis.len();
         let (leak, wd) = self.leakage_with_prune_w(basis, coeffs, protected, admit, tau_add, max_weight)?;
-        st.add_weight_drop(wd);
+        st.add_weight_drop(&wd);
         add_leakage_capped(basis, coeffs, leak, admit);
         st.admitted1 = (basis.len() - n0) as u64;
         // `expm_apply_mf` = `mf_cache_full` + `apply_cache` (the same arithmetic
@@ -682,17 +682,19 @@ impl<const W: usize> BlockLindbladSpec<W> {
         drop(cache);
         let n1 = basis.len();
         let (leak2, wd2) = self.leakage_with_prune_w(basis, &coeffs_predict, protected, admit, tau_add, max_weight)?;
-        st.add_weight_drop(wd2);
+        st.add_weight_drop(&wd2);
         drop(coeffs_predict);
         add_leakage_capped(basis, coeffs, leak2, admit);
         st.admitted2 = (basis.len() - n1) as u64;
         let mut cache = mf_expm::mf_cache_full(self, basis);
         mf_expm::add_depolarize(&mut cache, basis, depolarize_eps, weight_of);
+        st.snapshot_pre(basis, coeffs, weight_of);
         *coeffs = mf_expm::apply_cache(&cache, dt, coeffs, drop_tol);
         drop(cache);
-        st.add_trim(prune_basis(basis, coeffs, drop_tol, protected));
-        st.add_trim(cap_basis(basis, coeffs, max_basis, protected));
-        st.finish(basis, weight_of);
+        st.snapshot_post(basis, coeffs, dt, weight_of);
+        st.add_trim(&prune_basis(basis, coeffs, drop_tol, protected, weight_of, st.n_bins));
+        st.add_trim(&cap_basis(basis, coeffs, max_basis, protected, weight_of, st.n_bins));
+        st.finish(basis, coeffs, weight_of);
         Ok(st)
     }
 }

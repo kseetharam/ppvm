@@ -68,8 +68,9 @@ MAX_QUBITS: int = int(_max_qubits())
 #: admit_basis, tau_add)` signature, for guarded imports: the locality-aware step
 #: (`locality=`), the admission weight cap (`max_weight=`), the per-site
 #: depolarizing channel (`depolarize_eps=`) and the step account
-#: (`return_stats=` / `_core.LindbladSpec.pc_step_stats`).
-STEP_FEATURES: tuple[str, ...] = ("locality", "max_weight", "depolarize_eps", "step_stats")
+#: (`return_stats=` / `_core.LindbladSpec.pc_step_stats`) and the per-weight-class arrays in it (`step_hist`:
+#: `*_by_w` keys of length `n_qubits + 1`).
+STEP_FEATURES: tuple[str, ...] = ("locality", "max_weight", "depolarize_eps", "step_stats", "step_hist")
 
 
 def max_qubits() -> int:
@@ -1066,7 +1067,19 @@ class Lindbladian:
         times ``dt`` the first-order coefficient weight removed in the step),
         ``trim_dropped`` / ``trim_dropped_l2sq`` (strings the end-of-step
         prune / cap removed and the sum of their squared coefficients),
-        ``basis_max_weight`` and ``basis_len`` of the retained basis.
+        ``basis_max_weight`` and ``basis_len`` of the retained basis; and the
+        per-weight-class arrays (numpy, length ``n_bins = n_qubits + 1``, bin
+        ``w`` = Pauli weight ``w``): ``cap_refused_l1_by_w`` (the refused
+        leakage magnitude by the weight of the refused word),
+        ``trim_l2sq_by_w`` (the trimmed squared coefficients by weight),
+        ``pre_l2sq_by_w`` / ``post_l2sq_by_w`` (``sum c**2`` by weight of the
+        corrector's input -- the state at the start of the step on the
+        enlarged basis -- and of its output before the trim),
+        ``retained_l2sq_by_w`` (after the trim) and ``channel_damp_l2sq_by_w``
+        (the depolarizing channel's norm removal per class over the step,
+        ``eps * w * dt * (pre_w + post_w)`` -- the trapezoid rule, exact to
+        third order in ``eps * w * dt``; for ``H = 0`` the exact value is
+        ``pre_w * (1 - exp(-2 eps w dt))``; zeros when the channel is off).
 
         Returns ``(new_basis_arr, new_coeffs)``; the basis may have grown
         (or shrunk, if ``max_basis`` / ``drop_tol`` pruned entries).

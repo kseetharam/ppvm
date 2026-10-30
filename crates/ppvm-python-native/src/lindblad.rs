@@ -673,6 +673,14 @@ pub(crate) fn stats_dict<'py>(
     d.set_item("trim_dropped_l2sq", st.trim_dropped_l2sq)?;
     d.set_item("basis_max_weight", st.basis_max_weight)?;
     d.set_item("basis_len", st.basis_len)?;
+    // the per-weight-class arrays (length n_bins = sites + 1), as numpy arrays
+    d.set_item("n_bins", st.n_bins)?;
+    d.set_item("cap_refused_l1_by_w", PyArray1::from_vec(py, st.cap_refused_l1_by_w.clone()))?;
+    d.set_item("trim_l2sq_by_w", PyArray1::from_vec(py, st.trim_l2sq_by_w.clone()))?;
+    d.set_item("pre_l2sq_by_w", PyArray1::from_vec(py, st.pre_l2sq_by_w.clone()))?;
+    d.set_item("post_l2sq_by_w", PyArray1::from_vec(py, st.post_l2sq_by_w.clone()))?;
+    d.set_item("retained_l2sq_by_w", PyArray1::from_vec(py, st.retained_l2sq_by_w.clone()))?;
+    d.set_item("channel_damp_l2sq_by_w", PyArray1::from_vec(py, st.channel_damp_l2sq_by_w.clone()))?;
     Ok(d)
 }
 

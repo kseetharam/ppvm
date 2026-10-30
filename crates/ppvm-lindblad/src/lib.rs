@@ -142,7 +142,7 @@ impl PcStepTimings {
 /// settings the step ran with. All counters are exact for the step; the
 /// `_l1` / `_l2sq` sums are the plain sums of the quantities named (no
 /// rounding beyond the summation order).
-#[derive(Default, Clone, Copy, Debug)]
+#[derive(Default, Clone, Debug)]
 pub struct PcStepStats {
     /// The step's weight cap (`PcStepConfig::max_weight`), `None` = off.
     pub max_weight: Option<u32>,
@@ -167,30 +167,173 @@ pub struct PcStepStats {
     /// sites only on the block spec), and the retained basis size.
     pub basis_max_weight: u32,
     pub basis_len: u64,
+    /// Number of weight classes: `n_sites + 1` (bin `w` = Pauli weight `w`;
+    /// the block spec counts its physical sites). Every `*_by_w` vector below
+    /// has this length.
+    pub n_bins: usize,
+    /// `weight_dropped_l1` split by the weight of the refused output word.
+    pub cap_refused_l1_by_w: Vec<f64>,
+    /// `trim_dropped_l2sq` split by the weight of the removed string.
+    pub trim_l2sq_by_w: Vec<f64>,
+    /// `Σ c²` by weight class of the corrector's input — the pre-step state
+    /// on the doubly-enlarged basis (the admitted strings enter at 0), i.e.
+    /// the state at the start of the step.
+    pub pre_l2sq_by_w: Vec<f64>,
+    /// `Σ c²` by weight class of the corrector's output, before the trim.
+    pub post_l2sq_by_w: Vec<f64>,
+    /// `Σ c²` by weight class of the retained basis after the trim.
+    pub retained_l2sq_by_w: Vec<f64>,
+    /// The depolarizing channel's norm removal per class over the step,
+    /// `∫ 2·eps·w·Σ_{w} c² dt` by the trapezoid rule on the pre / post
+    /// snapshots: `eps·w·dt·(pre_w + post_w)`. Exact to O((eps·w·dt)³) per
+    /// step for the channel's own term under the full generator; for `H = 0`
+    /// the exact value is `pre_w·(1 − e^{−2·eps·w·dt})`. All zeros when the
+    /// channel is off.
+    pub channel_damp_l2sq_by_w: Vec<f64>,
+}
+
+/// Account of the contributions a weight cap refuses in one leakage pass:
+/// count, `Σ|contribution|`, and the latter by the weight of the refused
+/// output word (`by_w` is left empty until the first refusal, so the
+/// `max_weight = None` path allocates nothing).
+#[derive(Default, Clone, Debug)]
+pub struct WeightDrop {
+    pub n: u64,
+    pub l1: f64,
+    pub by_w: Vec<f64>,
+}
+
+impl WeightDrop {
+    #[inline]
+    pub(crate) fn add_term(&mut self, w: u32, mag: f64, n_bins: usize) {
+        self.n += 1;
+        self.l1 += mag;
+        if self.by_w.is_empty() {
+            self.by_w = vec![0.0; n_bins];
+        }
+        let i = (w as usize).min(n_bins.saturating_sub(1));
+        self.by_w[i] += mag;
+    }
+
+    pub(crate) fn merge(&mut self, other: &WeightDrop) {
+        self.n += other.n;
+        self.l1 += other.l1;
+        if !other.by_w.is_empty() {
+            if self.by_w.is_empty() {
+                self.by_w = vec![0.0; other.by_w.len()];
+            }
+            for (a, b) in self.by_w.iter_mut().zip(other.by_w.iter()) {
+                *a += b;
+            }
+        }
+    }
+}
+
+/// Account of what `prune_basis` / `cap_basis` removed: count, `Σ c²`, and
+/// `Σ c²` by the weight of the removed string.
+#[derive(Default, Clone, Debug)]
+pub struct TrimAccount {
+    pub n: u64,
+    pub l2sq: f64,
+    pub by_w: Vec<f64>,
+}
+
+impl TrimAccount {
+    fn new(n_bins: usize) -> Self {
+        Self { n: 0, l2sq: 0.0, by_w: vec![0.0; n_bins] }
+    }
+
+    #[inline]
+    fn add(&mut self, w: u32, c: f64) {
+        self.n += 1;
+        self.l2sq += c * c;
+        let i = (w as usize).min(self.by_w.len().saturating_sub(1));
+        self.by_w[i] += c * c;
+    }
+}
+
+/// `Σ c²` by Pauli-weight class of a coefficient vector on `basis`
+/// (`n_bins` = sites + 1; `weight_of` counts the physical sites).
+pub fn l2sq_by_weight<const W: usize>(
+    basis: &[Word<W>],
+    coeffs: &[f64],
+    n_bins: usize,
+    weight_of: impl Fn(&Word<W>) -> u32 + Sync,
+) -> Vec<f64> {
+    let last = n_bins.saturating_sub(1);
+    basis
+        .par_iter()
+        .zip(coeffs.par_iter())
+        .fold(
+            || vec![0.0f64; n_bins],
+            |mut acc, (w, c)| {
+                acc[(weight_of(w) as usize).min(last)] += c * c;
+                acc
+            },
+        )
+        .reduce(
+            || vec![0.0f64; n_bins],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(b.iter()) {
+                    *x += y;
+                }
+                a
+            },
+        )
 }
 
 impl PcStepStats {
-    fn for_cfg(cfg: &PcStepConfig) -> Self {
+    fn for_cfg(cfg: &PcStepConfig, n_bins: usize) -> Self {
         Self {
             max_weight: cfg.max_weight,
             depolarize_eps: cfg.depolarize_eps,
+            n_bins,
+            cap_refused_l1_by_w: vec![0.0; n_bins],
+            trim_l2sq_by_w: vec![0.0; n_bins],
+            pre_l2sq_by_w: vec![0.0; n_bins],
+            post_l2sq_by_w: vec![0.0; n_bins],
+            retained_l2sq_by_w: vec![0.0; n_bins],
+            channel_damp_l2sq_by_w: vec![0.0; n_bins],
             ..Default::default()
         }
     }
 
-    fn add_weight_drop(&mut self, d: (u64, f64)) {
-        self.weight_dropped_terms += d.0;
-        self.weight_dropped_l1 += d.1;
+    fn add_weight_drop(&mut self, d: &WeightDrop) {
+        self.weight_dropped_terms += d.n;
+        self.weight_dropped_l1 += d.l1;
+        for (a, b) in self.cap_refused_l1_by_w.iter_mut().zip(d.by_w.iter()) {
+            *a += b;
+        }
     }
 
-    fn add_trim(&mut self, t: (u64, f64)) {
-        self.trim_dropped += t.0;
-        self.trim_dropped_l2sq += t.1;
+    fn add_trim(&mut self, t: &TrimAccount) {
+        self.trim_dropped += t.n;
+        self.trim_dropped_l2sq += t.l2sq;
+        for (a, b) in self.trim_l2sq_by_w.iter_mut().zip(t.by_w.iter()) {
+            *a += b;
+        }
     }
 
-    fn finish<const W: usize>(&mut self, basis: &[Word<W>], weight_of: impl Fn(&Word<W>) -> u32 + Sync) {
+    /// The corrector's input snapshot (pre-step state on the enlarged basis).
+    fn snapshot_pre<const W: usize>(&mut self, basis: &[Word<W>], coeffs: &[f64], weight_of: impl Fn(&Word<W>) -> u32 + Sync) {
+        self.pre_l2sq_by_w = l2sq_by_weight(basis, coeffs, self.n_bins, weight_of);
+    }
+
+    /// The corrector's output snapshot (before the trim) and the channel's
+    /// per-class damping estimate over the step.
+    fn snapshot_post<const W: usize>(&mut self, basis: &[Word<W>], coeffs: &[f64], dt: f64, weight_of: impl Fn(&Word<W>) -> u32 + Sync) {
+        self.post_l2sq_by_w = l2sq_by_weight(basis, coeffs, self.n_bins, weight_of);
+        if self.depolarize_eps > 0.0 {
+            for (w, d) in self.channel_damp_l2sq_by_w.iter_mut().enumerate() {
+                *d = self.depolarize_eps * w as f64 * dt.abs() * (self.pre_l2sq_by_w[w] + self.post_l2sq_by_w[w]);
+            }
+        }
+    }
+
+    fn finish<const W: usize>(&mut self, basis: &[Word<W>], coeffs: &[f64], weight_of: impl Fn(&Word<W>) -> u32 + Sync) {
         self.basis_len = basis.len() as u64;
         self.basis_max_weight = basis.par_iter().map(|w| weight_of(w)).max().unwrap_or(0);
+        self.retained_l2sq_by_w = l2sq_by_weight(basis, coeffs, self.n_bins, &weight_of);
     }
 }
 
@@ -223,9 +366,6 @@ pub fn pauli_weight_upto<const W: usize>(w: &Word<W>, n: usize) -> u32 {
     total
 }
 
-/// `(count, Σ|c|)` of the contributions a weight cap refuses: shared by the
-/// leakage passes of the plain, locality and block steps.
-pub(crate) type WeightDrop = (u64, f64);
 
 // ────────────────── codec helpers ──────────────────
 
@@ -1648,7 +1788,8 @@ impl<const W: usize> LindbladSpec<W> {
                 b: coeffs.len(),
             });
         }
-        let mut wdrop: WeightDrop = (0, 0.0);
+        let mut wdrop = WeightDrop::default();
+        let n_bins = self.n_qubits + 1;
         // Hash-only membership tables: storing 8-byte `u64` keys instead
         // of 48-byte Words shrinks the in-basis structure ~6×, keeping it
         // in L3 (and often L2) at basis sizes where the full-Word version
@@ -1689,16 +1830,16 @@ impl<const W: usize> LindbladSpec<W> {
                         let c = coeffs[i];
                         let terms = self.compute_action_terms(p, s1, s2, lm);
                         let mut out = Vec::with_capacity(terms.len());
-                        let mut wd: WeightDrop = (0, 0.0);
+                        let mut wd = WeightDrop::default();
                         for (w, v) in terms.iter() {
                             let h = word_hash(w);
                             if !in_basis.contains_key(&h) && !protected_set.contains_key(&h) {
-                                if let Some(mw) = max_weight
-                                    && pauli_weight(w) > mw
-                                {
-                                    wd.0 += 1;
-                                    wd.1 += (c * *v).abs();
-                                    continue;
+                                if let Some(mw) = max_weight {
+                                    let pw = pauli_weight(w);
+                                    if pw > mw {
+                                        wd.add_term(pw, (c * *v).abs(), n_bins);
+                                        continue;
+                                    }
                                 }
                                 out.push((*w, c * *v));
                             }
@@ -1708,8 +1849,7 @@ impl<const W: usize> LindbladSpec<W> {
                 )
                 .collect();
             for (v, wd) in local {
-                wdrop.0 += wd.0;
-                wdrop.1 += wd.1;
+                wdrop.merge(&wd);
                 for (k, val) in v {
                     *merged.entry(k).or_insert(0.0) += val;
                 }
@@ -1919,7 +2059,7 @@ impl<const W: usize> LindbladSpec<W> {
         let admit = admit_basis.unwrap_or(max_basis).max(max_basis);
         let tau_add = tau_add.unwrap_or(0.0);
         let mut t = PcStepTimings::default();
-        let mut st = PcStepStats::for_cfg(cfg);
+        let mut st = PcStepStats::for_cfg(cfg, self.n_qubits + 1);
         if cfg.locality {
             self.pc_step_inner_locality(
                 basis, coeffs, dt, protected, admit, tau_add, max_basis, drop_tol, max_weight, depolarize_eps,
@@ -1931,7 +2071,7 @@ impl<const W: usize> LindbladSpec<W> {
         let t0 = Instant::now();
         let n0 = basis.len();
         let (leak, wd) = self.leakage_with_prune_w(basis, coeffs, protected, admit, tau_add, max_weight)?;
-        st.add_weight_drop(wd);
+        st.add_weight_drop(&wd);
         t.leakage1_us = t0.elapsed().as_micros() as u64;
 
         let t0 = Instant::now();
@@ -1952,7 +2092,7 @@ impl<const W: usize> LindbladSpec<W> {
         let t0 = Instant::now();
         let n1 = basis.len();
         let (leak2, wd2) = self.leakage_with_prune_w(basis, &coeffs_predict, protected, admit, tau_add, max_weight)?;
-        st.add_weight_drop(wd2);
+        st.add_weight_drop(&wd2);
         t.leakage2_us = t0.elapsed().as_micros() as u64;
         drop(coeffs_predict);
 
@@ -1965,15 +2105,17 @@ impl<const W: usize> LindbladSpec<W> {
         let mut cache = mf_expm::mf_cache_full(self, basis);
         mf_expm::add_depolarize(&mut cache, basis, depolarize_eps, pauli_weight);
         t.build2_us = t0.elapsed().as_micros() as u64;
+        st.snapshot_pre(basis, coeffs, pauli_weight);
         *coeffs = mf_expm::apply_cache(&cache, dt, coeffs, drop_tol);
         drop(cache);
+        st.snapshot_post(basis, coeffs, dt, pauli_weight);
         t.expm2_us = t0.elapsed().as_micros() as u64;
 
         let t0 = Instant::now();
-        st.add_trim(prune_basis(basis, coeffs, drop_tol, protected));
-        st.add_trim(cap_basis(basis, coeffs, max_basis, protected));
+        st.add_trim(&prune_basis(basis, coeffs, drop_tol, protected, pauli_weight, st.n_bins));
+        st.add_trim(&cap_basis(basis, coeffs, max_basis, protected, pauli_weight, st.n_bins));
         t.prune_cap_us = t0.elapsed().as_micros() as u64;
-        st.finish(basis, pauli_weight);
+        st.finish(basis, coeffs, pauli_weight);
 
         Ok((t, st))
     }
@@ -2003,7 +2145,7 @@ impl<const W: usize> LindbladSpec<W> {
         // a no-op, and membership turnover requires `drop_tol > 0`.
         let admit = admit_basis.unwrap_or(max_basis).max(max_basis);
         let tau_add = tau_add.unwrap_or(0.0);
-        let mut st = PcStepStats::for_cfg(cfg);
+        let mut st = PcStepStats::for_cfg(cfg, self.n_qubits + 1);
         if cfg.locality {
             self.pc_step_inner_locality(
                 basis, coeffs, dt, protected, admit, tau_add, max_basis, drop_tol, max_weight, depolarize_eps,
@@ -2017,7 +2159,7 @@ impl<const W: usize> LindbladSpec<W> {
         // — no `.clone()` is needed because the exponential only borrows it.
         let n0 = basis.len();
         let (leak, wd) = self.leakage_with_prune_w(basis, coeffs, protected, admit, tau_add, max_weight)?;
-        st.add_weight_drop(wd);
+        st.add_weight_drop(&wd);
         add_leakage_capped(basis, coeffs, leak, admit);
         st.admitted1 = (basis.len() - n0) as u64;
         // 2. Predictor: the generator cache (one action pass; `expm_apply_mf`
@@ -2033,19 +2175,22 @@ impl<const W: usize> LindbladSpec<W> {
         // (pre-step state) for the corrector.
         let n1 = basis.len();
         let (leak2, wd2) = self.leakage_with_prune_w(basis, &coeffs_predict, protected, admit, tau_add, max_weight)?;
-        st.add_weight_drop(wd2);
+        st.add_weight_drop(&wd2);
         drop(coeffs_predict);
         add_leakage_capped(basis, coeffs, leak2, admit);
         st.admitted2 = (basis.len() - n1) as u64;
-        // 4. Corrector: redo from pre-step state on the doubly-enlarged basis.
+        // 4. Corrector: redo from pre-step state on the doubly-enlarged basis
+        // (its input and output are snapshotted by weight class).
         let mut cache = mf_expm::mf_cache_full(self, basis);
         mf_expm::add_depolarize(&mut cache, basis, depolarize_eps, pauli_weight);
+        st.snapshot_pre(basis, coeffs, pauli_weight);
         *coeffs = mf_expm::apply_cache(&cache, dt, coeffs, drop_tol);
         drop(cache);
+        st.snapshot_post(basis, coeffs, dt, pauli_weight);
         // 5. Prune basis entries below `drop_tol` (protected words never dropped).
-        st.add_trim(prune_basis(basis, coeffs, drop_tol, protected));
-        st.add_trim(cap_basis(basis, coeffs, max_basis, protected));
-        st.finish(basis, pauli_weight);
+        st.add_trim(&prune_basis(basis, coeffs, drop_tol, protected, pauli_weight, st.n_bins));
+        st.add_trim(&cap_basis(basis, coeffs, max_basis, protected, pauli_weight, st.n_bins));
+        st.finish(basis, coeffs, pauli_weight);
         Ok(st)
     }
 
@@ -2082,7 +2227,7 @@ impl<const W: usize> LindbladSpec<W> {
         let (leak, wd) = self.leakage_locality(
             basis, coeffs, protected, admit, tau_add, max_weight, if want { Some(&mut prof) } else { None },
         );
-        st.add_weight_drop(wd);
+        st.add_weight_drop(&wd);
         lap(|t| &mut t.leakage1_us, t0);
         let t0 = Instant::now();
         add_leakage_capped(basis, coeffs, leak, admit);
@@ -2097,7 +2242,7 @@ impl<const W: usize> LindbladSpec<W> {
         let t0 = Instant::now();
         let n1 = basis.len();
         let (leak2, wd2) = self.leakage_locality(basis, &coeffs_predict, protected, admit, tau_add, max_weight, None);
-        st.add_weight_drop(wd2);
+        st.add_weight_drop(&wd2);
         drop(coeffs_predict);
         lap(|t| &mut t.leakage2_us, t0);
         let t0 = Instant::now();
@@ -2113,13 +2258,15 @@ impl<const W: usize> LindbladSpec<W> {
             c
         };
         lap(|t| &mut t.build2_us, t0);
+        st.snapshot_pre(basis, coeffs, pauli_weight);
         *coeffs = mf_expm::apply_cache(&cache, dt, coeffs, drop_tol);
+        st.snapshot_post(basis, coeffs, dt, pauli_weight);
         lap(|t| &mut t.expm2_us, t0);
         let t0 = Instant::now();
-        st.add_trim(prune_basis(basis, coeffs, drop_tol, protected));
-        st.add_trim(cap_basis(basis, coeffs, max_basis, protected));
+        st.add_trim(&prune_basis(basis, coeffs, drop_tol, protected, pauli_weight, st.n_bins));
+        st.add_trim(&cap_basis(basis, coeffs, max_basis, protected, pauli_weight, st.n_bins));
         lap(|t| &mut t.prune_cap_us, t0);
-        st.finish(basis, pauli_weight);
+        st.finish(basis, coeffs, pauli_weight);
         if let Some(t) = timings.as_deref_mut() {
             t.locality = prof;
         }
@@ -2391,14 +2538,16 @@ pub(crate) fn prune_basis<const W: usize>(
     coeffs: &mut Vec<f64>,
     drop_tol: f64,
     protected: &[Word<W>],
-) -> (u64, f64) {
+    weight_of: impl Fn(&Word<W>) -> u32,
+    n_bins: usize,
+) -> TrimAccount {
+    let mut acc = TrimAccount::new(n_bins);
     if drop_tol <= 0.0 {
-        return (0, 0.0);
+        return acc;
     }
     debug_assert_eq!(basis.len(), coeffs.len());
     let protected_set: FxHashSet<&Word<W>> = protected.iter().collect();
     let mut write = 0;
-    let (mut n_drop, mut l2sq) = (0u64, 0.0f64);
     for read in 0..basis.len() {
         if coeffs[read].abs() >= drop_tol || protected_set.contains(&basis[read]) {
             if write != read {
@@ -2407,13 +2556,12 @@ pub(crate) fn prune_basis<const W: usize>(
             }
             write += 1;
         } else {
-            n_drop += 1;
-            l2sq += coeffs[read] * coeffs[read];
+            acc.add(weight_of(&basis[read]), coeffs[read]);
         }
     }
     basis.truncate(write);
     coeffs.truncate(write);
-    (n_drop, l2sq)
+    acc
 }
 
 /// Global max-basis cap (PauliStrings.jl-style top-M trim): keep only the
@@ -2425,9 +2573,12 @@ pub(crate) fn cap_basis<const W: usize>(
     coeffs: &mut Vec<f64>,
     max_basis: usize,
     protected: &[Word<W>],
-) -> (u64, f64) {
+    weight_of: impl Fn(&Word<W>) -> u32,
+    n_bins: usize,
+) -> TrimAccount {
+    let mut acc = TrimAccount::new(n_bins);
     if basis.len() <= max_basis {
-        return (0, 0.0);
+        return acc;
     }
     let protected_set: FxHashSet<&Word<W>> = protected.iter().collect();
     let n_prot = basis.iter().filter(|w| protected_set.contains(w)).count();
@@ -2441,7 +2592,7 @@ pub(crate) fn cap_basis<const W: usize>(
     let cutoff = if slots == 0 {
         f64::INFINITY
     } else if slots >= mags.len() {
-        return (0, 0.0);
+        return acc;
     } else {
         let k = slots - 1;
         mags.select_nth_unstable_by(k, |a, b| {
@@ -2450,7 +2601,6 @@ pub(crate) fn cap_basis<const W: usize>(
         mags[k]
     };
     let mut write = 0;
-    let (mut n_drop, mut l2sq) = (0u64, 0.0f64);
     for read in 0..basis.len() {
         if protected_set.contains(&basis[read]) || coeffs[read].abs() >= cutoff {
             if write != read {
@@ -2459,13 +2609,12 @@ pub(crate) fn cap_basis<const W: usize>(
             }
             write += 1;
         } else {
-            n_drop += 1;
-            l2sq += coeffs[read] * coeffs[read];
+            acc.add(weight_of(&basis[read]), coeffs[read]);
         }
     }
     basis.truncate(write);
     coeffs.truncate(write);
-    (n_drop, l2sq)
+    acc
 }
 
 /// Add the largest leakage strings to the basis, up to the available room
@@ -3674,19 +3823,98 @@ mod tests {
         let coeffs = vec![0.9, 1e-14, 0.3, -0.05, 0.02, 1e-13];
         let prot = vec![word_of("IIYY")];
         let (mut b, mut c) = (basis.clone(), coeffs.clone());
-        let (n1, l1) = prune_basis(&mut b, &mut c, 1e-12, &prot);
-        assert_eq!(n1, 1);
-        assert_eq!(l1, 1e-14 * 1e-14);
+        let a1 = prune_basis(&mut b, &mut c, 1e-12, &prot, pauli_weight, 5);
+        assert_eq!(a1.n, 1);
+        assert_eq!(a1.l2sq, 1e-14 * 1e-14);
+        assert_eq!(a1.by_w, vec![0.0, 1e-14 * 1e-14, 0.0, 0.0, 0.0]);
         assert_eq!(b.len(), 5);
-        let (n2, l2) = cap_basis(&mut b, &mut c, 3, &prot);
-        assert_eq!(n2, 2, "two of the five leave (the protected one stays)");
-        assert!((l2 - (0.05 * 0.05 + 0.02 * 0.02)).abs() < 1e-18);
+        let a2 = cap_basis(&mut b, &mut c, 3, &prot, pauli_weight, 5);
+        assert_eq!(a2.n, 2, "two of the five leave (the protected one stays)");
+        assert!((a2.l2sq - (0.05 * 0.05 + 0.02 * 0.02)).abs() < 1e-18);
+        assert!((a2.by_w[1] - 0.05 * 0.05).abs() < 1e-18 && (a2.by_w[2] - 0.02 * 0.02).abs() < 1e-18);
         assert_eq!(b.len(), 3);
         assert!(b.contains(&word_of("IIYY")));
-        let (n3, l3) = cap_basis(&mut b, &mut c, 10, &prot);
-        assert_eq!((n3, l3), (0, 0.0));
-        let (n4, l4) = prune_basis(&mut b, &mut c, 0.0, &prot);
-        assert_eq!((n4, l4), (0, 0.0));
+        let a3 = cap_basis(&mut b, &mut c, 10, &prot, pauli_weight, 5);
+        assert_eq!((a3.n, a3.l2sq), (0, 0.0));
+        let a4 = prune_basis(&mut b, &mut c, 0.0, &prot, pauli_weight, 5);
+        assert_eq!((a4.n, a4.l2sq), (0, 0.0));
+    }
+
+    /// The per-class arrays: for `H = 0` the pre / post snapshots obey
+    /// `post_w = pre_w·e^{−2·eps·w·dt}` exactly, the channel estimate is
+    /// within its trapezoid error, nothing is trimmed; with a cap the refused
+    /// l1 sits in the classes above the cap and sums to the total.
+    #[test]
+    fn per_class_arrays_h0_and_cap() {
+        let n = 5;
+        let (eps, dt) = (0.37, 0.05);
+        let spec = LindbladSpec::<W_CHUNKS>::new(n, &[], &[]).unwrap();
+        let strings = ["IIIII", "ZIIII", "XIIII", "XYIII", "IZZXI", "XYZXY"];
+        let mut basis: Vec<Word> = strings.iter().map(|s| word_of(s)).collect();
+        let mut coeffs = vec![0.5, 1.0, -0.5, 0.25, 2.0, 1.5];
+        let pre_expect = |c: &[f64]| {
+            let mut v = vec![0.0; n + 1];
+            for (s, x) in strings.iter().zip(c) {
+                v[s.chars().filter(|ch| *ch != 'I').count()] += x * x;
+            }
+            v
+        };
+        let cfg = PcStepConfig { depolarize_eps: eps, ..Default::default() };
+        for _ in 0..3 {
+            let before = pre_expect(&coeffs);
+            let st = spec.pc_step(&mut basis, &mut coeffs, dt, &[], &cfg).unwrap();
+            assert_eq!(st.n_bins, n + 1);
+            assert_eq!(st.pre_l2sq_by_w.len(), n + 1);
+            for w in 0..=n {
+                assert!((st.pre_l2sq_by_w[w] - before[w]).abs() <= 1e-15 * before[w].max(1.0), "pre {w}");
+                let want = before[w] * (-2.0 * eps * w as f64 * dt).exp();
+                assert!((st.post_l2sq_by_w[w] - want).abs() <= 1e-12 * want.max(1e-300), "post {w}: {} vs {want}", st.post_l2sq_by_w[w]);
+                assert_eq!(st.post_l2sq_by_w[w], st.retained_l2sq_by_w[w], "no trim");
+                let exact = before[w] - want;
+                let x = eps * w as f64 * dt;
+                assert!((st.channel_damp_l2sq_by_w[w] - exact).abs() <= exact * x * x / 3.0 * 1.01 + 1e-15, "channel {w}");
+            }
+            assert!(st.trim_l2sq_by_w.iter().all(|v| *v == 0.0));
+            assert_eq!(st.trim_dropped, 0);
+        }
+        // the cap: refused l1 by class, only above the cap, summing to the total
+        let mut h: Vec<(String, f64)> = Vec::new();
+        for i in 0..n - 1 {
+            for p in ['X', 'Y', 'Z'] {
+                let mut v = vec!['I'; n];
+                v[i] = p;
+                v[i + 1] = p;
+                h.push((v.into_iter().collect(), 0.5 + 0.1 * i as f64));
+            }
+        }
+        let spec = LindbladSpec::<W_CHUNKS>::new(n, &h, &[]).unwrap();
+        let (mut b, mut c) = (vec![word_of("IIZII")], vec![1.0]);
+        let capped = PcStepConfig { max_weight: Some(2), ..Default::default() };
+        let mut any = false;
+        for _ in 0..3 {
+            let st = spec.pc_step(&mut b, &mut c, 0.1, &[], &capped).unwrap();
+            let sum: f64 = st.cap_refused_l1_by_w.iter().sum();
+            assert!((sum - st.weight_dropped_l1).abs() <= 1e-12 * sum.max(1.0));
+            assert!(st.cap_refused_l1_by_w[..3].iter().all(|v| *v == 0.0), "nothing refused at w <= 2");
+            any |= st.weight_dropped_terms > 0;
+            assert!(st.channel_damp_l2sq_by_w.iter().all(|v| *v == 0.0), "channel off");
+            let total: f64 = st.retained_l2sq_by_w.iter().sum();
+            let direct: f64 = c.iter().map(|x| x * x).sum();
+            assert!((total - direct).abs() <= 1e-12 * direct.max(1.0));
+        }
+        assert!(any);
+        // a trimmed step: the trim account by class sums to the total
+        let (mut b, mut c) = (vec![word_of("IIZII")], vec![1.0]);
+        let tight = PcStepConfig { max_basis: 8, admit_basis: Some(40), ..Default::default() };
+        let mut trimmed = 0u64;
+        for _ in 0..3 {
+            let st = spec.pc_step(&mut b, &mut c, 0.1, &[], &tight).unwrap();
+            let sum: f64 = st.trim_l2sq_by_w.iter().sum();
+            assert!((sum - st.trim_dropped_l2sq).abs() <= 1e-12 * sum.max(1e-300));
+            trimmed += st.trim_dropped;
+            assert!(b.len() <= 8);
+        }
+        assert!(trimmed > 0);
     }
 
     /// `pauli_weight_upto` counts the first `n` positions only (block rows).

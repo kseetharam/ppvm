@@ -769,7 +769,8 @@ impl<const W: usize> LindbladSpec<W> {
         mut prof: Option<&mut LocalityProfile>,
     ) -> (Vec<(Word<W>, f64)>, crate::WeightDrop) {
         debug_assert_eq!(basis.len(), coeffs.len());
-        let mut wdrop: crate::WeightDrop = (0, 0.0);
+        let mut wdrop = crate::WeightDrop::default();
+        let n_bins = self.n_qubits + 1;
         let room = max_basis.saturating_sub(basis.len());
         if room == 0 || basis.is_empty() {
             return (Vec::new(), wdrop);
@@ -826,16 +827,16 @@ impl<const W: usize> LindbladSpec<W> {
                         let terms = self.action_terms_locality(p, sc);
                         let rd = raw_diag(p, &terms);
                         let mut buckets: Vec<Vec<(Word<W>, f64)>> = (0..shards).map(|_| Vec::new()).collect();
-                        let mut wd: crate::WeightDrop = (0, 0.0);
+                        let mut wd = crate::WeightDrop::default();
                         for (w, v) in terms.iter() {
                             let h = word_hash(w);
                             if !in_basis.contains_key(&h) && !protected_set.contains_key(&h) {
-                                if let Some(mw) = max_weight
-                                    && weight(w) > mw
-                                {
-                                    wd.0 += 1;
-                                    wd.1 += (c * *v).abs();
-                                    continue;
+                                if let Some(mw) = max_weight {
+                                    let pw = weight(w);
+                                    if pw > mw {
+                                        wd.add_term(pw, (c * *v).abs(), n_bins);
+                                        continue;
+                                    }
                                 }
                                 buckets[shard_of(h)].push((*w, c * *v));
                             }
@@ -845,8 +846,7 @@ impl<const W: usize> LindbladSpec<W> {
                 )
                 .collect();
             for (_, _, wd) in &local {
-                wdrop.0 += wd.0;
-                wdrop.1 += wd.1;
+                wdrop.merge(wd);
             }
             lap!(leak_action_us, t0);
             count!(leak_strings, chunk_indices.len() as u64);

@@ -67,6 +67,7 @@ def test_step_features_announced():
     assert "max_weight" in STEP_FEATURES
     assert "depolarize_eps" in STEP_FEATURES
     assert "step_stats" in STEP_FEATURES
+    assert "step_hist" in STEP_FEATURES
     import inspect
 
     params = inspect.signature(Lindbladian.pc_step_arr).parameters
@@ -259,3 +260,82 @@ def test_depolarize_preserves_the_identity():
     assert out[0.0]["IIII"] == out[0.1]["IIII"]
     assert abs(out[0.1]["IIII"] - 0.5) < 1e-14
     assert out[0.1]["ZIII"] != out[0.0]["ZIII"]
+
+
+BY_W_KEYS = ("cap_refused_l1_by_w", "trim_l2sq_by_w", "pre_l2sq_by_w", "post_l2sq_by_w", "retained_l2sq_by_w", "channel_damp_l2sq_by_w")
+
+
+def l2sq_by_w(basis_arr, coeffs, n):
+    out = np.zeros(n + 1)
+    for s, c in zip(_codes_to_basis(basis_arr), coeffs):
+        out[weight(s)] += c * c
+    return out
+
+
+def test_per_class_arrays_h0_analytic():
+    """H = 0, channel on: pre_w is the start-of-step norm by class, post_w = pre_w * exp(-2 eps w dt) exactly, nothing is
+    trimmed, retained = post, and the channel estimate is within its trapezoid error of pre_w * (1 - exp(-2 eps w dt))."""
+    n, eps, dt = 6, 0.41, 0.05
+    L = Lindbladian(n, [], [])
+    strings = ["IIIIII", "ZIIIII", "XIIIII", "XYIIII", "IZZXII", "YXZIIZ", "XYZXYZ"]
+    b = _basis_to_codes(strings, n)
+    c = np.array([0.5, 1.0, -0.5, 0.25, 2.0, 1.5, -1.0])
+    for _ in range(4):
+        before = l2sq_by_w(b, c, n)
+        b, c, st = L.pc_step_arr(b, c, dt, 10_000_000, drop_tol=0.0, depolarize_eps=eps, return_stats=True)
+        assert st["n_bins"] == n + 1
+        for k in BY_W_KEYS:
+            assert isinstance(st[k], np.ndarray) and st[k].shape == (n + 1,) and st[k].dtype == np.float64, k
+        w = np.arange(n + 1)
+        assert np.allclose(st["pre_l2sq_by_w"], before, rtol=1e-15, atol=1e-300)
+        want = before * np.exp(-2 * eps * w * dt)
+        assert np.allclose(st["post_l2sq_by_w"], want, rtol=1e-12, atol=0)
+        assert np.array_equal(st["post_l2sq_by_w"], st["retained_l2sq_by_w"])
+        assert not st["trim_l2sq_by_w"].any() and not st["cap_refused_l1_by_w"].any()
+        exact = before - want
+        x = eps * w * dt
+        assert np.all(np.abs(st["channel_damp_l2sq_by_w"] - exact) <= exact * x * x / 3 * 1.01 + 1e-15)
+        assert st["channel_damp_l2sq_by_w"][0] == 0.0  # the identity is never damped
+    # retained snapshot agrees with the coefficients returned
+    assert np.allclose(st["retained_l2sq_by_w"], l2sq_by_w(b, c, n), rtol=1e-14, atol=0)
+
+
+def test_per_class_arrays_cap_and_trim_sum_to_totals():
+    n, dt = 6, 0.1
+    L = Lindbladian(n, chain_h(n), [])
+    b, c = _basis_to_codes(["IIZIII"], n), np.array([1.0])
+    refused_any = False
+    for _ in range(3):
+        b, c, st = L.pc_step_arr(b, c, dt, 10_000_000, drop_tol=0.0, max_weight=2, return_stats=True)
+        assert abs(st["cap_refused_l1_by_w"].sum() - st["weight_dropped_l1"]) <= 1e-12 * max(st["weight_dropped_l1"], 1.0)
+        assert not st["cap_refused_l1_by_w"][:3].any()        # nothing refused at w <= 2
+        refused_any |= st["weight_dropped_terms"] > 0
+        assert not st["channel_damp_l2sq_by_w"].any()         # channel off
+        assert abs(st["retained_l2sq_by_w"].sum() - (c ** 2).sum()) <= 1e-12 * (c ** 2).sum()
+        # the step's norm balance on the enlarged basis: pre -> post is the exponential, post - trim = retained
+        assert np.allclose(st["post_l2sq_by_w"] - st["trim_l2sq_by_w"], st["retained_l2sq_by_w"], rtol=1e-12, atol=1e-15)
+    assert refused_any
+    b, c = _basis_to_codes(["IIZIII"], n), np.array([1.0])
+    trimmed = 0
+    for _ in range(3):
+        b, c, st = L.pc_step_arr(b, c, dt, 8, drop_tol=0.0, admit_basis=40, return_stats=True)
+        assert abs(st["trim_l2sq_by_w"].sum() - st["trim_dropped_l2sq"]) <= 1e-12 * max(st["trim_dropped_l2sq"], 1e-300)
+        assert np.allclose(st["post_l2sq_by_w"] - st["trim_l2sq_by_w"], st["retained_l2sq_by_w"], rtol=1e-12, atol=1e-15)
+        trimmed += st["trim_dropped"]
+    assert trimmed > 0
+
+
+def test_per_class_arrays_block_physical_sites():
+    n, m, eps, dt = 3, 2, 0.29, 0.05
+    B = BlockLindbladian(n, m, [[] for _ in range(m)], None, None, exchange=None, matchings=None)
+    strings = ["ZII", "XYI", "ZZZ", "III"]
+    basis = _basis_to_codes(strings, n)
+    species = np.array([1, 0, 1, 0], dtype=np.uint8)
+    coeffs = np.array([1.0, 0.5, 0.25, 2.0])
+    before = np.zeros(n + 1)
+    for s, c in zip(strings, coeffs):
+        before[weight(s)] += c * c
+    basis, species, coeffs, st = B.pc_step_arr(basis, species, coeffs, dt, 10_000_000, drop_tol=0.0, depolarize_eps=eps, return_stats=True)
+    assert st["n_bins"] == n + 1                                   # physical sites only, not the species digit
+    assert np.allclose(st["pre_l2sq_by_w"], before, rtol=1e-15, atol=0)
+    assert np.allclose(st["post_l2sq_by_w"], before * np.exp(-2 * eps * np.arange(n + 1) * dt), rtol=1e-12, atol=0)
