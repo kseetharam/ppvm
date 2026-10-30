@@ -51,7 +51,7 @@ from collections.abc import Iterable, Sequence
 import numpy as np
 
 from ._core import BlockLindbladSpec as _BlockLindbladSpec
-from .lindblad import MAX_QUBITS, PauliLincomb, _check_n_qubits, _codes_to_basis, _normalize_jump, _string_to_codes
+from .lindblad import MAX_QUBITS, PauliLincomb, _check_n_qubits, _codes_to_basis, _normalize_jump, _string_to_codes, _tail_args
 
 
 def _per_species(value, n_species, name):
@@ -309,6 +309,10 @@ class BlockLindbladian:
         max_weight: int | None = None,
         depolarize_eps: float = 0.0,
         return_stats: bool = False,
+        tail_mode: str | None = None,
+        tail_threshold: float = 0.0,
+        tail_rule: str = "abs",
+        tail_seed: int = 0,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
         """One predictor-corrector step ``O ← exp(dt·L*_block) O`` on block rows.
 
@@ -317,9 +321,12 @@ class BlockLindbladian:
         bound, ``drop_tol`` magnitude prune, ``tau_add`` admission filter,
         protected rows never dropped); the protected rows are given as a
         ``(protected_arr, protected_species)`` pair. ``max_weight`` /
-        ``depolarize_eps`` / ``return_stats`` as `Lindbladian.pc_step_arr`;
-        the Pauli weight of a row is taken over the physical sites (the
-        species index is not a letter). Returns
+        ``depolarize_eps`` / ``return_stats`` and the tail keywords
+        ``tail_mode`` / ``tail_threshold`` / ``tail_rule`` / ``tail_seed`` as
+        `Lindbladian.pc_step_arr` (the stochastic rounding acts on rows over
+        all species; protected rows are never randomised); the Pauli weight of
+        a row is taken over the physical sites (the species index is not a
+        letter). Returns
         ``(new_basis, new_species, new_coeffs)`` (plus the stats dict with
         ``return_stats=True``).
         """
@@ -339,6 +346,7 @@ class BlockLindbladian:
             None if tau_add is None else float(tau_add),
             None if max_weight is None else int(max_weight),
             float(depolarize_eps),
+            *_tail_args(tail_mode, tail_threshold, tail_rule, tail_seed),
         )
         if return_stats:
             (b, sp, c), stats = self._spec.pc_step_stats(*args)

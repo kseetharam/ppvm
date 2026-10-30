@@ -69,14 +69,38 @@ MAX_QUBITS: int = int(_max_qubits())
 #: (`locality=`), the admission weight cap (`max_weight=`), the per-site
 #: depolarizing channel (`depolarize_eps=`) and the step account
 #: (`return_stats=` / `_core.LindbladSpec.pc_step_stats`) and the per-weight-class arrays in it (`step_hist`:
-#: `*_by_w` keys of length `n_qubits + 1`).
-STEP_FEATURES: tuple[str, ...] = ("locality", "max_weight", "depolarize_eps", "step_stats", "step_hist")
+#: `*_by_w` keys of length `n_qubits + 1`), and the stochastic tail (`tail`: `tail_mode=` / `tail_threshold=` /
+#: `tail_rule=` / `tail_seed=`, the `tail_*` / `n_strings_*` / `room_refused_*` keys of the step account).
+STEP_FEATURES: tuple[str, ...] = ("locality", "max_weight", "depolarize_eps", "step_stats", "step_hist", "tail")
+
+#: The tail (end-of-step truncation) modes of `pc_step_arr(tail_mode=)` and the threshold rules of `tail_rule=`.
+TAIL_MODES: tuple[str, ...] = ("drop", "stochastic")
+TAIL_RULES: tuple[str, ...] = ("abs", "rel", "budget")
 
 
 def max_qubits() -> int:
     """The largest ``n_qubits`` a `Lindbladian` / `BlockLindbladian` of this
     build accepts (the top compiled Pauli-word width times `CHUNK_BITS`)."""
     return MAX_QUBITS
+
+
+def _tail_args(tail_mode, tail_threshold, tail_rule, tail_seed) -> tuple:
+    """The validated ``(tail_mode, tail_threshold, tail_rule, tail_seed)`` of a step for the native core
+    (`Lindbladian.pc_step_arr` / `BlockLindbladian.pc_step_arr`): ``None`` / ``"drop"`` is the deterministic trim and the
+    other three values are then ignored; ``"stochastic"`` needs a rule in `TAIL_RULES`, a finite threshold >= 0 and an
+    integer seed (taken modulo 2**64)."""
+    if tail_mode is None or tail_mode == "drop":
+        return (None, 0.0, "abs", 0)
+    if tail_mode != "stochastic":
+        raise ValueError(f"tail_mode must be None, 'drop' or 'stochastic', got {tail_mode!r}")
+    if tail_rule not in TAIL_RULES:
+        raise ValueError(f"tail_rule must be one of {TAIL_RULES}, got {tail_rule!r}")
+    thr = float(tail_threshold)
+    if not np.isfinite(thr) or thr < 0.0:
+        raise ValueError(f"tail_threshold must be a finite number >= 0, got {tail_threshold!r}")
+    if isinstance(tail_seed, bool) or int(tail_seed) != tail_seed:
+        raise ValueError(f"tail_seed must be an integer, got {tail_seed!r}")
+    return ("stochastic", thr, str(tail_rule), int(tail_seed) % (1 << 64))
 
 
 def word_widths() -> tuple[int, ...]:
@@ -994,6 +1018,10 @@ class Lindbladian:
         max_weight: int | None = None,
         depolarize_eps: float = 0.0,
         return_stats: bool = False,
+        tail_mode: str | None = None,
+        tail_threshold: float = 0.0,
+        tail_rule: str = "abs",
+        tail_seed: int = 0,
     ) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, dict]:
         """One predictor-corrector adaptive step.
 
@@ -1081,12 +1109,43 @@ class Lindbladian:
         third order in ``eps * w * dt``; for ``H = 0`` the exact value is
         ``pre_w * (1 - exp(-2 eps w dt))``; zeros when the channel is off).
 
+        ``tail_mode`` (default ``None`` = ``"drop"``) selects the end-of-step
+        truncation. ``"drop"`` is the deterministic trim -- the ``drop_tol``
+        prune followed by the top-``max_basis`` rank cap -- bit for bit the step
+        of every earlier build. ``"stochastic"`` replaces it by stochastic
+        rounding: with the step's threshold ``tau`` (``tail_rule="abs"``: ``tau =
+        tail_threshold``; ``"rel"``: ``tau = tail_threshold * max |c|`` over the
+        basis after the corrector; ``"budget"``: the ``tau`` with ``sum min(1,
+        |c|/tau) = max_basis - n_protected`` over the non-protected strings, so
+        the expected number retained is the budget, 0 when the basis fits),
+        every non-protected string with ``0 < |c| < tau`` is kept with
+        probability ``|c|/tau`` at coefficient ``sign(c) * tau`` or removed, so
+        ``E[c'] = c`` string by string and the propagated operator is unbiased
+        step by step; strings with ``|c| >= tau`` and protected words are never
+        randomised; exact zeros are removed; the ``drop_tol`` prune and the rank
+        cap are NOT applied (the working set stays bounded by ``admit_basis``;
+        the admission room cap of the leakage passes stays deterministic and is
+        counted). One uniform per rounded string from a SplitMix64 generator
+        seeded with ``tail_seed`` (integer arithmetic: the same draws on every
+        platform), in basis order -- pass a seed derived per (replica, step) so
+        a trajectory is reproducible and replicas are independent. The account
+        (``return_stats=True``): ``tail_mode``, ``tail_threshold_used`` (the
+        step's ``tau``), ``n_strings_rounded`` (strings below ``tau``),
+        ``n_strings_kept_by_chance``, ``tail_mass_rounded`` / ``tail_l1_rounded``
+        (``sum c**2`` / ``sum |c|`` of them before the rounding),
+        ``tail_mass_kept`` (``sum tau**2`` of the kept ones), ``tail_mass_removed``
+        (``sum c**2`` of the removed ones; the removed strings are also the
+        ``trim_dropped`` account), and in both modes ``room_refused_terms`` /
+        ``room_refused_l1`` (merged leakage words the admission room cap refused
+        in the two passes and the sum of their magnitudes, a coefficient rate).
+
         Returns ``(new_basis_arr, new_coeffs)``; the basis may have grown
         (or shrunk, if ``max_basis`` / ``drop_tol`` pruned entries).
         """
         n = self.n_qubits
         if protected_arr is None:
             protected_arr = np.zeros((0, n), dtype=np.uint8)
+        tail_args = _tail_args(tail_mode, tail_threshold, tail_rule, tail_seed)
         args = (
             np.ascontiguousarray(basis_arr, dtype=np.uint8),
             np.ascontiguousarray(coeffs, dtype=np.float64),
@@ -1100,6 +1159,7 @@ class Lindbladian:
             bool(locality),
             None if max_weight is None else int(max_weight),
             float(depolarize_eps),
+            *tail_args,
         )
         if return_stats:
             (new_basis, new_coeffs), stats = self._spec.pc_step_stats(*args)

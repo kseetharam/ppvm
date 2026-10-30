@@ -890,7 +890,26 @@ impl<const W: usize> LindbladSpec<W> {
                     });
                 cands.select_nth_unstable_by(k, desc);
                 let cutoff = cands[k];
-                merged.par_iter_mut().for_each(|m| m.retain(|_, &mut v| v.abs() >= cutoff));
+                // the room-cap account per shard (count, Σ|v| of the refused words), summed in shard order
+                let refused: Vec<(u64, f64)> = merged
+                    .par_iter_mut()
+                    .map(|m| {
+                        let (mut n, mut l1) = (0u64, 0.0f64);
+                        m.retain(|_, &mut v| {
+                            let keep = v.abs() >= cutoff;
+                            if !keep {
+                                n += 1;
+                                l1 += v.abs();
+                            }
+                            keep
+                        });
+                        (n, l1)
+                    })
+                    .collect();
+                for (n, l1) in refused {
+                    wdrop.room_n += n;
+                    wdrop.room_l1 += l1;
+                }
             }
             lap!(leak_cap_us, t0);
         }
@@ -1126,6 +1145,7 @@ mod tests {
             locality: false,
             max_weight: None,
             depolarize_eps: 0.0,
+            tail: None,
         };
         let (mut b1, mut c1) = (vec![z0, x3], vec![0.8, 0.3]);
         let (mut b2, mut c2) = (b1.clone(), c1.clone());

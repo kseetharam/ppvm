@@ -100,7 +100,7 @@ pub const fn max_qubits_for(w_chunks: usize) -> usize {
 pub type Word<const W: usize = W_CHUNKS> = PauliWord<[Chunk; W], FxBuildHasher, true>;
 
 pub use block::BlockLindbladSpec;
-pub use config::PcStepConfig;
+pub use config::{PcStepConfig, TailConfig, TailRule};
 pub use error::Error;
 pub use factor::{Csr, CsrC, FactorBlockInput};
 
@@ -190,6 +190,34 @@ pub struct PcStepStats {
     /// the exact value is `pre_w·(1 − e^{−2·eps·w·dt})`. All zeros when the
     /// channel is off.
     pub channel_damp_l2sq_by_w: Vec<f64>,
+    /// Admission room-cap account over both leakage passes: merged leakage
+    /// words refused because the working set was full (`admit − |basis|`
+    /// slots; the plain, locality and block steps alike), and Σ of their
+    /// merged magnitudes (a coefficient rate; × `dt` the first-order norm the
+    /// room cap removed in the step). Deterministic in both tail modes — the
+    /// residual admission bias of the stochastic tail. Counting only; the
+    /// step's arithmetic is unchanged.
+    pub room_refused_terms: u64,
+    pub room_refused_l1: f64,
+    /// The tail mode of the step: `false` = the deterministic trim (prune +
+    /// rank cap), `true` = stochastic rounding ([`TailConfig`]).
+    pub tail_stochastic: bool,
+    /// The step's rounding threshold τ (0.0 in drop mode).
+    pub tail_threshold_used: f64,
+    /// Non-protected strings with |c| < τ, each kept with probability |c|/τ at
+    /// sign(c)·τ or removed: their count, how many were kept by chance (the
+    /// others are `trim_dropped`), Σ c² and Σ |c| of them before the rounding,
+    /// Σ τ² of the kept ones after it (their retained mass) and Σ c² of the
+    /// removed ones. `tail_mass_rounded − tail_mass_removed` is the pre-rounding
+    /// mass of the kept strings; `τ·tail_l1_rounded − tail_mass_rounded` is the
+    /// expected squared-norm the rounding injects in the step (its variance
+    /// budget). All zero in drop mode.
+    pub n_strings_rounded: u64,
+    pub n_strings_kept_by_chance: u64,
+    pub tail_mass_rounded: f64,
+    pub tail_l1_rounded: f64,
+    pub tail_mass_kept: f64,
+    pub tail_mass_removed: f64,
 }
 
 /// Account of the contributions a weight cap refuses in one leakage pass:
@@ -201,6 +229,11 @@ pub struct WeightDrop {
     pub n: u64,
     pub l1: f64,
     pub by_w: Vec<f64>,
+    /// The pass's admission room-cap refusals (merged words beyond the room
+    /// and Σ of their magnitudes), counted at the cap; see
+    /// [`PcStepStats::room_refused_terms`].
+    pub room_n: u64,
+    pub room_l1: f64,
 }
 
 impl WeightDrop {
@@ -215,9 +248,18 @@ impl WeightDrop {
         self.by_w[i] += mag;
     }
 
+    /// Count one room-cap refusal of a merged word of magnitude `mag`.
+    #[inline]
+    pub(crate) fn add_room(&mut self, mag: f64) {
+        self.room_n += 1;
+        self.room_l1 += mag;
+    }
+
     pub(crate) fn merge(&mut self, other: &WeightDrop) {
         self.n += other.n;
         self.l1 += other.l1;
+        self.room_n += other.room_n;
+        self.room_l1 += other.room_l1;
         if !other.by_w.is_empty() {
             if self.by_w.is_empty() {
                 self.by_w = vec![0.0; other.by_w.len()];
@@ -301,6 +343,8 @@ impl PcStepStats {
     fn add_weight_drop(&mut self, d: &WeightDrop) {
         self.weight_dropped_terms += d.n;
         self.weight_dropped_l1 += d.l1;
+        self.room_refused_terms += d.room_n;
+        self.room_refused_l1 += d.room_l1;
         for (a, b) in self.cap_refused_l1_by_w.iter_mut().zip(d.by_w.iter()) {
             *a += b;
         }
@@ -1866,7 +1910,13 @@ impl<const W: usize> LindbladSpec<W> {
                         b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
                     });
                     let cutoff = mags[k];
-                    merged.retain(|_, &mut v| v.abs() >= cutoff);
+                    merged.retain(|_, &mut v| {
+                        let keep = v.abs() >= cutoff;
+                        if !keep {
+                            wdrop.add_room(v.abs());
+                        }
+                        keep
+                    });
                 }
             }
         }
@@ -2063,7 +2113,7 @@ impl<const W: usize> LindbladSpec<W> {
         if cfg.locality {
             self.pc_step_inner_locality(
                 basis, coeffs, dt, protected, admit, tau_add, max_basis, drop_tol, max_weight, depolarize_eps,
-                Some(&mut t), &mut st,
+                cfg.tail, Some(&mut t), &mut st,
             );
             return Ok((t, st));
         }
@@ -2112,8 +2162,7 @@ impl<const W: usize> LindbladSpec<W> {
         t.expm2_us = t0.elapsed().as_micros() as u64;
 
         let t0 = Instant::now();
-        st.add_trim(&prune_basis(basis, coeffs, drop_tol, protected, pauli_weight, st.n_bins));
-        st.add_trim(&cap_basis(basis, coeffs, max_basis, protected, pauli_weight, st.n_bins));
+        trim_tail(basis, coeffs, max_basis, drop_tol, protected, pauli_weight, &mut st, cfg.tail);
         t.prune_cap_us = t0.elapsed().as_micros() as u64;
         st.finish(basis, coeffs, pauli_weight);
 
@@ -2149,7 +2198,7 @@ impl<const W: usize> LindbladSpec<W> {
         if cfg.locality {
             self.pc_step_inner_locality(
                 basis, coeffs, dt, protected, admit, tau_add, max_basis, drop_tol, max_weight, depolarize_eps,
-                None, &mut st,
+                cfg.tail, None, &mut st,
             );
             return Ok(st);
         }
@@ -2187,9 +2236,9 @@ impl<const W: usize> LindbladSpec<W> {
         *coeffs = mf_expm::apply_cache(&cache, dt, coeffs, drop_tol);
         drop(cache);
         st.snapshot_post(basis, coeffs, dt, pauli_weight);
-        // 5. Prune basis entries below `drop_tol` (protected words never dropped).
-        st.add_trim(&prune_basis(basis, coeffs, drop_tol, protected, pauli_weight, st.n_bins));
-        st.add_trim(&cap_basis(basis, coeffs, max_basis, protected, pauli_weight, st.n_bins));
+        // 5. The tail: prune basis entries below `drop_tol` and cap at `max_basis` (protected words never dropped),
+        // or, with `cfg.tail`, the stochastic rounding (`trim_tail`).
+        trim_tail(basis, coeffs, max_basis, drop_tol, protected, pauli_weight, &mut st, cfg.tail);
         st.finish(basis, coeffs, pauli_weight);
         Ok(st)
     }
@@ -2212,6 +2261,7 @@ impl<const W: usize> LindbladSpec<W> {
         drop_tol: f64,
         max_weight: Option<u32>,
         depolarize_eps: f64,
+        tail: Option<TailConfig>,
         mut timings: Option<&mut PcStepTimings>,
         st: &mut PcStepStats,
     ) {
@@ -2263,8 +2313,7 @@ impl<const W: usize> LindbladSpec<W> {
         st.snapshot_post(basis, coeffs, dt, pauli_weight);
         lap(|t| &mut t.expm2_us, t0);
         let t0 = Instant::now();
-        st.add_trim(&prune_basis(basis, coeffs, drop_tol, protected, pauli_weight, st.n_bins));
-        st.add_trim(&cap_basis(basis, coeffs, max_basis, protected, pauli_weight, st.n_bins));
+        trim_tail(basis, coeffs, max_basis, drop_tol, protected, pauli_weight, st, tail);
         lap(|t| &mut t.prune_cap_us, t0);
         st.finish(basis, coeffs, pauli_weight);
         if let Some(t) = timings.as_deref_mut() {
@@ -2615,6 +2664,172 @@ pub(crate) fn cap_basis<const W: usize>(
     basis.truncate(write);
     coeffs.truncate(write);
     acc
+}
+
+/// SplitMix64 (Steele, Lea & Flood 2014): a 64-bit state, integer arithmetic
+/// only, so a seed gives the same uniforms on every platform.
+#[derive(Clone, Copy, Debug)]
+pub struct SplitMix64(pub u64);
+
+impl SplitMix64 {
+    #[inline]
+    pub fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A uniform in [0, 1) with 53 random bits.
+    #[inline]
+    pub fn next_f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+    }
+}
+
+/// The stochastic tail's threshold τ for one step ([`TailRule`]): `Abs` the
+/// value, `Rel` the fraction of the largest |c| over the whole basis, `Budget`
+/// the τ with Σ_{non-protected} min(1, |c|/τ) = `max_basis − n_protected`
+/// (0.0 when the non-protected strings already fit). For `Budget` the
+/// magnitudes are sorted once (O(n log n)); with m_1 ≥ m_2 ≥ … and
+/// S_k = Σ_{i>k} m_i, τ = S_k / (slots − k) for the k with m_{k+1} < τ ≤ m_k.
+pub fn tail_threshold<const W: usize>(
+    basis: &[Word<W>],
+    coeffs: &[f64],
+    max_basis: usize,
+    protected_set: &FxHashSet<&Word<W>>,
+    tail: &TailConfig,
+) -> f64 {
+    match tail.rule {
+        TailRule::Abs => tail.threshold.max(0.0),
+        TailRule::Rel => {
+            let cmax = coeffs.iter().fold(0.0f64, |m, c| m.max(c.abs()));
+            (tail.threshold.max(0.0)) * cmax
+        }
+        TailRule::Budget => {
+            let mut mags: Vec<f64> = basis
+                .iter()
+                .zip(coeffs.iter())
+                .filter(|(w, _)| !protected_set.contains(w))
+                .map(|(_, c)| c.abs())
+                .collect();
+            let n_prot = basis.len() - mags.len();
+            let slots = max_basis.saturating_sub(n_prot);
+            if mags.len() <= slots {
+                return 0.0;
+            }
+            if slots == 0 {
+                return f64::INFINITY;
+            }
+            mags.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            // suffix sums S_k = Σ_{i>k} m_i (index k = number of strings kept deterministically)
+            let n = mags.len();
+            let mut suffix = vec![0.0f64; n + 1];
+            for i in (0..n).rev() {
+                suffix[i] = suffix[i + 1] + mags[i];
+            }
+            for k in 0..slots {
+                let tau = suffix[k] / (slots - k) as f64;
+                let upper = if k == 0 { f64::INFINITY } else { mags[k - 1] };
+                if tau <= upper && tau > mags[k] {
+                    return tau;
+                }
+                if tau <= upper && tau == mags[k] && tau > 0.0 {
+                    return tau;
+                }
+            }
+            // every candidate k failed only through ties; the largest consistent τ is the k = slots − 1 value
+            suffix[slots - 1] / 1.0
+        }
+    }
+}
+
+/// The stochastic tail (`PcStepConfig::tail = Some(..)`): every non-protected
+/// string with 0 < |c| < τ is kept with probability |c|/τ at coefficient
+/// sign(c)·τ, else removed (E[c'] = c); strings with |c| ≥ τ > 0 and protected
+/// words are never touched; an exact zero is removed (counted as rounded, mass
+/// 0); an infinite τ (the budget rule with no free slot) removes every
+/// non-protected string. One uniform per rounded string from [`SplitMix64`]
+/// seeded with `tail.seed`, drawn in basis order. Fills the tail fields of
+/// `st` and the trim account (the removed strings); the basis / coeffs are
+/// compacted in place as `prune_basis` does (swap-down, the survivors' order
+/// preserved).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn tail_round<const W: usize>(
+    basis: &mut Vec<Word<W>>,
+    coeffs: &mut Vec<f64>,
+    max_basis: usize,
+    protected: &[Word<W>],
+    weight_of: impl Fn(&Word<W>) -> u32,
+    st: &mut PcStepStats,
+    tail: &TailConfig,
+) {
+    debug_assert_eq!(basis.len(), coeffs.len());
+    let protected_set: FxHashSet<&Word<W>> = protected.iter().collect();
+    let tau = tail_threshold(basis, coeffs, max_basis, &protected_set, tail);
+    st.tail_stochastic = true;
+    st.tail_threshold_used = tau;
+    let mut acc = TrimAccount::new(st.n_bins);
+    let mut rng = SplitMix64(tail.seed);
+    let mut write = 0;
+    for read in 0..basis.len() {
+        let c = coeffs[read];
+        let mag = c.abs();
+        let keep = if protected_set.contains(&basis[read]) || (mag >= tau && mag > 0.0) {
+            true
+        } else {
+            st.n_strings_rounded += 1;
+            st.tail_mass_rounded += c * c;
+            st.tail_l1_rounded += mag;
+            let p = if tau.is_finite() && tau > 0.0 { mag / tau } else { 0.0 };
+            let u = if mag > 0.0 { rng.next_f64() } else { 1.0 };     // no draw for an exact zero (removed)
+            if u < p {
+                st.n_strings_kept_by_chance += 1;
+                st.tail_mass_kept += tau * tau;
+                coeffs[read] = if c < 0.0 { -tau } else { tau };
+                true
+            } else {
+                st.tail_mass_removed += c * c;
+                acc.add(weight_of(&basis[read]), c);
+                false
+            }
+        };
+        if keep {
+            if write != read {
+                basis.swap(write, read);
+                coeffs.swap(write, read);
+            }
+            write += 1;
+        }
+    }
+    basis.truncate(write);
+    coeffs.truncate(write);
+    st.add_trim(&acc);
+}
+
+/// The end-of-step truncation: with `tail = None` the deterministic trim —
+/// `prune_basis` then `cap_basis`, the two calls of every earlier build in
+/// the same order (bit identity); with `Some(tail)` the stochastic rounding
+/// (`tail_round`; the `drop_tol` prune and the rank cap are not applied).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn trim_tail<const W: usize>(
+    basis: &mut Vec<Word<W>>,
+    coeffs: &mut Vec<f64>,
+    max_basis: usize,
+    drop_tol: f64,
+    protected: &[Word<W>],
+    weight_of: impl Fn(&Word<W>) -> u32 + Copy,
+    st: &mut PcStepStats,
+    tail: Option<TailConfig>,
+) {
+    match tail {
+        None => {
+            st.add_trim(&prune_basis(basis, coeffs, drop_tol, protected, weight_of, st.n_bins));
+            st.add_trim(&cap_basis(basis, coeffs, max_basis, protected, weight_of, st.n_bins));
+        }
+        Some(t) => tail_round(basis, coeffs, max_basis, protected, weight_of, st, &t),
+    }
 }
 
 /// Add the largest leakage strings to the basis, up to the available room
@@ -3938,5 +4153,256 @@ mod tests {
         assert_eq!(pauli_weight_upto(&w, 64), 2);
         assert_eq!(pauli_weight_upto(&w, 65), 3);
         assert_eq!(pauli_weight_upto(&w, 70), 4);
+    }
+
+    // ---- the stochastic tail (TailConfig) ----
+
+    fn tail_cfg(rule: TailRule, threshold: f64, seed: u64) -> TailConfig {
+        TailConfig { rule, threshold, seed }
+    }
+
+    /// `tail_round` with an absolute τ: strings at or above τ and protected
+    /// words are untouched bit for bit, the strings below τ are kept at ±τ or
+    /// removed, the account identities hold for every seed, and the mean of
+    /// each coefficient over many seeds is the original one (unbiasedness)
+    /// within five standard errors.
+    #[test]
+    fn tail_round_unbiased_and_accounts() {
+        let strings = ["ZIII", "IZII", "IIZI", "IIIZ", "XXII", "IIYY", "XYZI", "IXYZ"];
+        let basis: Vec<Word> = strings.iter().map(|s| word_of(s)).collect();
+        let coeffs = vec![0.9, 0.07, 0.3, -0.05, 0.02, 0.001, -0.099, 0.0];
+        let prot = vec![word_of("IIYY")];
+        let tau = 0.1;
+        let n_seeds = 4000u64;
+        let mut sums = vec![0.0f64; strings.len()];
+        let mut sq = vec![0.0f64; strings.len()];
+        for seed in 0..n_seeds {
+            let (mut b, mut c) = (basis.clone(), coeffs.clone());
+            let mut st = PcStepStats::for_cfg(&PcStepConfig::default(), 5);
+            tail_round(&mut b, &mut c, usize::MAX, &prot, pauli_weight, &mut st, &tail_cfg(TailRule::Abs, tau, seed));
+            assert!(st.tail_stochastic);
+            assert_eq!(st.tail_threshold_used, tau);
+            let got: FxHashMap<Word, f64> = b.iter().cloned().zip(c.iter().cloned()).collect();
+            // never randomised: |c| >= tau, the protected word
+            assert_eq!(got[&word_of("ZIII")], 0.9);
+            assert_eq!(got[&word_of("IIZI")], 0.3);
+            assert_eq!(got[&word_of("IIYY")], 0.001);
+            // the exact zero is removed and counted as rounded (mass 0)
+            assert!(!got.contains_key(&word_of("IXYZ")));
+            // below tau: 0.07, -0.05, 0.02, -0.099 and the zero -> 5 rounded
+            assert_eq!(st.n_strings_rounded, 5);
+            assert_eq!(st.n_strings_rounded, st.n_strings_kept_by_chance + st.trim_dropped);
+            let mass_below = 0.07f64.powi(2) + 0.05f64.powi(2) + 0.02f64.powi(2) + 0.099f64.powi(2);
+            assert!((st.tail_mass_rounded - mass_below).abs() < 1e-15);
+            assert!((st.tail_l1_rounded - (0.07 + 0.05 + 0.02 + 0.099)).abs() < 1e-15);
+            assert!((st.trim_dropped_l2sq - st.tail_mass_removed).abs() < 1e-18);
+            assert!((st.tail_mass_kept - st.n_strings_kept_by_chance as f64 * tau * tau).abs() < 1e-15);
+            let kept_before: f64 = strings
+                .iter()
+                .zip(coeffs.iter())
+                .filter(|(s, c)| **s != "IIYY" && c.abs() < tau && c.abs() > 0.0 && got.contains_key(&word_of(s)))
+                .map(|(_, c)| c * c)
+                .sum();
+            assert!((st.tail_mass_rounded - st.tail_mass_removed - kept_before).abs() < 1e-15);
+            for (i, s) in strings.iter().enumerate() {
+                let v = got.get(&word_of(s)).copied().unwrap_or(0.0);
+                if coeffs[i].abs() < tau && coeffs[i] != 0.0 && *s != "IIYY" {
+                    assert!(v == 0.0 || v.abs() == tau, "rounded value {v} is neither 0 nor ±tau");
+                    assert!(v == 0.0 || v.signum() == coeffs[i].signum());
+                }
+                sums[i] += v;
+                sq[i] += v * v;
+            }
+        }
+        for (i, c) in coeffs.iter().enumerate() {
+            let mean = sums[i] / n_seeds as f64;
+            let var = (sq[i] / n_seeds as f64 - mean * mean).max(0.0);
+            let se = (var / n_seeds as f64).sqrt();
+            // (+1e-12: the summation round-off of 4000 identical terms on the never-randomised strings, whose se is 0)
+            assert!((mean - c).abs() <= 5.0 * se + 1e-12, "string {}: mean {mean} vs {c}, se {se}", strings[i]);
+        }
+    }
+
+    /// The budget rule: τ solves Σ min(1, |c|/τ) = slots over the non-protected strings; 0 when the basis fits.
+    #[test]
+    fn tail_budget_threshold_expected_count() {
+        let strings = ["ZIII", "IZII", "IIZI", "IIIZ", "XXII", "IIYY", "XYZI", "IXYZ", "YYII", "ZZII"];
+        let basis: Vec<Word> = strings.iter().map(|s| word_of(s)).collect();
+        let coeffs = vec![0.9, 0.07, 0.3, -0.05, 0.02, 0.001, -0.099, 0.004, 0.25, 0.011];
+        let prot_words = vec![word_of("IIYY")];
+        let prot: FxHashSet<&Word> = prot_words.iter().collect();
+        for slots in 1..9usize {
+            let max_basis = slots + 1;   // one protected word
+            let tau = tail_threshold(&basis, &coeffs, max_basis, &prot, &tail_cfg(TailRule::Budget, 0.0, 0));
+            let expected: f64 = basis
+                .iter()
+                .zip(coeffs.iter())
+                .filter(|(w, _)| !prot.contains(w))
+                .map(|(_, c)| (c.abs() / tau).min(1.0))
+                .sum();
+            assert!((expected - slots as f64).abs() < 1e-12, "slots {slots}: tau {tau} gives {expected}");
+            assert!(tau > 0.0 && tau.is_finite());
+        }
+        let tau = tail_threshold(&basis, &coeffs, 10, &prot, &tail_cfg(TailRule::Budget, 0.0, 0));
+        assert_eq!(tau, 0.0, "nine non-protected strings fit nine slots");
+        let tau = tail_threshold(&basis, &coeffs, 1, &prot, &tail_cfg(TailRule::Budget, 0.0, 0));
+        assert!(tau.is_infinite(), "no free slot: every non-protected string goes");
+        // the relative rule
+        let tau = tail_threshold(&basis, &coeffs, 10, &prot, &tail_cfg(TailRule::Rel, 0.5, 0));
+        assert_eq!(tau, 0.45);
+    }
+
+    /// Reproducibility: one seed gives one result; two seeds differ when many strings are rounded.
+    #[test]
+    fn tail_seed_reproducible_and_independent() {
+        let n = 4;
+        let basis: Vec<Word> = (0..256)
+            .map(|k| {
+                let s: String = (0..n).map(|i| ['I', 'X', 'Y', 'Z'][(k >> (2 * i)) & 3]).collect();
+                word_of(&s)
+            })
+            .collect();
+        let coeffs: Vec<f64> = (0..256).map(|k| 0.05 * ((k * 37 % 101) as f64 / 101.0) * if k % 3 == 0 { -1.0 } else { 1.0 }).collect();
+        let run = |seed: u64| {
+            let (mut b, mut c) = (basis.clone(), coeffs.clone());
+            let mut st = PcStepStats::for_cfg(&PcStepConfig::default(), n + 1);
+            tail_round(&mut b, &mut c, usize::MAX, &[], pauli_weight, &mut st, &tail_cfg(TailRule::Abs, 0.03, seed));
+            (b, c, st.n_strings_kept_by_chance)
+        };
+        let (b1, c1, k1) = run(11);
+        let (b2, c2, _) = run(11);
+        let (b3, c3, _) = run(12);
+        assert_eq!(b1, b2);
+        assert_eq!(c1, c2);
+        assert!(k1 > 20);
+        assert!(b1 != b3 || c1 != c3);
+    }
+
+    /// Through the step: a 3-site chain on the complete basis (so every step is
+    /// the exact in-basis exponential and admission is never short of room);
+    /// (a) `tail = Some(Abs 0)` removes exact zeros only and agrees with the
+    /// deterministic trim otherwise, bit for bit; (b) the replica mean of every
+    /// coefficient after three stochastic steps (relative τ) is the untruncated
+    /// one within five standard errors (the step map is linear in the
+    /// coefficients, the rounding unbiased, so the composition is unbiased).
+    #[test]
+    fn tail_pc_step_unbiased_on_complete_basis() {
+        let n = 3;
+        let mut h_terms = Vec::new();
+        let mut h_coeffs = Vec::new();
+        for i in 0..n - 1 {
+            for p in ['X', 'Y', 'Z'] {
+                let mut t = vec!['I'; n];
+                t[i] = p;
+                t[i + 1] = p;
+                h_terms.push(t.into_iter().collect::<String>());
+                h_coeffs.push(0.5 * (1.0 + 0.1 * i as f64));
+            }
+        }
+        for i in 0..n {
+            let mut t = vec!['I'; n];
+            t[i] = 'Z';
+            h_terms.push(t.into_iter().collect::<String>());
+            h_coeffs.push(0.3 * (1 + i % 2) as f64);
+        }
+        let pairs: Vec<(String, f64)> = h_terms.into_iter().zip(h_coeffs).collect();
+        let spec = LindbladSpec::<W_CHUNKS>::new(n, &pairs, &[]).unwrap();
+        let full: Vec<Word> = (0..64)
+            .map(|k| {
+                let s: String = (0..n).map(|i| ['I', 'X', 'Y', 'Z'][(k >> (2 * i)) & 3]).collect();
+                word_of(&s)
+            })
+            .collect();
+        let start: Vec<f64> = (0..64).map(|k| if k == 0 { 0.0 } else { ((k * 29 % 17) as f64 - 8.0) / 40.0 }).collect();
+        let dt = 0.07;
+        let steps = 3;
+        let exact = {
+            let (mut b, mut c) = (full.clone(), start.clone());
+            for _ in 0..steps {
+                spec.pc_step(&mut b, &mut c, dt, &[], &PcStepConfig::default()).unwrap();
+            }
+            b.into_iter().zip(c).collect::<FxHashMap<Word, f64>>()
+        };
+        // (a) Abs 0: zeros removed, everything else identical
+        {
+            let (mut b, mut c) = (full.clone(), start.clone());
+            let cfg = PcStepConfig { tail: Some(tail_cfg(TailRule::Abs, 0.0, 1)), ..Default::default() };
+            let mut st = PcStepStats::default();
+            for _ in 0..steps {
+                st = spec.pc_step(&mut b, &mut c, dt, &[], &cfg).unwrap();
+            }
+            assert!(st.tail_stochastic && st.tail_threshold_used == 0.0 && st.n_strings_kept_by_chance == 0);
+            let got: FxHashMap<Word, f64> = b.into_iter().zip(c).collect();
+            for (w, v) in &exact {
+                match got.get(w) {
+                    Some(g) => assert_eq!(g, v),
+                    None => assert_eq!(*v, 0.0),
+                }
+            }
+        }
+        // (b) relative tau, R replicas
+        let r = 300u64;
+        let mut sums: FxHashMap<Word, f64> = FxHashMap::default();
+        let mut sq: FxHashMap<Word, f64> = FxHashMap::default();
+        let mut rounded_total = 0u64;
+        for rep in 0..r {
+            let (mut b, mut c) = (full.clone(), start.clone());
+            for step in 0..steps as u64 {
+                let cfg = PcStepConfig {
+                    tail: Some(tail_cfg(TailRule::Rel, 0.4, rep * 1000 + step)),
+                    ..Default::default()
+                };
+                let st = spec.pc_step(&mut b, &mut c, dt, &[], &cfg).unwrap();
+                rounded_total += st.n_strings_rounded;
+                assert_eq!(st.room_refused_terms, 0, "the complete basis never lacks room");
+            }
+            let got: FxHashMap<Word, f64> = b.into_iter().zip(c).collect();
+            for w in &full {
+                let v = got.get(w).copied().unwrap_or(0.0);
+                *sums.entry(*w).or_insert(0.0) += v;
+                *sq.entry(*w).or_insert(0.0) += v * v;
+            }
+        }
+        assert!(rounded_total > 100, "the relative threshold must actually round strings");
+        let mut n_checked = 0;
+        for w in &full {
+            let mean = sums[w] / r as f64;
+            let var = (sq[w] / r as f64 - mean * mean).max(0.0);
+            let se = (var / r as f64).sqrt();
+            let ex = exact.get(w).copied().unwrap_or(0.0);
+            assert!((mean - ex).abs() <= 5.0 * se + 1e-12, "{:?}: mean {mean} exact {ex} se {se}", w);
+            n_checked += 1;
+        }
+        assert_eq!(n_checked, 64);
+    }
+
+    /// The admission room-cap account: with a working set short of room the
+    /// refused merged words are counted, and nothing is refused when the room is ample.
+    #[test]
+    fn room_refused_account_counts_the_cap() {
+        let n = 6;
+        let mut h_terms = Vec::new();
+        let mut h_coeffs = Vec::new();
+        for i in 0..n - 1 {
+            for p in ["XX", "YY", "ZZ"] {
+                let mut t = vec!['I'; n];
+                t[i] = p.chars().next().unwrap();
+                t[i + 1] = p.chars().nth(1).unwrap();
+                h_terms.push(t.into_iter().collect::<String>());
+                h_coeffs.push(0.4 + 0.05 * i as f64);
+            }
+        }
+        let pairs: Vec<(String, f64)> = h_terms.into_iter().zip(h_coeffs).collect();
+        let spec = LindbladSpec::<W_CHUNKS>::new(n, &pairs, &[]).unwrap();
+        let (mut b, mut c) = (vec![word_of("IZIIII")], vec![1.0]);
+        let ample = spec.pc_step(&mut b, &mut c, 0.1, &[], &PcStepConfig { max_basis: 10_000, ..Default::default() }).unwrap();
+        assert_eq!(ample.room_refused_terms, 0);
+        assert_eq!(ample.room_refused_l1, 0.0);
+        let (mut b, mut c) = (vec![word_of("IZIIII")], vec![1.0]);
+        let tight = spec.pc_step(&mut b, &mut c, 0.1, &[], &PcStepConfig { max_basis: 4, admit_basis: Some(6), ..Default::default() }).unwrap();
+        assert!(tight.room_refused_terms > 0, "{tight:?}");
+        assert!(tight.room_refused_l1 > 0.0);
+        // (the rank cap keeps ties at its cutoff, so the retained count is not asserted here: the symmetric chain ties)
+        assert!(b.len() >= 4);
     }
 }

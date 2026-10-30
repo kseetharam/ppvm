@@ -56,7 +56,7 @@ use rayon::prelude::*;
 use crate::mf_expm::{self, ActionTerms};
 use crate::{
     Error, LindbladSpec, PcStepConfig, PcStepStats, W_CHUNKS, WeightDrop, Word, add_leakage_capped,
-    build_basis_index, cap_basis, max_qubits_for, pauli_weight_upto, prune_basis, word_hash,
+    build_basis_index, max_qubits_for, pauli_weight_upto, word_hash,
 };
 
 /// Heisenberg-picture inflow into one species from the rows of another:
@@ -574,7 +574,13 @@ impl<const W: usize> BlockLindbladSpec<W> {
                         b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
                     });
                     let cutoff = mags[k];
-                    merged.retain(|_, &mut v| v.abs() >= cutoff);
+                    merged.retain(|_, &mut v| {
+                        let keep = v.abs() >= cutoff;
+                        if !keep {
+                            wdrop.add_room(v.abs());
+                        }
+                        keep
+                    });
                 }
             }
         }
@@ -692,8 +698,7 @@ impl<const W: usize> BlockLindbladSpec<W> {
         *coeffs = mf_expm::apply_cache(&cache, dt, coeffs, drop_tol);
         drop(cache);
         st.snapshot_post(basis, coeffs, dt, weight_of);
-        st.add_trim(&prune_basis(basis, coeffs, drop_tol, protected, weight_of, st.n_bins));
-        st.add_trim(&cap_basis(basis, coeffs, max_basis, protected, weight_of, st.n_bins));
+        crate::trim_tail(basis, coeffs, max_basis, drop_tol, protected, weight_of, &mut st, cfg.tail);
         st.finish(basis, coeffs, weight_of);
         Ok(st)
     }

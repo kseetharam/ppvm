@@ -681,7 +681,53 @@ pub(crate) fn stats_dict<'py>(
     d.set_item("post_l2sq_by_w", PyArray1::from_vec(py, st.post_l2sq_by_w.clone()))?;
     d.set_item("retained_l2sq_by_w", PyArray1::from_vec(py, st.retained_l2sq_by_w.clone()))?;
     d.set_item("channel_damp_l2sq_by_w", PyArray1::from_vec(py, st.channel_damp_l2sq_by_w.clone()))?;
+    // the admission room-cap account and the tail (end-of-step truncation) account (`.tail` build)
+    d.set_item("room_refused_terms", st.room_refused_terms)?;
+    d.set_item("room_refused_l1", st.room_refused_l1)?;
+    d.set_item("tail_mode", if st.tail_stochastic { "stochastic" } else { "drop" })?;
+    d.set_item("tail_threshold_used", st.tail_threshold_used)?;
+    d.set_item("n_strings_rounded", st.n_strings_rounded)?;
+    d.set_item("n_strings_kept_by_chance", st.n_strings_kept_by_chance)?;
+    d.set_item("tail_mass_rounded", st.tail_mass_rounded)?;
+    d.set_item("tail_l1_rounded", st.tail_l1_rounded)?;
+    d.set_item("tail_mass_kept", st.tail_mass_kept)?;
+    d.set_item("tail_mass_removed", st.tail_mass_removed)?;
     Ok(d)
+}
+
+/// The step's tail configuration from the Python keywords: `tail_mode` None /
+/// "drop" = the deterministic trim (`None`), "stochastic" = stochastic rounding
+/// with `tail_rule` "abs" | "rel" | "budget", `tail_threshold` and `tail_seed`.
+pub(crate) fn tail_config(
+    tail_mode: Option<&str>,
+    tail_threshold: f64,
+    tail_rule: &str,
+    tail_seed: u64,
+) -> PyResult<Option<ppvm_lindblad::TailConfig>> {
+    match tail_mode {
+        None | Some("drop") => Ok(None),
+        Some("stochastic") => {
+            let rule = match tail_rule {
+                "abs" => ppvm_lindblad::TailRule::Abs,
+                "rel" => ppvm_lindblad::TailRule::Rel,
+                "budget" => ppvm_lindblad::TailRule::Budget,
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "tail_rule must be 'abs', 'rel' or 'budget', got {other:?}"
+                    )));
+                }
+            };
+            if !tail_threshold.is_finite() || tail_threshold < 0.0 {
+                return Err(PyValueError::new_err(format!(
+                    "tail_threshold must be a finite number >= 0, got {tail_threshold}"
+                )));
+            }
+            Ok(Some(ppvm_lindblad::TailConfig { rule, threshold: tail_threshold, seed: tail_seed }))
+        }
+        Some(other) => Err(PyValueError::new_err(format!(
+            "tail_mode must be None, 'drop' or 'stochastic', got {other:?}"
+        ))),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1401,6 +1447,10 @@ impl LindbladSpec {
         locality = false,
         max_weight = None,
         depolarize_eps = 0.0,
+        tail_mode = None,
+        tail_threshold = 0.0,
+        tail_rule = "abs",
+        tail_seed = 0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn pc_step<'py>(
@@ -1418,6 +1468,10 @@ impl LindbladSpec {
         locality: bool,
         max_weight: Option<u32>,
         depolarize_eps: f64,
+        tail_mode: Option<&str>,
+        tail_threshold: f64,
+        tail_rule: &str,
+        tail_seed: u64,
     ) -> PyResult<PyPauliMap<'py>> {
         let cfg = ppvm_lindblad::PcStepConfig {
             max_basis,
@@ -1428,6 +1482,7 @@ impl LindbladSpec {
             locality,
             max_weight,
             depolarize_eps,
+            tail: tail_config(tail_mode, tail_threshold, tail_rule, tail_seed)?,
         };
         let (map, _, _) =
             dispatch!(&self.inner, s => pc_step_impl(s, py, basis, coeffs, dt, cfg, protected, false))?;
@@ -1449,6 +1504,10 @@ impl LindbladSpec {
         locality = false,
         max_weight = None,
         depolarize_eps = 0.0,
+        tail_mode = None,
+        tail_threshold = 0.0,
+        tail_rule = "abs",
+        tail_seed = 0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn pc_step_stats<'py>(
@@ -1466,6 +1525,10 @@ impl LindbladSpec {
         locality: bool,
         max_weight: Option<u32>,
         depolarize_eps: f64,
+        tail_mode: Option<&str>,
+        tail_threshold: f64,
+        tail_rule: &str,
+        tail_seed: u64,
     ) -> PyResult<(PyPauliMap<'py>, Bound<'py, pyo3::types::PyDict>)> {
         let cfg = ppvm_lindblad::PcStepConfig {
             max_basis,
@@ -1476,6 +1539,7 @@ impl LindbladSpec {
             locality,
             max_weight,
             depolarize_eps,
+            tail: tail_config(tail_mode, tail_threshold, tail_rule, tail_seed)?,
         };
         let (map, _, stats) =
             dispatch!(&self.inner, s => pc_step_impl(s, py, basis, coeffs, dt, cfg, protected, false))?;
@@ -1495,6 +1559,10 @@ impl LindbladSpec {
         locality = false,
         max_weight = None,
         depolarize_eps = 0.0,
+        tail_mode = None,
+        tail_threshold = 0.0,
+        tail_rule = "abs",
+        tail_seed = 0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn pc_step_timed<'py>(
@@ -1512,6 +1580,10 @@ impl LindbladSpec {
         locality: bool,
         max_weight: Option<u32>,
         depolarize_eps: f64,
+        tail_mode: Option<&str>,
+        tail_threshold: f64,
+        tail_rule: &str,
+        tail_seed: u64,
     ) -> PyResult<(PyPauliMap<'py>, Bound<'py, pyo3::types::PyDict>)> {
         let cfg = ppvm_lindblad::PcStepConfig {
             max_basis,
@@ -1522,6 +1594,7 @@ impl LindbladSpec {
             locality,
             max_weight,
             depolarize_eps,
+            tail: tail_config(tail_mode, tail_threshold, tail_rule, tail_seed)?,
         };
         let (map, timings, stats) =
             dispatch!(&self.inner, s => pc_step_impl(s, py, basis, coeffs, dt, cfg, protected, true))?;
@@ -1610,6 +1683,7 @@ impl LindbladSpec {
             locality: false,
             max_weight: None,
             depolarize_eps: 0.0,
+            tail: None,
         };
         dispatch!(&self.inner, s => pc_step_orbit_rep_impl(
             s, py, basis, coeffs, dt, cfg, group, momentum, protected, canonicalize_first))

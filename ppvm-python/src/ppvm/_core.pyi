@@ -470,6 +470,10 @@ class LindbladSpec:
         locality: bool = False,
         max_weight: int | None = None,
         depolarize_eps: float = 0.0,
+        tail_mode: str | None = None,
+        tail_threshold: float = 0.0,
+        tail_rule: str = "abs",
+        tail_seed: int = 0,
     ) -> tuple[np.ndarray, np.ndarray]: ...
     def pc_step_stats(
         self,
@@ -485,6 +489,10 @@ class LindbladSpec:
         locality: bool = False,
         max_weight: int | None = None,
         depolarize_eps: float = 0.0,
+        tail_mode: str | None = None,
+        tail_threshold: float = 0.0,
+        tail_rule: str = "abs",
+        tail_seed: int = 0,
     ) -> tuple[tuple[np.ndarray, np.ndarray], dict[str, int | float | None]]: ...
     def pc_step_timed(
         self,
@@ -500,6 +508,10 @@ class LindbladSpec:
         locality: bool = False,
         max_weight: int | None = None,
         depolarize_eps: float = 0.0,
+        tail_mode: str | None = None,
+        tail_threshold: float = 0.0,
+        tail_rule: str = "abs",
+        tail_seed: int = 0,
     ) -> tuple[tuple[np.ndarray, np.ndarray], dict[str, int | float | None]]: ...
     def pc_step_orbit_rep(
         self,
@@ -579,6 +591,10 @@ class BlockLindbladSpec:
         tau_add: float | None = None,
         max_weight: int | None = None,
         depolarize_eps: float = 0.0,
+        tail_mode: str | None = None,
+        tail_threshold: float = 0.0,
+        tail_rule: str = "abs",
+        tail_seed: int = 0,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]: ...
     def pc_step_stats(
         self,
@@ -595,6 +611,10 @@ class BlockLindbladSpec:
         tau_add: float | None = None,
         max_weight: int | None = None,
         depolarize_eps: float = 0.0,
+        tail_mode: str | None = None,
+        tail_threshold: float = 0.0,
+        tail_rule: str = "abs",
+        tail_seed: int = 0,
     ) -> tuple[tuple[np.ndarray, np.ndarray, np.ndarray], dict[str, int | float | None]]: ...
     def generator(
         self, basis: np.ndarray, species: np.ndarray

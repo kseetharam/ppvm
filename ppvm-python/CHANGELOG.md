@@ -38,3 +38,31 @@ Two knobs in the predictor-corrector step, both default off, in the Rust core (`
   `pauli_weight_upto_masks_trailing_positions`, `per_class_arrays_h0_and_cap`) and `test/lindblad/test_weight_depolarize.py`.
 - Installing the wheel: with its dependencies (`kirin`, `bloqade-circuit`; `import ppvm` fails without them); running the test suite
   needs `pytest-benchmark` (the package's `addopts`).
+
+## `.weight.hist.tail` — branch `nc-tail` (from 4dad2359)
+
+The stochastic tail: an end-of-step truncation mode in the Rust core (`PcStepConfig::tail: Option<TailConfig>`) and the Python
+bindings (`Lindbladian.pc_step_arr` / `BlockLindbladian.pc_step_arr`: `tail_mode=None | "drop" | "stochastic"`, `tail_threshold`,
+`tail_rule="abs" | "rel" | "budget"`, `tail_seed`), default off.
+
+- `tail = None` / `tail_mode=None` or `"drop"`: the deterministic trim — the `drop_tol` prune followed by the top-`max_basis` rank cap,
+  the same two calls in the same order — so the step is the `.weight.hist` step bit for bit (checked on the stored propagation records
+  against the lever-1 wheel).
+- `"stochastic"`: with the step's threshold τ (`abs`: the value; `rel`: the fraction of the largest |c| after the corrector; `budget`:
+  the τ with Σ min(1, |c|/τ) = `max_basis` − n_protected over the non-protected strings, so the expected number retained is the
+  budget; 0 when the basis fits), every non-protected string with 0 < |c| < τ is kept with probability |c|/τ at coefficient sign(c)·τ,
+  else removed: E[c'] = c string by string, so the propagated operator is unbiased step by step and the replica mean over independent
+  seeds estimates the untruncated value with a variance the replicas measure. Strings with |c| ≥ τ and protected words are never
+  randomised; exact zeros are removed; the `drop_tol` prune and the rank cap are not applied (the working set stays bounded by
+  `admit_basis`). The admission room cap of the leakage passes stays deterministic in both modes (the residual admission bias).
+- The generator: SplitMix64 seeded with `tail_seed`, one uniform per rounded string in basis order; integer arithmetic only, so a seed
+  gives the same draws on every platform. The caller derives the seed per (replica, step).
+- `PcStepStats` / the `stats` dict: `room_refused_terms` / `room_refused_l1` (both modes: merged leakage words the room cap refused over
+  the two passes and Σ of their magnitudes, a coefficient rate; the plain, locality and block steps alike), `tail_mode`,
+  `tail_threshold_used`, `n_strings_rounded`, `n_strings_kept_by_chance`, `tail_mass_rounded` / `tail_l1_rounded` (Σ c² / Σ |c| of the
+  rounded strings before the rounding), `tail_mass_kept` (Σ τ² of the kept ones), `tail_mass_removed` (Σ c² of the removed ones, which
+  are also the `trim_dropped` account). Identities: `n_strings_rounded = n_strings_kept_by_chance + trim_dropped`,
+  `tail_mass_rounded − tail_mass_removed` = the pre-rounding mass of the kept strings, `τ·tail_l1_rounded − tail_mass_rounded` = the
+  expected squared norm the rounding injects in the step.
+- `ppvm.STEP_FEATURES += ('tail',)`; `ppvm.TAIL_MODES`, `ppvm.TAIL_RULES`. The orbit-rep step has no tail mode.
+- Tests: `cargo test -p ppvm-lindblad` (`tail_*`) and `test/lindblad/test_tail.py`.

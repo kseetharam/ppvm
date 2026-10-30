@@ -461,6 +461,10 @@ impl BlockLindbladSpec {
         tau_add = None,
         max_weight = None,
         depolarize_eps = 0.0,
+        tail_mode = None,
+        tail_threshold = 0.0,
+        tail_rule = "abs",
+        tail_seed = 0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn pc_step<'py>(
@@ -479,6 +483,10 @@ impl BlockLindbladSpec {
         tau_add: Option<f64>,
         max_weight: Option<u32>,
         depolarize_eps: f64,
+        tail_mode: Option<&str>,
+        tail_threshold: f64,
+        tail_rule: &str,
+        tail_seed: u64,
     ) -> PyResult<PyBlockMap<'py>> {
         let cfg = ppvm_lindblad::PcStepConfig {
             max_basis,
@@ -489,6 +497,7 @@ impl BlockLindbladSpec {
             locality: false,
             max_weight,
             depolarize_eps,
+            tail: crate::lindblad::tail_config(tail_mode, tail_threshold, tail_rule, tail_seed)?,
         };
         let (map, _) = dispatch!(&self.inner, s => pc_step_impl(
             s, py, basis, species, coeffs, dt, cfg, protected_basis, protected_species))?;
@@ -508,6 +517,10 @@ impl BlockLindbladSpec {
         tau_add = None,
         max_weight = None,
         depolarize_eps = 0.0,
+        tail_mode = None,
+        tail_threshold = 0.0,
+        tail_rule = "abs",
+        tail_seed = 0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn pc_step_stats<'py>(
@@ -526,6 +539,10 @@ impl BlockLindbladSpec {
         tau_add: Option<f64>,
         max_weight: Option<u32>,
         depolarize_eps: f64,
+        tail_mode: Option<&str>,
+        tail_threshold: f64,
+        tail_rule: &str,
+        tail_seed: u64,
     ) -> PyResult<(PyBlockMap<'py>, Bound<'py, pyo3::types::PyDict>)> {
         let cfg = ppvm_lindblad::PcStepConfig {
             max_basis,
@@ -536,6 +553,7 @@ impl BlockLindbladSpec {
             locality: false,
             max_weight,
             depolarize_eps,
+            tail: crate::lindblad::tail_config(tail_mode, tail_threshold, tail_rule, tail_seed)?,
         };
         let (map, stats) = dispatch!(&self.inner, s => pc_step_impl(
             s, py, basis, species, coeffs, dt, cfg, protected_basis, protected_species))?;

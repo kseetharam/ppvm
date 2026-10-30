@@ -72,6 +72,47 @@ pub struct PcStepConfig {
     /// `H ≠ 0`); being diagonal it never leaks. `0.0` (default): off, the
     /// generator unchanged bit for bit.
     pub depolarize_eps: f64,
+    /// The end-of-step truncation ("tail") mode. `None` (default): the
+    /// deterministic trim — the `drop_tol` prune followed by the top-`max_basis`
+    /// rank cap — bit for bit the step of every earlier build. `Some(tail)`:
+    /// stochastic rounding ([`TailConfig`]): the strings below the step's
+    /// threshold τ are kept with probability |c|/τ at coefficient sign(c)·τ or
+    /// removed, so the expectation of every coefficient is preserved and the
+    /// propagated operator is unbiased step by step; strings with |c| ≥ τ and
+    /// protected words are never randomised; the `drop_tol` prune and the rank
+    /// cap are NOT applied (the rounding is the whole trim; the working set stays
+    /// bounded by `admit_basis`). The admission room cap of the leakage passes
+    /// stays deterministic in both modes and is counted
+    /// ([`crate::PcStepStats::room_refused_terms`]).
+    pub tail: Option<TailConfig>,
+}
+
+/// How the stochastic tail's threshold τ is set per step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailRule {
+    /// τ = `threshold` (an absolute coefficient).
+    Abs,
+    /// τ = `threshold` × max_i |c_i| over the whole basis after the corrector
+    /// (protected words included).
+    Rel,
+    /// τ solves Σ_i min(1, |c_i|/τ) = `max_basis` − n_protected over the
+    /// non-protected strings — the expected number of retained strings equals
+    /// the budget; τ = 0 (nothing rounded) when the basis already fits.
+    Budget,
+}
+
+/// The stochastic tail: threshold rule, threshold and the step's seed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TailConfig {
+    pub rule: TailRule,
+    /// The absolute threshold (`Abs`), the fraction of the largest
+    /// coefficient (`Rel`); ignored by `Budget`.
+    pub threshold: f64,
+    /// Seed of the step's generator (SplitMix64; one uniform per rounded
+    /// string, drawn in basis order). The caller derives it per
+    /// (replica, step) so a trajectory is reproducible and replicas are
+    /// independent.
+    pub seed: u64,
 }
 
 impl Default for PcStepConfig {
@@ -88,6 +129,7 @@ impl Default for PcStepConfig {
             locality: false,
             max_weight: None,
             depolarize_eps: 0.0,
+            tail: None,
         }
     }
 }
